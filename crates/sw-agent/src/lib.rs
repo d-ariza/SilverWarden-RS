@@ -1,6 +1,6 @@
-use sw-config::ConfigFile;
-use sw-ipc::{IpcRequest, IpcResponse};
 use std::sync::Arc;
+use sw_config::ConfigFile;
+use sw_ipc::{IpcRequest, IpcResponse};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -48,12 +48,8 @@ impl AgentDaemon {
                 state.is_locked = true;
                 IpcResponse::Ok(serde_json::json!({ "status": "locked" }))
             }
-            IpcRequest::Sync => {
-                IpcResponse::Ok(serde_json::json!({ "status": "synced" }))
-            }
-            IpcRequest::GetLogins { filter: _ } => {
-                IpcResponse::Ok(serde_json::json!([]))
-            }
+            IpcRequest::Sync => IpcResponse::Ok(serde_json::json!({ "status": "synced" })),
+            IpcRequest::GetLogins { filter: _ } => IpcResponse::Ok(serde_json::json!([])),
         }
     }
 }

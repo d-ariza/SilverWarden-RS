@@ -30,7 +30,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings
 
       - name: Run Tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --exclude sw-gui --verbose

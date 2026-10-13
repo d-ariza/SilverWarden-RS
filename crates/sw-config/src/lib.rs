@@ -4,19 +4,13 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("IO error: {0}")]
-    Io(#[io::source] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("Configuration lock/pin error: {0}")]
     Lock(String),
-}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(err: std::io::Error) -> Self {
-        ConfigError::Io(err)
-    }
 }
 
 /// Representation of ~/.config/goldwarden/goldwarden.json

@@ -73,7 +73,10 @@ impl EncString {
 
         if cipher_type.has_mac() {
             let mac_b64 = B64.encode(&self.mac);
-            Ok(format!("{}.{}|{}|{}", cipher_type as i32, iv_b64, ct_b64, mac_b64))
+            Ok(format!(
+                "{}.{}|{}|{}",
+                cipher_type as i32, iv_b64, ct_b64, mac_b64
+            ))
         } else {
             Ok(format!("{}.{}|{}", cipher_type as i32, iv_b64, ct_b64))
         }
@@ -98,13 +101,16 @@ impl FromStr for EncString {
             return Ok(Self::default());
         }
 
-        let dot_pos = trimmed
-            .find('.')
-            .ok_or_else(|| CryptoError::InvalidEncString(format!("Missing dot separator in '{}'", trimmed)))?;
+        let dot_pos = trimmed.find('.').ok_or_else(|| {
+            CryptoError::InvalidEncString(format!("Missing dot separator in '{}'", trimmed))
+        })?;
 
-        let type_num: i32 = trimmed[..dot_pos]
-            .parse()
-            .map_err(|_| CryptoError::InvalidEncString(format!("Invalid cipher type integer '{}'", &trimmed[..dot_pos])))?;
+        let type_num: i32 = trimmed[..dot_pos].parse().map_err(|_| {
+            CryptoError::InvalidEncString(format!(
+                "Invalid cipher type integer '{}'",
+                &trimmed[..dot_pos]
+            ))
+        })?;
 
         let cipher_type = EncStringType::from_i32(type_num)?;
         let remainder = &trimmed[dot_pos + 1..];
@@ -119,9 +125,15 @@ impl FromStr for EncString {
                         parts.len()
                     )));
                 }
-                let iv = B64.decode(parts[0]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
-                let ct = B64.decode(parts[1]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
-                let mac = B64.decode(parts[2]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                let iv = B64
+                    .decode(parts[0])
+                    .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                let ct = B64
+                    .decode(parts[1])
+                    .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                let mac = B64
+                    .decode(parts[2])
+                    .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
                 Ok(Self {
                     cipher_type: Some(cipher_type),
                     iv,
@@ -137,8 +149,12 @@ impl FromStr for EncString {
                         parts.len()
                     )));
                 }
-                let iv = B64.decode(parts[0]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
-                let ct = B64.decode(parts[1]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                let iv = B64
+                    .decode(parts[0])
+                    .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                let ct = B64
+                    .decode(parts[1])
+                    .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
                 Ok(Self {
                     cipher_type: Some(cipher_type),
                     iv,
@@ -149,7 +165,9 @@ impl FromStr for EncString {
             EncStringType::Rsa2048OaepSha1B64 | EncStringType::Rsa2048OaepSha256B64 => {
                 // Asymmetric keys in Bitwarden are formatted as 4.ct
                 if parts.len() == 1 {
-                    let ct = B64.decode(parts[0]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                    let ct = B64
+                        .decode(parts[0])
+                        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
                     Ok(Self {
                         cipher_type: Some(cipher_type),
                         iv: Vec::new(),
@@ -157,8 +175,12 @@ impl FromStr for EncString {
                         mac: Vec::new(),
                     })
                 } else if parts.len() == 2 {
-                    let ct = B64.decode(parts[0]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
-                    let mac = B64.decode(parts[1]).map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                    let ct = B64
+                        .decode(parts[0])
+                        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                    let mac = B64
+                        .decode(parts[1])
+                        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
                     Ok(Self {
                         cipher_type: Some(cipher_type),
                         iv: Vec::new(),
@@ -187,12 +209,20 @@ mod tests {
         let ct = vec![100, 101, 102, 103, 104];
         let mac = vec![200, 201, 202, 203, 204, 205];
 
-        let enc = EncString::new(EncStringType::AesCbc256HmacSha256B64, iv.clone(), ct.clone(), mac.clone());
+        let enc = EncString::new(
+            EncStringType::AesCbc256HmacSha256B64,
+            iv.clone(),
+            ct.clone(),
+            mac.clone(),
+        );
         let serialized = enc.to_string_repr().unwrap();
         assert!(serialized.starts_with("2."));
 
         let parsed: EncString = serialized.parse().unwrap();
-        assert_eq!(parsed.cipher_type, Some(EncStringType::AesCbc256HmacSha256B64));
+        assert_eq!(
+            parsed.cipher_type,
+            Some(EncStringType::AesCbc256HmacSha256B64)
+        );
         assert_eq!(parsed.iv, iv);
         assert_eq!(parsed.ct, ct);
         assert_eq!(parsed.mac, mac);

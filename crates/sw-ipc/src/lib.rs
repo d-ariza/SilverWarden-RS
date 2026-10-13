@@ -7,7 +7,7 @@ pub const MAX_IPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB
 #[derive(Error, Debug)]
 pub enum IpcError {
     #[error("IO error: {0}")]
-    Io(#[io::source] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Serialization error: {0}")]
     Json(#[from] serde_json::Error),
@@ -20,12 +20,6 @@ pub enum IpcError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
-}
-
-impl From<std::io::Error> for IpcError {
-    fn from(err: std::io::Error) -> Self {
-        IpcError::Io(err)
-    }
 }
 
 /// Request commands sent from CLI or GUI to Daemon
@@ -48,7 +42,9 @@ pub enum IpcResponse {
 }
 
 /// Length-prefixed framing helper: read u32 big-endian length then payload bytes
-pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>, IpcError> {
+pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, IpcError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -63,7 +59,10 @@ pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) ->
 }
 
 /// Length-prefixed framing helper: write u32 big-endian length then payload bytes
-pub async fn write_message<W: tokio::io::AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> Result<(), IpcError> {
+pub async fn write_message<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> Result<(), IpcError> {
     if data.len() > MAX_IPC_MESSAGE_SIZE {
         return Err(IpcError::MessageTooLarge);
     }

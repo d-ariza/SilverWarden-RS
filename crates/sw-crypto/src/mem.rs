@@ -34,30 +34,48 @@ impl MemLockedBuffer {
             });
         }
 
-        // Lock memory pages and mark DONTDUMP
         let ptr = data.as_mut_ptr() as *mut core::ffi::c_void;
-        #[cfg(target_os = "linux")]
-        {
-            unsafe {
-                let _ = rustix::mm::mlock(ptr, len);
-                let _ = rustix::mm::madvise(ptr, len, rustix::mm::Advice::LinuxDontDump);
-            }
+
+        // Lock memory pages
+        unsafe {
+            rustix::mm::mlock(ptr, len)
+                .map_err(|e| CryptoError::MemLockError(format!("mlock failed: {e}")))?;
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            unsafe {
-                let _ = rustix::mm::mlock(ptr, len);
-            }
+        // Mark as DONTDUMP (Linux only). Non-fatal if it fails.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let _ = rustix::mm::madvise(ptr, len, rustix::mm::Advice::LinuxDontDump);
         }
 
         Ok(Self { data, locked: true })
     }
 
-    /// Creates an empty buffer with preallocated capacity.
+    /// Creates an empty buffer with preallocated capacity, locked in memory.
     pub fn with_capacity(capacity: usize) -> Result<Self, CryptoError> {
-        let data = vec![0u8; capacity];
-        Self::new(&data)
+        let mut data = vec![0u8; capacity];
+        let len = data.len();
+
+        if len == 0 {
+            return Ok(Self {
+                data,
+                locked: false,
+            });
+        }
+
+        let ptr = data.as_mut_ptr() as *mut core::ffi::c_void;
+
+        unsafe {
+            rustix::mm::mlock(ptr, len)
+                .map_err(|e| CryptoError::MemLockError(format!("mlock failed: {e}")))?;
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let _ = rustix::mm::madvise(ptr, len, rustix::mm::Advice::LinuxDontDump);
+        }
+
+        Ok(Self { data, locked: true })
     }
 }
 
@@ -170,5 +188,19 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
         empty.wipe();
+    }
+
+    #[test]
+    fn test_mlock_succeeds() {
+        let secret = b"verify_mlock_actually_works_1234";
+        let buf = MemLockedBuffer::new(secret).expect("mlock should succeed for small buffer");
+        assert_eq!(buf.as_slice(), secret);
+    }
+
+    #[test]
+    fn test_with_capacity_is_locked() {
+        let buf = MemLockedBuffer::with_capacity(64).expect("with_capacity should lock");
+        assert_eq!(buf.len(), 64);
+        assert_eq!(buf.as_slice(), &[0u8; 64]);
     }
 }

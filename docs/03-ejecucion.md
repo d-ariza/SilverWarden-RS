@@ -45,36 +45,69 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 
 ## 1. Evidencia de Ejecución: M1 — Núcleo criptográfico `sw-crypto`
 
-### [SW-001] Memoria segura bloqueada & [SW-002] EncString
+### [SW-001] Memoria segura bloqueada & [SW-002] EncString (Robustecido)
 
-**Comando ejecutado:**
-```bash
-cargo test -p sw-crypto
-```
+**Comandos ejecutados y resultados reales:**
 
-**Salida real obtenida:**
-```text
-   Compiling sw-crypto v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-crypto)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.59s
-     Running unittests src/lib.rs (target/debug/deps/sw_crypto-b1e6b98d9ab6421f)
+1. **Formato:**
+   ```bash
+   cargo fmt --all -- --check
+   ```
+   *Salida:* `0 diffs` (Código 0)
 
-running 7 tests
-test encstring::tests::test_invalid_formats ... ok
-test encstring::tests::test_is_null ... ok
-test encstring::tests::test_roundtrip_type_2 ... ok
-test encstring::tests::test_roundtrip_type_0 ... ok
-test mem::tests::test_empty_buffers ... ok
-test mem::tests::test_mem_locked_buffer_lifecycle ... ok
-test mem::tests::test_memory_buffer_wipe ... ok
+2. **Linter / Calidad estática:**
+   ```bash
+   cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings
+   ```
+   *Salida real:*
+   ```text
+       Checking sw-crypto v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-crypto)
+       Checking sw-ipc v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-ipc)
+       Checking sw-systemauth v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-systemauth)
+       Checking sw-notify v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-notify)
+       Checking sw-browserbiometrics v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-browserbiometrics)
+       Checking sw-autotype v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-autotype)
+       Checking sw-config v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-config)
+       Checking sw-vault v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-vault)
+       Checking sw-bitwarden-api v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-bitwarden-api)
+       Checking sw-ssh-agent v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-ssh-agent)
+       Checking sw-agent v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-agent)
+       Checking sw-cli v0.1.0 (/home/hermes/Proyectos/SilverWarden-Rs/crates/sw-cli)
+       Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.11s
+   ```
+   *Resultado:* 0 warnings, 0 errores.
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-```
+3. **Pruebas del Workspace completo:**
+   ```bash
+   cargo test --workspace --exclude sw-gui
+   ```
+   *Salida real de ejecución:*
+   ```text
+   running 9 tests
+   test encstring::tests::test_is_null ... ok
+   test encstring::tests::test_invalid_formats ... ok
+   test encstring::tests::test_roundtrip_type_0 ... ok
+   test encstring::tests::test_roundtrip_type_2 ... ok
+   test mem::tests::test_empty_buffers ... ok
+   test mem::tests::test_memory_buffer_wipe ... ok
+   test mem::tests::test_mem_locked_buffer_lifecycle ... ok
+   test mem::tests::test_mlock_succeeds ... ok
+   test mem::tests::test_with_capacity_is_locked ... ok
+
+   test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   ```
 
 **Criterios de aceptación verificados:**
 - [x] Trait `LockedBuffer` y las dos implementaciones (`MemLockedBuffer` y `MemoryBuffer`) compilan en Linux con `rustix`.
+- [x] Propagación de errores de `mlock` mediante `CryptoError::MemLockError` en `new` y `with_capacity`.
+- [x] Bloqueo directo de memoria en `with_capacity` (verificado con `test_with_capacity_is_locked`).
+- [x] Verificación de éxito de `mlock` en `test_mlock_succeeds`.
 - [x] `wipe()` pisa los bytes a ceros (verificado en `test_memory_buffer_wipe` y `test_mem_locked_buffer_lifecycle`).
-- [x] Desbloqueo y `zeroize` al dropear el buffer.
+- [x] Desbloqueo (`munlock`) y `zeroize` al dropear el buffer.
 - [x] Roundtrip serialize→parse de `EncString` tipos 0 y 2.
 - [x] Rechazo de tipos inválidos y partes faltantes con errores tipados `CryptoError`.
 - [x] `is_null()` verificado equivalente a Go.
+- [x] Corrección de errores base en `sw-ipc` y `sw-config` (`#[from] std::io::Error`) y `sw-agent` (`sw_config`/`sw_ipc`).
+- [x] Exclusión de `sw-gui` en CI y suites de comandos del núcleo MVP.
+
 
