@@ -31,4 +31,10 @@ pub enum CryptoError {
 
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
+
+    #[error("Invalid key length: {0}")]
+    InvalidKeyLength(String),
+
+    #[error("Feature not implemented: {0}")]
+    NotImplemented(String),
 }
