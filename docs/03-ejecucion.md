@@ -229,67 +229,54 @@ Argon2id: 8fc048a537cbda3e8b6c8596a13ec3a879b929a1a0304dddffec8df18a06222f
 
 ---
 
-### 1.3 [SW-004] Jerarquía de claves (stretchKey + Keyring)
+### 1.3 [SW-004] Jerarquía de claves (stretch_key + SymmetricKey + Keyring)
 
-**Commit:** Implementación y verificación de paridad (2026-10-13).
+**Commit:** `f810869` (implementación) + `b9fb1bc` (correcciones).
 
-#### Implementación
-
-- `crates/sw-crypto/src/keyhierarchy.rs`:
-  - `SymmetricKey`: estructura de 64 bytes conteniendo `enc_key` (32 bytes) y `mac_key` (32 bytes) protegidas con `MemLockedBuffer` (`mlock` + `MADV_DONTDUMP` + `zeroize` en Drop).
-  - `SymmetricKey::from_bytes`: validación estricta de 64 bytes (`CryptoError::InvalidKeyLength`).
-  - `SymmetricKey::bytes()`: concatenación `enc || mac` (64 bytes).
-  - `SymmetricKey::try_clone()`: clonación falible retornando `Result<Self, CryptoError>` sin panics (eliminado `impl Clone` con `.expect()`).
-  - `SymmetricKey::wipe()`: reseteo explícito a ceros.
-  - `stretch_key`: derivación mediante `Hkdf::<Sha256>::from_prk` y `expand(b"enc")` + `expand(b"mac")` hacia `SymmetricKey`.
-  - `Keyring`: gestión en memoria de estado (`is_locked`, `account_key: Option<SymmetricKey>`, `organization_keys: HashMap<String, String>`).
-  - Stubs Opción A: `init_keyring_from_master_password`, `init_keyring_from_master_key`, `init_keyring_from_user_symmetric_key`, `get_symmetric_key_for_organization` retornando `CryptoError::NotImplemented` garantizando no-mutación del `Keyring`.
-- `crates/sw-crypto/src/error.rs`: variantes `InvalidKeyLength(String)` y `NotImplemented(String)`.
-- `crates/sw-crypto/src/lib.rs`: re-exportación de tipos y funciones de `keyhierarchy`.
+**Alcance:** Opción A — `stretch_key`, `SymmetricKey`, `Keyring` (estructura). Las funciones que descifran (`InitKeyringFrom*`, `get_symmetric_key_for_organization`) quedan como stubs `NotImplemented` hasta SW-005/SW-006.
 
 #### Paridad criptográfica Go ↔ Rust (verificada)
 
-**Herramienta:** `keyhierarchy_export_test.go` con build tag `//go:build parity` y runner `go test -v -tags=parity ./cli/agent/bitwarden/crypto -run TestStretchKeyParity` en Goldwarden.
-- `go build ./...` en Goldwarden: código 0, no incluye `StretchKeyForParity`.
-- `grep -rn "StretchKeyForParity" --include="*.go" . | grep -v "_test.go"`: 0 resultados.
+**Herramienta:** `crypto.StretchKeyForParity` (archivo local `keyhierarchy_export_test.go`, no commiteado) ejecutada vía `go test -tags=parity`.
 
 **Salida real de Go (2026-10-13):**
 ```text
-PBKDF2 MasterKey:   f4de0e1196ff2e80ac327345d9e035ddbb6fb8c6129acdf1cbf9991c63f16370
+PBKDF2 MasterKey:  f4de0e1196ff2e80ac327345d9e035ddbb6fb8c6129acdf1cbf9991c63f16370
 PBKDF2 stretch enc: 4259e08507dbfad827ca1c49441249ddff3456f09e7827522e197917d9449928
 PBKDF2 stretch mac: b552622d1da25d3fe35e9a9718d76e996e344156195fe903f0eb2018c695f557
 PBKDF2 stretch all: 4259e08507dbfad827ca1c49441249ddff3456f09e7827522e197917d9449928b552622d1da25d3fe35e9a9718d76e996e344156195fe903f0eb2018c695f557
-
 Argon2id MasterKey: 8fc048a537cbda3e8b6c8596a13ec3a879b929a1a0304dddffec8df18a06222f
 Argon2id stretch enc: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e39761b008
 Argon2id stretch mac: 6911da83c0e785d2a32217600ecf67fa4006e59a04760f311dd2c55724ee1ee3
 Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e39761b0086911da83c0e785d2a32217600ecf67fa4006e59a04760f311dd2c55724ee1ee3
 ```
 
-**Resultado en Rust:**
-- `test_parity_go_stretch_pbkdf2`: enc, mac y full coinciden exactamente ✅
-- `test_parity_go_stretch_argon2id`: enc, mac y full coinciden exactamente ✅
-- `test_full_pipeline_from_password_to_stretch`: flujo completo contraseña → PBKDF2 → HKDF coincide ✅
+**Resultado en Rust:** los cuatro vectores coinciden byte a byte. `test_parity_go_stretch_pbkdf2` y `test_parity_go_stretch_argon2id` pasan. ✅
+
+*Nota:* `stretch_key` usa `Hkdf::<Sha256>::from_prk` (no `new`), con `info = b"enc"` / `b"mac"`. Paridad verificada.
+
+#### Correcciones aplicadas (commit `b9fb1bc`)
+- `impl Clone for SymmetricKey` eliminado. Usaba `.expect()` y podía panicar si `mlock` fallaba. Reemplazado por `try_clone() -> Result<Self, CryptoError>`.
+- `StretchKeyForParity` fuera de producción. Movido a archivo con build tag `parity` en el repo Go (referencia local, no commiteado).
+- Tests de stubs no-mutantes. Verifican que `Keyring` no cambia de estado tras llamar a los stubs.
 
 #### Criterios de aceptación
-- [x] `stretch_key` produce bytes idénticos a Go para la misma master key (enc, mac y concatenación).
-- [x] `SymmetricKey::from_bytes` / `bytes()` roundtrip exacto verificado.
-- [x] Validación estricta de 64 bytes (`CryptoError::InvalidKeyLength`).
-- [x] `SymmetricKey::try_clone()` implementado sin panics (`impl Clone` eliminado).
-- [x] `Keyring` lock/unlock funciona y limpia `account_key` y `organization_keys`.
-- [x] `stretch_key` utiliza `from_prk` (no `new`), verificado por test de paridad.
-- [x] Los stubs de Opción A devuelven `CryptoError::NotImplemented` y no mutan el `Keyring`.
-- [x] Cobertura ≥90% en `keyhierarchy.rs` (**96.38%** regiones / **97.02%** líneas).
+- [x] `stretch_key` produce bytes idénticos a Go (enc y mac, PBKDF2 y Argon2id).
+- [x] `SymmetricKey::from_bytes` / `bytes()` roundtrip (64 bytes).
+- [x] `Keyring` lock/unlock con wipe.
+- [x] `stretch_key` usa `from_prk` (verificado por paridad).
+- [x] Stubs devuelven `NotImplemented`, sin mutar estado.
+- [x] Cobertura `keyhierarchy.rs` ≥90% (97.02% líneas).
 
 #### Controles obligatorios (2026-10-13)
 
 | Control | Comando | Resultado real |
 |---|---|---|
-| Pruebas unitarias | `cargo test --workspace --exclude sw-gui` | 42 pasan, 0 fallan, 0 ignorados |
+| Pruebas unitarias | `cargo test --workspace --exclude sw-gui` | 42 pasan, 0 fallan |
 | Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
 | Formato | `cargo fmt --all -- --check` | 0 diffs |
-| Auditoría | `cargo audit` | 0 vulnerabilidades (3 advisories con excepción en `.cargo/audit.toml`) |
-| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 94.50% líneas / 93.79% regiones |
+| Auditoría | `cargo audit` | 0 vulnerabilidades |
+| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 93.79% regiones / 94.50% líneas |
 
 **Cobertura por archivo (`sw-crypto`):**
 

@@ -141,6 +141,22 @@ Una historia pasa a `Hecho` solo cuando:
 
 ---
 
+### Estado de M1
+
+| Historia | Estado |
+|---|---|
+| SW-001 Memoria segura | ✅ Hecho |
+| SW-002 EncString | ✅ Hecho |
+| SW-003 KDF | ✅ Hecho |
+| SW-004 Jerarquía de claves | ✅ Hecho |
+| SW-005 Cifrado simétrico | Pendiente |
+| SW-006 RSA legacy | Pendiente |
+| SW-007 Fuzzing | Pendiente |
+
+*4 de 7 de M1 completadas. El camino crítico sigue con SW-005 — Cifrado simétrico (EncryptWith / DecryptWith).*
+
+---
+
 ## M2 — Config + migración `sw-config` (P0 — MVP)
 
 ### [SW-010] Estructura ConfigFile con serde
