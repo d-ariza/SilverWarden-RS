@@ -31,7 +31,13 @@ impl EncStringType {
     }
 
     pub fn has_mac(&self) -> bool {
-        !matches!(self, Self::AesCbc256B64)
+        matches!(
+            self,
+            Self::AesCbc128HmacSha256B64
+                | Self::AesCbc256HmacSha256B64
+                | Self::Rsa2048OaepSha256HmacSha256B64
+                | Self::Rsa2048OaepSha1HmacSha256B64
+        )
     }
 }
 
@@ -58,7 +64,7 @@ impl EncString {
         self.iv.is_empty() && self.ct.is_empty() && self.mac.is_empty()
     }
 
-    /// Serializes to the standard Bitwarden EncString string: `type.iv|ct[|mac]`
+    /// Serializes to the standard Bitwarden EncString string: `type.iv|ct[|mac]` or `type.ct` for asymmetric
     pub fn to_string_repr(&self) -> Result<String, CryptoError> {
         if self.is_null() {
             return Ok(String::new());
@@ -68,17 +74,36 @@ impl EncString {
             .cipher_type
             .ok_or_else(|| CryptoError::InvalidEncString("Missing cipher type".into()))?;
 
-        let iv_b64 = B64.encode(&self.iv);
-        let ct_b64 = B64.encode(&self.ct);
+        match cipher_type {
+            EncStringType::Rsa2048OaepSha1B64 | EncStringType::Rsa2048OaepSha256B64 => {
+                let ct_b64 = B64.encode(&self.ct);
+                if !self.mac.is_empty() {
+                    let mac_b64 = B64.encode(&self.mac);
+                    Ok(format!("{}.{}|{}", cipher_type as i32, ct_b64, mac_b64))
+                } else {
+                    Ok(format!("{}.{}", cipher_type as i32, ct_b64))
+                }
+            }
+            EncStringType::Rsa2048OaepSha256HmacSha256B64
+            | EncStringType::Rsa2048OaepSha1HmacSha256B64 => {
+                let ct_b64 = B64.encode(&self.ct);
+                let mac_b64 = B64.encode(&self.mac);
+                Ok(format!("{}.{}|{}", cipher_type as i32, ct_b64, mac_b64))
+            }
+            _ => {
+                let iv_b64 = B64.encode(&self.iv);
+                let ct_b64 = B64.encode(&self.ct);
 
-        if cipher_type.has_mac() {
-            let mac_b64 = B64.encode(&self.mac);
-            Ok(format!(
-                "{}.{}|{}|{}",
-                cipher_type as i32, iv_b64, ct_b64, mac_b64
-            ))
-        } else {
-            Ok(format!("{}.{}|{}", cipher_type as i32, iv_b64, ct_b64))
+                if cipher_type.has_mac() {
+                    let mac_b64 = B64.encode(&self.mac);
+                    Ok(format!(
+                        "{}.{}|{}|{}",
+                        cipher_type as i32, iv_b64, ct_b64, mac_b64
+                    ))
+                } else {
+                    Ok(format!("{}.{}|{}", cipher_type as i32, iv_b64, ct_b64))
+                }
+            }
         }
     }
 }
@@ -194,7 +219,28 @@ impl FromStr for EncString {
                     )))
                 }
             }
-            other => Err(CryptoError::UnsupportedCipherType(other as i32)),
+            EncStringType::Rsa2048OaepSha256HmacSha256B64
+            | EncStringType::Rsa2048OaepSha1HmacSha256B64 => {
+                if parts.len() == 2 {
+                    let ct = B64
+                        .decode(parts[0])
+                        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                    let mac = B64
+                        .decode(parts[1])
+                        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+                    Ok(Self {
+                        cipher_type: Some(cipher_type),
+                        iv: Vec::new(),
+                        ct,
+                        mac,
+                    })
+                } else {
+                    Err(CryptoError::InvalidEncString(format!(
+                        "Invalid asymmetric EncString with MAC parts count {}",
+                        parts.len()
+                    )))
+                }
+            }
         }
     }
 }
@@ -256,5 +302,168 @@ mod tests {
         assert!("invalid".parse::<EncString>().is_err());
         assert!("99.abc|def|ghi".parse::<EncString>().is_err());
         assert!("2.abc|def".parse::<EncString>().is_err()); // type 2 requires 3 parts
+    }
+
+    #[test]
+    fn test_roundtrip_type_1() {
+        let iv = vec![1u8; 16];
+        let ct = vec![2u8; 16];
+        let mac = vec![3u8; 32];
+        let enc = EncString::new(
+            EncStringType::AesCbc128HmacSha256B64,
+            iv.clone(),
+            ct.clone(),
+            mac.clone(),
+        );
+        let s = enc.to_string_repr().unwrap();
+        let parsed: EncString = s.parse().unwrap();
+        assert_eq!(
+            parsed.cipher_type,
+            Some(EncStringType::AesCbc128HmacSha256B64)
+        );
+        assert_eq!(parsed.iv, iv);
+        assert_eq!(parsed.ct, ct);
+        assert_eq!(parsed.mac, mac);
+    }
+
+    #[test]
+    fn test_roundtrip_asymmetric_sha1() {
+        let ct = vec![9u8; 256];
+        let enc = EncString::new(
+            EncStringType::Rsa2048OaepSha1B64,
+            vec![],
+            ct.clone(),
+            vec![],
+        );
+        let s = enc.to_string_repr().unwrap();
+        assert!(s.starts_with("4."));
+        let parsed: EncString = s.parse().unwrap();
+        assert_eq!(parsed.cipher_type, Some(EncStringType::Rsa2048OaepSha1B64));
+        assert_eq!(parsed.ct, ct);
+        assert!(parsed.iv.is_empty());
+        assert!(parsed.mac.is_empty());
+    }
+
+    #[test]
+    fn test_roundtrip_asymmetric_sha256() {
+        let ct = vec![7u8; 256];
+        let enc = EncString::new(
+            EncStringType::Rsa2048OaepSha256B64,
+            vec![],
+            ct.clone(),
+            vec![],
+        );
+        let s = enc.to_string_repr().unwrap();
+        assert!(s.starts_with("3."));
+        let parsed: EncString = s.parse().unwrap();
+        assert_eq!(
+            parsed.cipher_type,
+            Some(EncStringType::Rsa2048OaepSha256B64)
+        );
+        assert_eq!(parsed.ct, ct);
+    }
+
+    #[test]
+    fn test_roundtrip_asymmetric_with_mac() {
+        let ct = vec![7u8; 128];
+        let mac = vec![8u8; 32];
+        let enc = EncString::new(
+            EncStringType::Rsa2048OaepSha256HmacSha256B64,
+            vec![],
+            ct.clone(),
+            mac.clone(),
+        );
+        let s = enc.to_string_repr().unwrap();
+        assert!(s.starts_with("5."));
+        let parsed: EncString = s.parse().unwrap();
+        assert_eq!(
+            parsed.cipher_type,
+            Some(EncStringType::Rsa2048OaepSha256HmacSha256B64)
+        );
+        assert_eq!(parsed.ct, ct);
+        assert_eq!(parsed.mac, mac);
+    }
+
+    #[test]
+    fn test_display_trait() {
+        let enc = EncString::new(
+            EncStringType::AesCbc256B64,
+            vec![1u8; 16],
+            vec![2u8; 16],
+            vec![],
+        );
+        let displayed = format!("{}", enc);
+        assert!(displayed.starts_with("0."));
+
+        let invalid_enc = EncString {
+            cipher_type: None,
+            iv: vec![1],
+            ct: vec![2],
+            mac: vec![],
+        };
+        assert_eq!(format!("{}", invalid_enc), "");
+    }
+
+    #[test]
+    fn test_type_from_i32_all_variants() {
+        assert_eq!(
+            EncStringType::from_i32(0).unwrap(),
+            EncStringType::AesCbc256B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(1).unwrap(),
+            EncStringType::AesCbc128HmacSha256B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(2).unwrap(),
+            EncStringType::AesCbc256HmacSha256B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(3).unwrap(),
+            EncStringType::Rsa2048OaepSha256B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(4).unwrap(),
+            EncStringType::Rsa2048OaepSha1B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(5).unwrap(),
+            EncStringType::Rsa2048OaepSha256HmacSha256B64
+        );
+        assert_eq!(
+            EncStringType::from_i32(6).unwrap(),
+            EncStringType::Rsa2048OaepSha1HmacSha256B64
+        );
+        assert!(EncStringType::from_i32(99).is_err());
+    }
+
+    #[test]
+    fn test_invalid_base64() {
+        // type 0 with invalid base64
+        assert!("0.!!!invalid!!!|$$$invalid$$$"
+            .parse::<EncString>()
+            .is_err());
+    }
+
+    #[test]
+    fn test_missing_dot() {
+        assert!("nodothere".parse::<EncString>().is_err());
+    }
+
+    #[test]
+    fn test_invalid_type_integer() {
+        assert!("abc.aaaa|bbbb".parse::<EncString>().is_err());
+    }
+
+    #[test]
+    fn test_type_1_wrong_parts() {
+        // type 1 requires 3 parts
+        assert!("1.aaaa|bbbb".parse::<EncString>().is_err());
+        // type 0 requires 2 parts
+        assert!("0.aaaa".parse::<EncString>().is_err());
+        // type 4 rejects >2 parts
+        assert!("4.aaaa|bbbb|cccc".parse::<EncString>().is_err());
+        // type 5 requires 2 parts
+        assert!("5.aaaa".parse::<EncString>().is_err());
     }
 }

@@ -1,0 +1,15 @@
+[advisories]
+ignore = [
+    # Marvin Attack (RUSTSEC-2023-0071): timing sidechannel in rsa crate.
+    # Excepción aprobada y documentada: rsa es la única implementación madura en Rust para
+    # RSA-OAEP-SHA1 (necesaria para descifrar el encKey legacy de Bitwarden en SW-006).
+    # Su uso es local, confinado a descifrar encKey una única vez por sesión con datos propios en memoria,
+    # no expuesto a medición remota de timing por atacantes de red.
+    "RUSTSEC-2023-0071",
+
+    # proc-macro-error unmaintained (RUSTSEC-2024-0370): dependencia transitiva de build de Tauri, fuera del MVP CLI
+    "RUSTSEC-2024-0370",
+
+    # glib unsound (RUSTSEC-2024-0429): dependencia transitiva de Tauri/GTK, excluida del MVP CLI
+    "RUSTSEC-2024-0429",
+]

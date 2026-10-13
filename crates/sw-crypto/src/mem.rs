@@ -203,4 +203,38 @@ mod tests {
         assert_eq!(buf.len(), 64);
         assert_eq!(buf.as_slice(), &[0u8; 64]);
     }
+
+    #[test]
+    fn test_memory_buffer_with_capacity() {
+        let buf = MemoryBuffer::with_capacity(32);
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf.as_slice(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_memory_buffer_as_mut_slice() {
+        let mut buf = MemoryBuffer::new(b"hello");
+        buf.as_mut_slice()[0] = b'H';
+        assert_eq!(buf.as_slice(), b"Hello");
+    }
+
+    #[test]
+    fn test_mem_locked_as_mut_slice() {
+        let mut buf = MemLockedBuffer::new(b"hello").unwrap();
+        buf.as_mut_slice()[0] = b'H';
+        assert_eq!(buf.as_slice(), b"Hello");
+    }
+
+    #[test]
+    fn test_empty_memory_buffer() {
+        let buf = MemoryBuffer::new(&[]);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn test_mem_locked_with_capacity_zero() {
+        let buf = MemLockedBuffer::with_capacity(0).unwrap();
+        assert!(buf.is_empty());
+    }
 }
