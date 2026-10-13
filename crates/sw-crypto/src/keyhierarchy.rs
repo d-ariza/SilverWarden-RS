@@ -82,14 +82,10 @@ impl SymmetricKey {
         self.enc_key.wipe();
         self.mac_key.wipe();
     }
-}
 
-impl Clone for SymmetricKey {
-    fn clone(&self) -> Self {
-        Self {
-            enc_key: MemLockedBuffer::new(self.enc_key.as_slice()).expect("cloning locked enc_key"),
-            mac_key: MemLockedBuffer::new(self.mac_key.as_slice()).expect("cloning locked mac_key"),
-        }
+    /// Fallible clone. Returns error if memory locking fails for the new buffers.
+    pub fn try_clone(&self) -> Result<Self, CryptoError> {
+        Self::from_parts(self.enc_key.as_slice(), self.mac_key.as_slice())
     }
 }
 
@@ -290,9 +286,9 @@ mod tests {
     }
 
     #[test]
-    fn test_symmetric_key_clone_and_wipe() {
+    fn test_symmetric_key_try_clone_and_wipe() {
         let original = SymmetricKey::from_bytes(&[5u8; 64]).unwrap();
-        let mut cloned = original.clone();
+        let mut cloned = original.try_clone().unwrap();
         assert_eq!(cloned.bytes(), original.bytes());
 
         cloned.wipe();
@@ -401,10 +397,17 @@ mod tests {
             parallelism: None,
         };
 
+        let was_locked = keyring.is_locked();
+        let had_account_key = keyring.account_key().is_some();
+        let org_count = keyring.organization_keys().len();
+
         assert!(matches!(
             keyring.get_symmetric_key_for_organization("org-1"),
             Err(CryptoError::NotImplemented(_))
         ));
+        assert_eq!(keyring.is_locked(), was_locked);
+        assert_eq!(keyring.account_key().is_some(), had_account_key);
+        assert_eq!(keyring.organization_keys().len(), org_count);
 
         assert!(matches!(
             init_keyring_from_master_password(
@@ -418,15 +421,24 @@ mod tests {
             ),
             Err(CryptoError::NotImplemented(_))
         ));
+        assert_eq!(keyring.is_locked(), was_locked);
+        assert_eq!(keyring.account_key().is_some(), had_account_key);
+        assert_eq!(keyring.organization_keys().len(), org_count);
 
         assert!(matches!(
             init_keyring_from_master_key(&mut keyring, &enc_str, &enc_str, HashMap::new(), &mk),
             Err(CryptoError::NotImplemented(_))
         ));
+        assert_eq!(keyring.is_locked(), was_locked);
+        assert_eq!(keyring.account_key().is_some(), had_account_key);
+        assert_eq!(keyring.organization_keys().len(), org_count);
 
         assert!(matches!(
             init_keyring_from_user_symmetric_key(&mut keyring, sym_key, &enc_str, HashMap::new()),
             Err(CryptoError::NotImplemented(_))
         ));
+        assert_eq!(keyring.is_locked(), was_locked);
+        assert_eq!(keyring.account_key().is_some(), had_account_key);
+        assert_eq!(keyring.organization_keys().len(), org_count);
     }
 }

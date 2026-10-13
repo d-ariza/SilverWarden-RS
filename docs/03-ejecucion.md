@@ -239,16 +239,19 @@ Argon2id: 8fc048a537cbda3e8b6c8596a13ec3a879b929a1a0304dddffec8df18a06222f
   - `SymmetricKey`: estructura de 64 bytes conteniendo `enc_key` (32 bytes) y `mac_key` (32 bytes) protegidas con `MemLockedBuffer` (`mlock` + `MADV_DONTDUMP` + `zeroize` en Drop).
   - `SymmetricKey::from_bytes`: validación estricta de 64 bytes (`CryptoError::InvalidKeyLength`).
   - `SymmetricKey::bytes()`: concatenación `enc || mac` (64 bytes).
+  - `SymmetricKey::try_clone()`: clonación falible retornando `Result<Self, CryptoError>` sin panics (eliminado `impl Clone` con `.expect()`).
   - `SymmetricKey::wipe()`: reseteo explícito a ceros.
   - `stretch_key`: derivación mediante `Hkdf::<Sha256>::from_prk` y `expand(b"enc")` + `expand(b"mac")` hacia `SymmetricKey`.
   - `Keyring`: gestión en memoria de estado (`is_locked`, `account_key: Option<SymmetricKey>`, `organization_keys: HashMap<String, String>`).
-  - Stubs Opción A: `init_keyring_from_master_password`, `init_keyring_from_master_key`, `init_keyring_from_user_symmetric_key`, `get_symmetric_key_for_organization` retornando `CryptoError::NotImplemented`.
+  - Stubs Opción A: `init_keyring_from_master_password`, `init_keyring_from_master_key`, `init_keyring_from_user_symmetric_key`, `get_symmetric_key_for_organization` retornando `CryptoError::NotImplemented` garantizando no-mutación del `Keyring`.
 - `crates/sw-crypto/src/error.rs`: variantes `InvalidKeyLength(String)` y `NotImplemented(String)`.
 - `crates/sw-crypto/src/lib.rs`: re-exportación de tipos y funciones de `keyhierarchy`.
 
 #### Paridad criptográfica Go ↔ Rust (verificada)
 
-**Herramienta:** `tools/parity/main.go` en Goldwarden con helper `StretchKeyForParity`.
+**Herramienta:** `keyhierarchy_export_test.go` con build tag `//go:build parity` y runner `go test -v -tags=parity ./cli/agent/bitwarden/crypto -run TestStretchKeyParity` en Goldwarden.
+- `go build ./...` en Goldwarden: código 0, no incluye `StretchKeyForParity`.
+- `grep -rn "StretchKeyForParity" --include="*.go" . | grep -v "_test.go"`: 0 resultados.
 
 **Salida real de Go (2026-10-13):**
 ```text
@@ -272,10 +275,11 @@ Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e397
 - [x] `stretch_key` produce bytes idénticos a Go para la misma master key (enc, mac y concatenación).
 - [x] `SymmetricKey::from_bytes` / `bytes()` roundtrip exacto verificado.
 - [x] Validación estricta de 64 bytes (`CryptoError::InvalidKeyLength`).
+- [x] `SymmetricKey::try_clone()` implementado sin panics (`impl Clone` eliminado).
 - [x] `Keyring` lock/unlock funciona y limpia `account_key` y `organization_keys`.
 - [x] `stretch_key` utiliza `from_prk` (no `new`), verificado por test de paridad.
-- [x] Los stubs de Opción A devuelven `CryptoError::NotImplemented`.
-- [x] Cobertura ≥90% en `keyhierarchy.rs` (**96.04%** regiones / **96.90%** líneas).
+- [x] Los stubs de Opción A devuelven `CryptoError::NotImplemented` y no mutan el `Keyring`.
+- [x] Cobertura ≥90% en `keyhierarchy.rs` (**96.38%** regiones / **97.02%** líneas).
 
 #### Controles obligatorios (2026-10-13)
 
@@ -285,7 +289,7 @@ Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e397
 | Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
 | Formato | `cargo fmt --all -- --check` | 0 diffs |
 | Auditoría | `cargo audit` | 0 vulnerabilidades (3 advisories con excepción en `.cargo/audit.toml`) |
-| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 94.43% líneas / 93.62% regiones |
+| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 94.50% líneas / 93.79% regiones |
 
 **Cobertura por archivo (`sw-crypto`):**
 
@@ -293,9 +297,9 @@ Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e397
 |---|---|---|
 | `encstring.rs` | 90.54% | 92.28% |
 | `kdf.rs` | 93.88% | 94.31% |
-| `keyhierarchy.rs` | 96.04% | 96.90% |
+| `keyhierarchy.rs` | 96.38% | 97.02% |
 | `mem.rs` | 95.06% | 94.48% |
-| **TOTAL `sw-crypto`** | **93.62%** | **94.43%** |
+| **TOTAL `sw-crypto`** | **93.79%** | **94.50%** |
 
 **Estado:** ✅ SW-004 — Hecho (2026-10-13).
 
