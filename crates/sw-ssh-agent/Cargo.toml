@@ -1,0 +1,16 @@
+[package]
+name = "sw-ssh-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sw-vault = { workspace = true }
+sw-crypto = { workspace = true }
+ssh-key = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

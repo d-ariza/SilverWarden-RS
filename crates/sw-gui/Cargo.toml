@@ -1,0 +1,21 @@
+[package]
+name = "sw-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sw-ipc = { workspace = true }
+sw-config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tauri = { version = "2.0", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2.0" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
