@@ -70,7 +70,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** vectores cruzados Go↔Rust pasan; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-001 · **Estado:** Hecho
+**Depende de:** SW-001 · **Estado:** Hecho (2026-10-13)
 
 ---
 
