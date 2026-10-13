@@ -23,6 +23,9 @@ pub enum CryptoError {
     #[error("Key derivation failed: {0}")]
     KdfError(String),
 
+    #[error("Invalid KDF parameters: {0}")]
+    InvalidKdfParams(String),
+
     #[error("Decryption failed: {0}")]
     DecryptionFailed(String),
 
