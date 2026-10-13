@@ -12,6 +12,7 @@ Cargo.lock
 
 # Tauri build artifacts
 crates/sw-gui/src-tauri/target/
+**/gen/
 
 # IDE & Editor
 .vscode/

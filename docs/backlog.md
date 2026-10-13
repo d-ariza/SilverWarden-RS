@@ -35,7 +35,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** los 4 criterios pasan en CI; cobertura del crate ≥90%; evidencia en `03-ejecucion.md`.
 
-**Depende de:** — · **Estado:** Pendiente
+**Depende de:** — · **Estado:** Hecho
 
 ---
 
@@ -53,7 +53,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan; fuzz target en repo; evidencia en `03-ejecucion.md`.
 
-**Depende de:** — · **Estado:** Pendiente
+**Depende de:** — · **Estado:** Hecho
 
 ---
 

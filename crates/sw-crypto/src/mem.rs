@@ -73,6 +73,10 @@ impl LockedBuffer for MemLockedBuffer {
     fn len(&self) -> usize {
         self.data.len()
     }
+
+    fn wipe(&mut self) {
+        self.data.as_mut_slice().zeroize();
+    }
 }
 
 impl Zeroize for MemLockedBuffer {
@@ -83,13 +87,13 @@ impl Zeroize for MemLockedBuffer {
 
 impl Drop for MemLockedBuffer {
     fn drop(&mut self) {
-        self.zeroize();
         if self.locked && !self.data.is_empty() {
             let ptr = self.data.as_mut_ptr() as *mut core::ffi::c_void;
             unsafe {
                 let _ = rustix::mm::munlock(ptr, self.data.len());
             }
         }
+        self.data.zeroize();
     }
 }
 
@@ -126,6 +130,10 @@ impl LockedBuffer for MemoryBuffer {
 
     fn len(&self) -> usize {
         self.data.len()
+    }
+
+    fn wipe(&mut self) {
+        self.data.as_mut_slice().zeroize();
     }
 }
 
