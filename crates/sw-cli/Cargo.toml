@@ -1,0 +1,21 @@
+[package]
+name = "sw-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "silverwarden"
+path = "src/main.rs"
+
+[dependencies]
+sw-ipc = { workspace = true }
+sw-config = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]

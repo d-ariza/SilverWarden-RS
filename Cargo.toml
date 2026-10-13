@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sw-crypto",
+    "crates/sw-config",
+    "crates/sw-ipc",
+    "crates/sw-systemauth",
+    "crates/sw-agent",
+    "crates/sw-vault",
+    "crates/sw-bitwarden-api",
+    "crates/sw-ssh-agent",
+    "crates/sw-cli",
+    "crates/sw-notify",
+    "crates/sw-autotype",
+    "crates/sw-browserbiometrics",
+    "crates/sw-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["silverWarden-rs contributors"]
+license = "GPL-3.0"
+repository = "https://github.com/d-ariza/silverwarden-rs"
+
+[workspace.dependencies]
+# Internal workspace crates
+sw-crypto = { path = "crates/sw-crypto" }
+sw-config = { path = "crates/sw-config" }
+sw-ipc = { path = "crates/sw-ipc" }
+sw-systemauth = { path = "crates/sw-systemauth" }
+sw-agent = { path = "crates/sw-agent" }
+sw-vault = { path = "crates/sw-vault" }
+sw-bitwarden-api = { path = "crates/sw-bitwarden-api" }
+sw-ssh-agent = { path = "crates/sw-ssh-agent" }
+sw-notify = { path = "crates/sw-notify" }
+sw-autotype = { path = "crates/sw-autotype" }
+sw-browserbiometrics = { path = "crates/sw-browserbiometrics" }
+
+# Serialization & Error handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async & Runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptography (RustCrypto stack)
+zeroize = { version = "1.8", features = ["derive"] }
+rustix = { version = "0.38", features = ["mm"] }
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"
+hkdf = "0.12"
+argon2 = "0.5"
+pbkdf2 = { version = "0.12", default-features = false }
+rsa = "0.9"
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Network & WebSockets
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rmp-serde = "1.3"
+
+# SSH Key parsing and crypto
+ssh-key = { version = "0.6", features = ["rsa", "ed25519", "crypto"] }
+
+# Linux / System integrations
+zbus = "5.0"

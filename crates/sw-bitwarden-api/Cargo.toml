@@ -1,0 +1,19 @@
+[package]
+name = "sw-bitwarden-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sw-crypto = { workspace = true }
+sw-vault = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
