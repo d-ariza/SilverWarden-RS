@@ -1,3 +1,4 @@
+pub mod asymmetric;
 pub mod cipher;
 pub mod encstring;
 pub mod error;
@@ -5,6 +6,7 @@ pub mod kdf;
 pub mod keyhierarchy;
 pub mod mem;
 
+pub use asymmetric::{decrypt_with_asymmetric, encrypt_with_asymmetric, AsymmetricKey};
 pub use cipher::{decrypt_with, encrypt_with, encrypt_with_to_string};
 pub use encstring::{EncString, EncStringType};
 pub use error::CryptoError;

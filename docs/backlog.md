@@ -120,7 +120,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterio pasa con fixture; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-001 · **Estado:** Pendiente
+**Depende de:** SW-001 · **Estado:** Hecho (2026-10-13)
 
 ---
 

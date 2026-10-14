@@ -46,4 +46,13 @@ pub enum CryptoError {
 
     #[error("Invalid ciphertext: {0}")]
     InvalidCiphertext(String),
+
+    #[error("Invalid asymmetric key: {0}")]
+    InvalidAsymmetricKey(String),
+
+    #[error("Asymmetric decryption failed: {0}")]
+    AsymmetricDecryptionFailed(String),
+
+    #[error("Invalid prefix: {0}")]
+    InvalidPrefix(String),
 }

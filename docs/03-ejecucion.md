@@ -33,6 +33,7 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-003] KDF Bitwarden | Hecho | `cargo test -p sw-crypto`: 32 tests pasan, paridad byte a byte con Go |
 | M1 | [SW-004] Jerarquía de claves (HKDF stretch) | Hecho | `cargo test -p sw-crypto`: 42 tests pasan, stretch_key y SymmetricKey verificados Go↔Rust |
 | M1 | [SW-005] Cifrado simétrico EncryptWith/DecryptWith | Hecho | `cargo test -p sw-crypto`: 51 tests pasan, paridad exacta en Tipo 0 y Tipo 2, mitigación padding oracle |
+| M1 | [SW-006] RSA legacy OAEP-SHA1 | Hecho | `cargo test -p sw-crypto`: 61 tests pasan, interop bidireccional Go↔Rust, clave privada en memoria bloqueada |
 | M2 | Config y Migración `sw-config` | Pendiente | Por registrar |
 | M3 | Agente e IPC `sw-ipc`, `sw-agent`, `sw-systemauth` | Pendiente | Por registrar |
 | M4 | Vault y Bitwarden API `sw-vault`, `sw-bitwarden-api` | Pendiente | Por registrar |
@@ -384,6 +385,85 @@ PASS
 | **TOTAL `sw-crypto`** | **93.93%** | **93.38%** |
 
 **Estado:** ✅ SW-005 — Hecho (2026-10-13).
+
+---
+
+### 1.5 [SW-006] RSA legacy OAEP-SHA1
+
+**Commit:** Implementación y verificación de interoperabilidad (2026-10-13).
+
+**Alcance:** Cifrado y descifrado asimétrico RSA-2048 OAEP con SHA-1 (`encrypt_with_asymmetric`, `decrypt_with_asymmetric`), generación de pares de claves (`AsymmetricKey::generate`) con entropía del SO (`OsRng`), parseo de claves privadas PKCS#8 DER en memoria bloqueada (`MemLockedBuffer`), exportación de clave pública en formato PKIX/SPKI DER (`public_bytes`), soporte de formato en cable `4.<base64>` (Tipo 4 de Bitwarden). Corrección conceptual del RNG en cifrado simétrico migrado a `OsRng`.
+
+#### Implementación
+
+- `crates/sw-crypto/src/asymmetric.rs`:
+  - `AsymmetricKey`: envuelve la clave privada PKCS#8 en `MemLockedBuffer` (`mlock` + `MADV_DONTDUMP` + `zeroize` on drop). Implementa `generate()`, `from_pkcs8()`, `private_bytes()`, `public_bytes()`, `try_clone()`, `wipe()` y `Debug` redactado.
+  - `encrypt_with_asymmetric`: cifra con RSAES-OAEP-SHA1 y serializa a `4.<base64>`.
+  - `decrypt_with_asymmetric`: valida prefijo `4.`, decodifica base64 y descifra con RSAES-OAEP-SHA1.
+- `crates/sw-crypto/src/cipher.rs`:
+  - Migración de `rand::thread_rng()` a `rand::rngs::OsRng` para generación de IV aleatorio en `encrypt_aes_cbc_256` (paridad conceptual con `crypto/rand` de Go).
+- `crates/sw-crypto/src/error.rs`:
+  - Nuevas variantes tipadas: `InvalidAsymmetricKey(String)`, `AsymmetricDecryptionFailed(String)`, `InvalidPrefix(String)`.
+- `crates/sw-crypto/src/lib.rs`:
+  - Re-exportación de `AsymmetricKey`, `encrypt_with_asymmetric`, `decrypt_with_asymmetric`.
+- `Cargo.toml` (raíz y `sw-crypto`):
+  - Inclusión de dependencia `sha1 = "0.10"`.
+
+#### Interoperabilidad Criptográfica Go ↔ Rust (verificada)
+
+**Herramienta:** `cli/agent/bitwarden/crypto/parity_test.go` (`TestAsymmetricParity` y `TestDecryptRustCiphertext`).
+
+**1. Go genera clave y cifra fixture $\rightarrow$ Rust descifra:**
+- Plaintext: `symmetric-org-key-secret-payload-64-bytes-long-padding-test-1234`
+- Go Wire Ciphertext: `4.EyXlIUCwHtcE34SrfzHPFpTMGXnqWeSl/b8Zr3p4UVekQQ4YrSEkW5EC4odCU2dZZ3lniP/5avOmfv/13AlFFpaV85BVOf2PUO0brEy+KHz5F7VhjLSE4VwDwnpQEtDOD8OsdXs0T16mPoHaCDcV8eNiNAw5honLLXZfvJI7HXp7EnK4SPFtcJVQk+dbOZ+9KPLB1+faxjTz7LFKXACVBZs2g7m4xiWrybOawPQ8J3vqgOhU3QQmFwXbu9hlNvUq4MSBHA42XsMHnBVUcCPUxDrSpzDgDKDbSLR/PLaYeV+Xm7SdAkO8ZNrb4B2GJ+BL+1IFEyghkBHy4e3kFJsUNA==`
+- Resultado en Rust (`test_parity_decrypt_go_fixture`): Descifra exitosamente el texto original. ✅
+
+**2. Rust cifra con clave pública de Go $\rightarrow$ Go descifra:**
+- Plaintext: `testing rust encryption with go public key`
+- Rust Wire Ciphertext: `4.xIYUaJTv5P5fMNvi7OV0lu8vnk88BTGjnw6LF+lNJWeclCmRssSE2j20dOAfGT6VrdBXQsZYhpzxwkGkQR/XZ4gn0DY2QyH1Vw6eK986rBZskQjZl5qF8R7bJiA6M0+GIzcfSAfe25VqDKA0ECvK2okXbmtMbH2abHq3OF9Bo8Am01ISApyIJUlgV7UKShlaxZD9QFDw1sTj60bKr7E4z+JKmN3jvUhJuGwle9gFp2ctMRXghSOxX6BVqJMYuoFVYCGzKt3b4Xi9WNVAY6T9NBUAZYexgYI2HIG0kit9ddP/Un25kwLC6J/3sSWJ+DkgOiVDwQevR3tnjyhlGKcizQ==`
+- Salida real de Go (`TestDecryptRustCiphertext`):
+```text
+=== RUN   TestDecryptRustCiphertext
+=== INTEROP SUCCESS: Go successfully decrypted Rust ciphertext! ===
+Decrypted: "testing rust encryption with go public key"
+--- PASS: TestDecryptRustCiphertext (0.01s)
+PASS
+```
+- Resultado: Interoperabilidad bidireccional Go ↔ Rust 100% verificada. ✅
+
+#### Criterios de aceptación
+- [x] `generate()` produce clave RSA-2048 válida y `from_pkcs8()` la reparsea.
+- [x] `encrypt_with_asymmetric` produce prefijo `"4."` + base64 válido.
+- [x] `decrypt_with_asymmetric` descifra el output de Go (interop).
+- [x] Go descifra el output de Rust (interop).
+- [x] OAEP-SHA1 correcto (paridad de algoritmo con Bitwarden).
+- [x] Clave privada alojada en memoria bloqueada (`MemLockedBuffer`).
+- [x] Cobertura en `asymmetric.rs` ≥90% (**92.38%** regiones / **94.21%** líneas).
+- [x] Clippy, fmt y audit limpios sin advertencias.
+
+#### Controles obligatorios (2026-10-13)
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias | `cargo test --workspace --exclude sw-gui` | 61 pasan en sw-crypto, 0 fallan, 0 ignorados |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (3 advisories con excepción en `.cargo/audit.toml`) |
+| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 93.68% regiones / 93.49% líneas |
+
+**Cobertura por archivo (`sw-crypto`):**
+
+| Archivo | Regiones | Líneas |
+|---|---|---|
+| `asymmetric.rs` | 92.38% | 94.21% |
+| `cipher.rs` | 94.62% | 90.17% |
+| `encstring.rs` | 90.34% | 91.84% |
+| `kdf.rs` | 93.88% | 94.31% |
+| `keyhierarchy.rs` | 96.38% | 97.02% |
+| `mem.rs` | 95.06% | 94.48% |
+| **TOTAL `sw-crypto`** | **93.68%** | **93.49%** |
+
+**Estado:** ✅ SW-006 — Hecho (2026-10-13).
 
 
 

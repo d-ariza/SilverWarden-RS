@@ -96,7 +96,7 @@ pub fn encrypt_aes_cbc_256(
         }
         iv.copy_from_slice(user_iv);
     } else {
-        rand::thread_rng().fill_bytes(&mut iv);
+        rand::rngs::OsRng.fill_bytes(&mut iv);
     }
 
     let mut padded = pkcs7_pad(plaintext, BLOCK_SIZE)?;
