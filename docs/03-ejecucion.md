@@ -390,7 +390,7 @@ PASS
 
 ### 1.5 [SW-006] RSA legacy OAEP-SHA1
 
-**Commit:** Implementación y verificación de interoperabilidad (2026-10-13).
+**Commit:** `8411191` (implementación) + verificación de interoperabilidad (2026-10-13).
 
 **Alcance:** Cifrado y descifrado asimétrico RSA-2048 OAEP con SHA-1 (`encrypt_with_asymmetric`, `decrypt_with_asymmetric`), generación de pares de claves (`AsymmetricKey::generate`) con entropía del SO (`OsRng`), parseo de claves privadas PKCS#8 DER en memoria bloqueada (`MemLockedBuffer`), exportación de clave pública en formato PKIX/SPKI DER (`public_bytes`), soporte de formato en cable `4.<base64>` (Tipo 4 de Bitwarden). Corrección conceptual del RNG en cifrado simétrico migrado a `OsRng`.
 
