@@ -75,6 +75,8 @@ impl EncString {
             .ok_or_else(|| CryptoError::InvalidEncString("Missing cipher type".into()))?;
 
         match cipher_type {
+            // D21: Parity with Go MarshalText() which returns nil, nil (empty string) for type 0
+            EncStringType::AesCbc256B64 => Ok(String::new()),
             EncStringType::Rsa2048OaepSha1B64 | EncStringType::Rsa2048OaepSha256B64 => {
                 let ct_b64 = B64.encode(&self.ct);
                 if !self.mac.is_empty() {
@@ -280,15 +282,16 @@ mod tests {
         let iv = vec![1, 2, 3, 4];
         let ct = vec![5, 6, 7, 8];
 
-        let enc = EncString::new(EncStringType::AesCbc256B64, iv.clone(), ct.clone(), vec![]);
-        let serialized = enc.to_string_repr().unwrap();
-        assert!(serialized.starts_with("0."));
-
-        let parsed: EncString = serialized.parse().unwrap();
+        let raw_type_0 = format!("0.{}|{}", B64.encode(&iv), B64.encode(&ct));
+        let parsed: EncString = raw_type_0.parse().unwrap();
         assert_eq!(parsed.cipher_type, Some(EncStringType::AesCbc256B64));
         assert_eq!(parsed.iv, iv);
         assert_eq!(parsed.ct, ct);
         assert!(parsed.mac.is_empty());
+
+        // D21: Go parity - MarshalText/to_string_repr returns empty string for type 0
+        assert_eq!(parsed.to_string_repr().unwrap(), "");
+        assert_eq!(parsed.to_string(), "");
     }
 
     #[test]
@@ -386,14 +389,23 @@ mod tests {
 
     #[test]
     fn test_display_trait() {
-        let enc = EncString::new(
+        let enc_0 = EncString::new(
             EncStringType::AesCbc256B64,
             vec![1u8; 16],
             vec![2u8; 16],
             vec![],
         );
-        let displayed = format!("{}", enc);
-        assert!(displayed.starts_with("0."));
+        // D21: Type 0 format produces empty string (Go parity)
+        assert_eq!(format!("{}", enc_0), "");
+
+        let enc_2 = EncString::new(
+            EncStringType::AesCbc256HmacSha256B64,
+            vec![1u8; 16],
+            vec![2u8; 16],
+            vec![3u8; 32],
+        );
+        let displayed_2 = format!("{}", enc_2);
+        assert!(displayed_2.starts_with("2."));
 
         let invalid_enc = EncString {
             cipher_type: None,

@@ -37,4 +37,13 @@ pub enum CryptoError {
 
     #[error("Feature not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("Invalid PKCS7 padding: {0}")]
+    InvalidPadding(String),
+
+    #[error("MAC mismatch: {0}")]
+    MacMismatch(String),
+
+    #[error("Invalid ciphertext: {0}")]
+    InvalidCiphertext(String),
 }

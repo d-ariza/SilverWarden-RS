@@ -32,6 +32,7 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-002] EncString parser/serializador | Hecho | `cargo test -p sw-crypto`: 4 tests pasan (roundtrip 0/2, null, invalid) |
 | M1 | [SW-003] KDF Bitwarden | Hecho | `cargo test -p sw-crypto`: 32 tests pasan, paridad byte a byte con Go |
 | M1 | [SW-004] Jerarquía de claves (HKDF stretch) | Hecho | `cargo test -p sw-crypto`: 42 tests pasan, stretch_key y SymmetricKey verificados Go↔Rust |
+| M1 | [SW-005] Cifrado simétrico EncryptWith/DecryptWith | Hecho | `cargo test -p sw-crypto`: 51 tests pasan, paridad exacta en Tipo 0 y Tipo 2, mitigación padding oracle |
 | M2 | Config y Migración `sw-config` | Pendiente | Por registrar |
 | M3 | Agente e IPC `sw-ipc`, `sw-agent`, `sw-systemauth` | Pendiente | Por registrar |
 | M4 | Vault y Bitwarden API `sw-vault`, `sw-bitwarden-api` | Pendiente | Por registrar |
@@ -289,6 +290,101 @@ Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e397
 | **TOTAL `sw-crypto`** | **93.79%** | **94.50%** |
 
 **Estado:** ✅ SW-004 — Hecho (2026-10-13).
+
+---
+
+### 1.4 [SW-005] Cifrado simétrico (EncryptWith / DecryptWith)
+
+**Commit:** Implementación y verificación de paridad (2026-10-13).
+
+**Alcance:** Cifrado y descifrado simétrico AES-256-CBC con padding PKCS#7 y autenticación HMAC-SHA256 (`encrypt_with`, `encrypt_with_to_string`, `decrypt_with`). Soporte de Tipo 0 (`AesCbc256_B64`) y Tipo 2 (`AesCbc256_HmacSha256_B64`). Corrección D20 (unpad completo) y D21 (Tipo 0 serializa a cadena vacía).
+
+#### Implementación
+
+- `crates/sw-crypto/src/cipher.rs`:
+  - `pkcs7_pad` / `pkcs7_unpad`: padding PKCS#7 con validación estricta de uniformidad en todos los bytes de relleno (decisión D20, corrigiendo el defecto de validación parcial de Go).
+  - `is_mac_valid`: verificación HMAC-SHA256 en tiempo constante con `subtle::ConstantTimeEq`.
+  - `encrypt_aes_cbc_256`: cifrado AES-256-CBC usando `cbc::Encryptor<aes::Aes256>` con IV aleatorio de `rand::thread_rng()` u opcionalmente fijo para pruebas deterministas.
+  - `decrypt_aes_cbc_256`: descifrado AES-256-CBC con validaciones de tamaño de bloque y desacolchado PKCS#7.
+  - `encrypt_with` / `encrypt_with_to_string`: construcción de `EncString` (con cálculo de MAC sobre `IV || CT` para Tipo 2).
+  - `decrypt_with`: verificación del MAC previa a cualquier intento de descifrado (mitigación anti padding-oracle), logging de advertencia para Tipo 0 insecure (`tracing::warn!`).
+- `crates/sw-crypto/src/encstring.rs`:
+  - Corrección D21: `EncString::to_string_repr()` devuelve `Ok(String::new())` para Tipo 0 (`AesCbc256B64`), asegurando paridad exacta con `MarshalText()` de Go.
+- `crates/sw-crypto/src/error.rs`:
+  - Variantes `InvalidPadding(String)`, `MacMismatch(String)`, `InvalidCiphertext(String)`.
+- `crates/sw-crypto/src/lib.rs`:
+  - Re-exportación de `encrypt_with`, `encrypt_with_to_string`, `decrypt_with`.
+
+#### Paridad criptográfica Go ↔ Rust (verificada)
+
+**Herramienta:** `cli/agent/bitwarden/crypto/parity_test.go` ejecutada vía `go test -v -tags=parity ./cli/agent/bitwarden/crypto -run TestCipherParity` en Goldwarden.
+
+**Inputs comunes:**
+- Plaintext = `hello world`
+- EncKey = `0x42` × 32 bytes (`42424242...`)
+- MacKey = `0x43` × 32 bytes (`43434343...`)
+- IV fijo = `0x24` × 16 bytes (`24242424...`)
+
+**Salida real de Go (2026-10-13):**
+```text
+=== RUN   TestCipherParity
+=== CIPHER TYPE 2 PARITY ===
+Plaintext:  hello world
+EncKey:     4242424242424242424242424242424242424242424242424242424242424242
+MacKey:     4343434343434343434343434343434343434343434343434343434343434343
+IV:         24242424242424242424242424242424
+CT:         edcfa3ee3645667d5e9b3b4fbbcce520
+MAC:        56105a93e5dbd81bcdf3f030182b109ba2d7fa99108e0fda4b468c2322a30ca4
+Wire:       2.JCQkJCQkJCQkJCQkJCQkJA==|7c+j7jZFZn1emztPu8zlIA==|VhBak+Xb2BvN8/AwGCsQm6LX+pkQjg/aS0aMIyKjDKQ=
+
+[WRN] [18:46] [Goldwarden > Crypto] >>> WARNING: VAULT CONTAINS	INSECURE AesCbc256_B64 CIPHER, PLEASE ROTATE YOUR VAULT	KEYS IN	THE	WEB	VAULT
+=== CIPHER TYPE 0 PARITY ===
+CT (type 0): edcfa3ee3645667d5e9b3b4fbbcce520
+Wire (type 0): 
+Wire len (type 0): 0
+Tampered MAC error: decrypt: MAC mismatch
+--- PASS: TestCipherParity (0.00s)
+PASS
+```
+
+**Resultado en Rust:**
+- `test_parity_go_cipher_type_2`: CT, MAC y wire string coinciden exactamente byte a byte ✅
+- `test_parity_go_cipher_type_0`: CT coincide y wire string devuelve cadena vacía de 0 bytes (D21) ✅
+- `test_mac_mismatch_fails_before_decrypt`: MAC alterada falla inmediatamente con `CryptoError::MacMismatch` sin ejecutar descifrado ✅
+- Descifrado cruzado: el wire string generado por Go es descifrado correctamente por Rust produciendo `hello world` ✅
+
+#### Criterios de aceptación
+- [x] `encrypt_with` produce CT + MAC idénticos a Go para mismo plaintext, key, IV y tipo 2.
+- [x] `decrypt_with` descifra a plaintext idéntico a Go para strings cifrados por Go.
+- [x] MAC inválida es rechazada con `CryptoError::MacMismatch` antes de descifrar.
+- [x] Tipo 0 descifra correctamente emitiendo advertencia (`tracing::warn!`).
+- [x] `pkcs7_unpad` valida el relleno completo byte a byte (D20).
+- [x] `to_string_repr` para Tipo 0 devuelve `""` (D21).
+- [x] Cobertura en `cipher.rs` ≥90% (**94.62%** regiones / **90.17%** líneas).
+
+#### Controles obligatorios (2026-10-13)
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias | `cargo test --workspace --exclude sw-gui` | 51 pasan, 0 fallan, 0 ignorados |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (3 advisories con excepción en `.cargo/audit.toml`) |
+| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 93.93% regiones / 93.38% líneas |
+
+**Cobertura por archivo (`sw-crypto`):**
+
+| Archivo | Regiones | Líneas |
+|---|---|---|
+| `cipher.rs` | 94.62% | 90.17% |
+| `encstring.rs` | 90.34% | 91.84% |
+| `kdf.rs` | 93.88% | 94.31% |
+| `keyhierarchy.rs` | 96.38% | 97.02% |
+| `mem.rs` | 95.06% | 94.48% |
+| **TOTAL `sw-crypto`** | **93.93%** | **93.38%** |
+
+**Estado:** ✅ SW-005 — Hecho (2026-10-13).
+
 
 
 

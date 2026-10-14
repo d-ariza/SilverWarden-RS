@@ -104,7 +104,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-002, SW-004 · **Estado:** Pendiente
+**Depende de:** SW-002, SW-004 · **Estado:** Hecho (2026-10-13)
 
 ---
 
@@ -149,11 +149,11 @@ Una historia pasa a `Hecho` solo cuando:
 | SW-002 EncString | ✅ Hecho |
 | SW-003 KDF | ✅ Hecho |
 | SW-004 Jerarquía de claves | ✅ Hecho |
-| SW-005 Cifrado simétrico | Pendiente |
+| SW-005 Cifrado simétrico | ✅ Hecho |
 | SW-006 RSA legacy | Pendiente |
 | SW-007 Fuzzing | Pendiente |
 
-*4 de 7 de M1 completadas. El camino crítico sigue con SW-005 — Cifrado simétrico (EncryptWith / DecryptWith).*
+*5 de 7 de M1 completadas. El camino crítico sigue con SW-006 — RSA legacy (OAEP-SHA1).*
 
 ---
 
