@@ -295,7 +295,7 @@ Argon2id stretch all: f7f449446a3e586d480c4aa83a4640c180a8737fcc6efd7a483645e397
 
 ### 1.4 [SW-005] Cifrado simétrico (EncryptWith / DecryptWith)
 
-**Commit:** Implementación y verificación de paridad (2026-10-13).
+**Commit:** `e7c5328` (implementación) + verificación de paridad (2026-10-13).
 
 **Alcance:** Cifrado y descifrado simétrico AES-256-CBC con padding PKCS#7 y autenticación HMAC-SHA256 (`encrypt_with`, `encrypt_with_to_string`, `decrypt_with`). Soporte de Tipo 0 (`AesCbc256_B64`) y Tipo 2 (`AesCbc256_HmacSha256_B64`). Corrección D20 (unpad completo) y D21 (Tipo 0 serializa a cadena vacía).
 
