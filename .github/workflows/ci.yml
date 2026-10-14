@@ -34,3 +34,29 @@ jobs:
 
       - name: Run Tests
         run: cargo test --workspace --exclude sw-gui --verbose
+
+  fuzz:
+    name: Fuzzing (5 min per target)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Fuzz EncString parser
+        run: cd fuzz && cargo +nightly fuzz run fuzz_encstring_parse -- -max_total_time=300
+
+      - name: Fuzz PKCS7 unpad
+        run: cd fuzz && cargo +nightly fuzz run fuzz_pkcs7_unpad -- -max_total_time=300
+
+      - name: Fuzz decrypt_with
+        run: cd fuzz && cargo +nightly fuzz run fuzz_decrypt_with -- -max_total_time=300
+
+      - name: Fuzz decrypt_with_asymmetric
+        run: cd fuzz && cargo +nightly fuzz run fuzz_decrypt_with_asymmetric -- -max_total_time=300
+

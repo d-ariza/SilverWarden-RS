@@ -137,7 +137,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** CI verde con fuzz; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-002, SW-005 · **Estado:** Pendiente
+**Depende de:** SW-002, SW-005 · **Estado:** Hecho (2026-10-13)
 
 ---
 
@@ -150,10 +150,11 @@ Una historia pasa a `Hecho` solo cuando:
 | SW-003 KDF | ✅ Hecho |
 | SW-004 Jerarquía de claves | ✅ Hecho |
 | SW-005 Cifrado simétrico | ✅ Hecho |
-| SW-006 RSA legacy | Pendiente |
-| SW-007 Fuzzing | Pendiente |
+| SW-006 RSA legacy | ✅ Hecho |
+| SW-007 Fuzzing | ✅ Hecho |
 
-*5 de 7 de M1 completadas. El camino crítico sigue con SW-006 — RSA legacy (OAEP-SHA1).*
+*7 de 7 de M1 completadas. Milestone M1 (Criptografía y Memoria Segura) 100% completado.*
+
 
 ---
 

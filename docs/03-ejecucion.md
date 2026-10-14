@@ -34,6 +34,7 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-004] Jerarquía de claves (HKDF stretch) | Hecho | `cargo test -p sw-crypto`: 42 tests pasan, stretch_key y SymmetricKey verificados Go↔Rust |
 | M1 | [SW-005] Cifrado simétrico EncryptWith/DecryptWith | Hecho | `cargo test -p sw-crypto`: 51 tests pasan, paridad exacta en Tipo 0 y Tipo 2, mitigación padding oracle |
 | M1 | [SW-006] RSA legacy OAEP-SHA1 | Hecho | `cargo test -p sw-crypto`: 61 tests pasan, interop bidireccional Go↔Rust, clave privada en memoria bloqueada |
+| M1 | [SW-007] Suite de fuzzing en sw-crypto | Hecho | cargo-fuzz con 4 targets (EncString, pkcs7_unpad, decrypt_with, decrypt_asym), corpus semilla, CI job, 0 crashes |
 | M2 | Config y Migración `sw-config` | Pendiente | Por registrar |
 | M3 | Agente e IPC `sw-ipc`, `sw-agent`, `sw-systemauth` | Pendiente | Por registrar |
 | M4 | Vault y Bitwarden API `sw-vault`, `sw-bitwarden-api` | Pendiente | Por registrar |
@@ -464,6 +465,76 @@ PASS
 | **TOTAL `sw-crypto`** | **93.68%** | **93.49%** |
 
 **Estado:** ✅ SW-006 — Hecho (2026-10-13).
+
+---
+
+### 1.6 [SW-007] Suite de fuzzing en sw-crypto
+
+**Commit:** Implementación y verificación de fuzzing (2026-10-13).
+
+**Alcance:** Infraestructura completa de fuzzing continuo con `cargo-fuzz` y `libFuzzer` para los parsers criptográficos de `sw-crypto`. Cuatro targets implementados (`fuzz_encstring_parse`, `fuzz_pkcs7_unpad`, `fuzz_decrypt_with`, `fuzz_decrypt_with_asymmetric`), corpus semilla estructurado versionado, job de CI de 5 minutos por target en `main`, y reglas `.gitignore` para aislar corpus y artefactos generados. Cierre de Milestone M1.
+
+#### Implementación
+
+- `fuzz/Cargo.toml`: workspace propio para fuzz targets con dependencia a `sw-crypto` (`path = "../crates/sw-crypto"`) y `libfuzzer-sys = "0.4"`.
+- `fuzz/.gitignore`: reglas para ignorar `target/`, `artifacts/`, `coverage/` y corpus generados dinámicamente (`corpus/*/*`), preservando los archivos de corpus semilla (`!corpus/*/valid*`, `!corpus/*/invalid*`, `!corpus/*/seed*`).
+- `crates/sw-crypto/src/lib.rs`: re-exportación pública de `pkcs7_pad` y `pkcs7_unpad`.
+- `.github/workflows/ci.yml`: job `fuzz` automatizado en pushes a rama `main` (5 min por target, total 20 min).
+
+#### Fuzz Targets Implementados
+
+1. **`fuzz_encstring_parse`** (`fuzz/fuzz_targets/fuzz_encstring_parse.rs`):
+   - Ejercita el parser `EncString::from_str` con bytes UTF-8 arbitrarios.
+   - Cero panics en entradas malformadas, faltantes de delimitadores (`.`, `|`), o bases64 inválidos.
+2. **`fuzz_pkcs7_unpad`** (`fuzz/fuzz_targets/fuzz_pkcs7_unpad.rs`):
+   - Ejercita la función de desacolchado PKCS#7 estricta (`pkcs7_unpad(data, 16)`).
+   - Valida resistencia ante paddings truncados, nulos, o inconsistentes sin desbordamientos de buffer.
+3. **`fuzz_decrypt_with`** (`fuzz/fuzz_targets/fuzz_decrypt_with.rs`):
+   - Parsea `EncString` y ejecuta `decrypt_with` contra una clave simétrica de 64 bytes (`SymmetricKey`).
+   - Verifica que alteraciones de MAC, IVs inválidos o payloads corruptos retornen errores tipados sin panic.
+4. **`fuzz_decrypt_with_asymmetric`** (`fuzz/fuzz_targets/fuzz_decrypt_with_asymmetric.rs`):
+   - Ejecuta `decrypt_with_asymmetric` con clave privada RSA-2048 PKCS#8 válida contra entradas arbitrarias.
+   - Verifica manejo de prefijos inválidos, decodificación base64 y fallos de descifrado OAEP-SHA1 sin pánico.
+
+#### Corpus Semilla
+
+- `fuzz/corpus/fuzz_encstring_parse/`: `valid_type_0`, `valid_type_2`, `invalid_no_dot`, `invalid_type`.
+- `fuzz/corpus/fuzz_pkcs7_unpad/`: `valid_16`, `invalid_padding`.
+- `fuzz/corpus/fuzz_decrypt_with/`: `valid_type_2`, `valid_type_0`, `invalid_tampered`.
+- `fuzz/corpus/fuzz_decrypt_with_asymmetric/`: `valid_go_wire`, `invalid_prefix`, `invalid_short`.
+
+#### Evidencia Real de Ejecución de Fuzzing (2026-10-13)
+
+| Target | Ejecuciones locales | Tiempo | Crashes | Cobertura alcanzada |
+|---|---|---|---|---|
+| `fuzz_encstring_parse` | 462,130 runs | 16s | **0** | cov: 496, ft: 1262 |
+| `fuzz_pkcs7_unpad` | 732,109 runs | 16s | **0** | cov: 38, ft: 49 |
+| `fuzz_decrypt_with` | 211,817 runs | 16s | **0** | cov: 725, ft: 1441 |
+| `fuzz_decrypt_with_asymmetric` | 4,779 runs | 16s | **0** | cov: 1327, ft: 2281 |
+| **TOTAL** | **1,410,835 runs** | **64s** | **0 crashes** | Robusto |
+
+#### Criterios de Aceptación
+- [x] `cargo-fuzz` configurado y funcional en `fuzz/` con workspace independiente.
+- [x] 4 targets implementados y compilados exitosamente.
+- [x] Corpus semilla estructurado y versionado en git.
+- [x] Cada target ejecutado localmente sin crashes (>1.4 millones de ejecuciones acumuladas).
+- [x] Job `fuzz` añadido a `.github/workflows/ci.yml` (5 min por target en `main`).
+- [x] `.gitignore` aísla target, artefactos y corpus generados sin omitir el corpus semilla.
+- [x] Evidencia real documentada en `03-ejecucion.md`.
+
+#### Controles obligatorios (2026-10-13)
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias | `cargo test --workspace --exclude sw-gui` | 61 pasan en sw-crypto, 0 fallan, 0 ignorados |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (3 advisories con excepción en `.cargo/audit.toml`) |
+| Cobertura `sw-crypto` | `cargo llvm-cov -p sw-crypto --summary-only` | 93.68% regiones / 93.49% líneas |
+
+**Estado:** ✅ SW-007 — Hecho (2026-10-13).  
+**Hito:** 🏁 **Milestone M1 (Criptografía y Memoria Segura) COMPLETADO al 100%.**
+
 
 
 

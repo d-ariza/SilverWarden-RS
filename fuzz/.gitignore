@@ -1,0 +1,8 @@
+target/
+artifacts/
+coverage/
+corpus/*/*
+!corpus/*/.gitkeep
+!corpus/*/valid*
+!corpus/*/invalid*
+!corpus/*/seed*
