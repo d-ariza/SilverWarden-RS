@@ -470,7 +470,7 @@ PASS
 
 ### 1.6 [SW-007] Suite de fuzzing en sw-crypto
 
-**Commit:** Implementación y verificación de fuzzing (2026-10-13).
+**Commit:** `8290831` (implementación) + verificación de fuzzing (2026-10-13).
 
 **Alcance:** Infraestructura completa de fuzzing continuo con `cargo-fuzz` y `libFuzzer` para los parsers criptográficos de `sw-crypto`. Cuatro targets implementados (`fuzz_encstring_parse`, `fuzz_pkcs7_unpad`, `fuzz_decrypt_with`, `fuzz_decrypt_with_asymmetric`), corpus semilla estructurado versionado, job de CI de 5 minutos por target en `main`, y reglas `.gitignore` para aislar corpus y artefactos generados. Cierre de Milestone M1.
 
