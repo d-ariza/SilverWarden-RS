@@ -191,7 +191,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con fixture real y tests de roundtrip; evidencia en `03-ejecucion.md`.
 
-**Depende de:** — · **Estado:** Pendiente
+**Depende de:** — · **Estado:** Hecho (2026-10-18)
 
 ---
 

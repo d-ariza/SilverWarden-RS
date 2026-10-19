@@ -35,7 +35,7 @@ impl AgentDaemon {
                 let state = self.state.read().await;
                 IpcResponse::Ok(serde_json::json!({
                     "locked": state.is_locked,
-                    "version": state.config.version,
+                    "version": env!("CARGO_PKG_VERSION"),
                 }))
             }
             IpcRequest::Unlock { pin: _ } => {

@@ -35,7 +35,7 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-005] Cifrado simétrico EncryptWith/DecryptWith | Hecho | `cargo test -p sw-crypto`: 51 tests pasan, paridad exacta en Tipo 0 y Tipo 2, mitigación padding oracle |
 | M1 | [SW-006] RSA legacy OAEP-SHA1 | Hecho | `cargo test -p sw-crypto`: 61 tests pasan, interop bidireccional Go↔Rust, clave privada en memoria bloqueada |
 | M1 | [SW-007] Suite de fuzzing en sw-crypto | Hecho | cargo-fuzz con 4 targets (EncString, pkcs7_unpad, decrypt_with, decrypt_asym), corpus semilla, CI job, 0 crashes |
-| M2 | [SW-010] Estructura ConfigFile con serde | Pendiente | 13 campos PascalCase, LoginToken (5 campos), escritura atómica |
+| M2 | [SW-010] Estructura ConfigFile con serde | Hecho | `cargo test -p sw-config`: 4 tests pasan (12 campos PascalCase, LoginToken, roundtrip, parseo de goldwarden.json real) |
 | M2 | [SW-011] Cifrado de campos de config | Pendiente | Argon2i (t=2, m=2048, p=8), Tink ChaCha20-Poly1305, SHA3-256 |
 | M2 | [SW-012] Lectura + migración de path viejo | Pendiente | Detección legacy ~/.config/goldwarden.json -> ~/.config/goldwarden/, 0700/0600, fix Go bug |
 | M2 | [SW-013] Comando silverwarden migrate con backup | Pendiente | Backup .bak-<timestamp>, migración estado local, instrucción sync M4 |
@@ -579,3 +579,24 @@ PASS
    - Migración local: importar el config al nuevo path y verificar que se puede desbloquear.
    - Mensaje terminal a M4: *"Configuración migrada. Ejecuta silverwarden sync (M4) para descargar tus claves SSH y contraseñas."*
    - Tests: simular una migración desde cero con archivo de prueba.
+
+### 2.2 Evidencia de Ejecución: [SW-010] Estructura ConfigFile con serde
+
+**Fecha:** 2026-10-18  
+**Archivos modificados:**
+- `crates/sw-config/src/lib.rs`: structs `ConfigFile` (12 campos string serializados, `rename_all = "PascalCase"`, con soporte para `EncryptedClientID` y `DeviceUUID`), `LoginToken` (5 campos, `rename_all = "snake_case"`, derive `Default`), tests unitarios y de integración local.
+- `crates/sw-agent/src/lib.rs`: reemplazo de referencia a campo inexistente `config.version` por `env!("CARGO_PKG_VERSION")`.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config` | 4 pasan, 0 fallan (test JSON custom, LoginToken roundtrip, ConfigFile Default roundtrip, parseo de ~/.config/goldwarden/goldwarden.json real) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui` | 65 tests pasan en total (61 en `sw-crypto`, 4 en `sw-config`), 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only` | 98.87% regiones / 98.37% líneas |
+
+**Estado:** ✅ SW-010 — Hecho (2026-10-18).
+
