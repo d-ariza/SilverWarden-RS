@@ -235,7 +235,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con tests de filesystem; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-010 · **Estado:** Pendiente
+**Depende de:** SW-010 · **Estado:** Hecho (2026-10-18)
 
 ---
 
@@ -257,7 +257,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con simulación completa de migración; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-011, SW-012 · **Estado:** Pendiente
+**Depende de:** SW-011, SW-012 · **Estado:** Hecho (2026-10-18)
 
 ---
 

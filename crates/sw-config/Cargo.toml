@@ -20,3 +20,4 @@ hex = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

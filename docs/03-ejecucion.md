@@ -626,3 +626,50 @@ PASS
 
 **Estado:** ✅ SW-011 — Hecho (2026-10-18).
 
+### 2.4 Evidencia de Ejecución: [SW-012] Lectura + migración de path viejo
+
+**Fecha:** 2026-10-18  
+**Archivos modificados:**
+- `crates/sw-config/src/lib.rs`:
+  - `get_old_config_path(home: &Path) -> PathBuf`: resuelve `~/.config/goldwarden.json`.
+  - `get_new_config_path(home: &Path) -> PathBuf`: resuelve `~/.config/goldwarden/goldwarden.json`.
+  - `migrate_old_path_in(home: &Path) -> Result<(), ConfigError>`: verifica existencia del path viejo y no existencia del nuevo. Crea directorio padre con permisos Unix `0700`, mueve archivo con `rename`, asigna permisos Unix `0600` al archivo migrado y devuelve `Ok(())`.
+  - **Corrección de bug de Go (D34):** Go intentaba leer el archivo viejo después de renombrarlo y devolvía error innecesario; nuestra implementación devuelve `Ok(())` de forma limpia e idempotente si el archivo nuevo ya existía.
+  - `migrate_old_path() -> Result<(), ConfigError>`: resuelve el `$HOME` del entorno del usuario.
+
+### 2.5 Evidencia de Ejecución: [SW-013] Comando `silverwarden migrate` con backup
+
+**Fecha:** 2026-10-18  
+**Archivos modificados:**
+- `crates/sw-config/src/lib.rs`:
+  - `backup_config(path: &Path) -> Result<PathBuf, ConfigError>`: genera copia preventiva `<path>.bak-<timestamp>` con permisos `0600` antes de cualquier modificación.
+  - `run_migration_in(home: &Path) -> Result<String, ConfigError>`: orquesta el backup, llama a `migrate_old_path_in`, deserializa el archivo de configuración migrado con `#[serde(default)]` y valida la presencia de `ConfigKeyHash` no vacío.
+  - Constante de mensaje de éxito: `"Config migrado. Ejecuta 'silverwarden sync' para descargar claves SSH y contraseñas."`.
+  - `run_migration() -> Result<String, ConfigError>`: punto de entrada usando `$HOME` del sistema.
+  - Tests exhaustivos con directorios temporales (`tempfile`):
+    - `test_migrate_old_path_success`: verifica migración de archivo, creación de directorio `0700` y permisos `0600`.
+    - `test_migrate_old_path_new_already_exists`: garantiza idempotencia sin sobreescritura destructiva.
+    - `test_backup_config_creates_timestamped_file`: valida creación de respaldo `goldwarden.json.bak-<timestamp>`.
+    - `test_run_migration_full_flow`: valida el flujo integral con backup, migración, verificación de estructura y mensaje de retorno.
+    - `test_run_migration_missing_hash_fails`: valida rechazo cuando `ConfigKeyHash` no existe o está vacío.
+- `crates/sw-cli/src/main.rs`:
+  - Subcomando `Commands::Migrate { source }` configurado con `clap`.
+  - Invocación de `sw_config::run_migration()`, impresión de mensaje exitoso o salida con código de error 1.
+  - Tests unitarios de parseo CLI: `test_cli_parse_migrate_default` y `test_cli_parse_status`.
+- `crates/sw-config/Cargo.toml` & `Cargo.toml`: adición de `tempfile = "3.12"` en dev-dependencies.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config -- --test-threads=1` | 15 pasan, 0 fallan (migración de ruta, idempotencia, backup con timestamp, flujo completo de migración, validación de hash) |
+| Pruebas unitarias `sw-cli` | `cargo test -p sw-cli` | 2 pasan, 0 fallan (parseo de comando migrate y status) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui -- --test-threads=1` | 78 tests pasan en total (61 `sw-crypto`, 15 `sw-config`, 2 `sw-cli`), 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only -- --test-threads=1` | 89.69% regiones / 88.62% líneas (umbral: ≥85%) |
+
+**Estado:** ✅ SW-012 y SW-013 — Hecho (2026-10-18).  
+**Hito:** 🏁 **Milestone M2 (Configuración y Migración) COMPLETADO al 100%.**
+

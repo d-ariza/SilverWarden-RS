@@ -4379,6 +4379,7 @@ dependencies = [
  "sha3",
  "subtle",
  "sw-crypto",
+ "tempfile",
  "thiserror 2.0.21",
  "uuid",
 ]

@@ -75,11 +75,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SshCommands::List => println!("Listing SSH keys..."),
             SshCommands::Add { key_id } => println!("Adding SSH key {}", key_id),
         },
-        Commands::Migrate { source } => {
-            println!("Initiating migration from {}...", source);
-            println!("Creating automatic backup before changes...");
-        }
+        Commands::Migrate { source: _ } => match sw_config::run_migration() {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("Error en migración: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parse_migrate_default() {
+        let cli = Cli::try_parse_from(["silverwarden", "migrate"]).expect("Should parse migrate");
+        match cli.command {
+            Commands::Migrate { source } => {
+                assert_eq!(source, "~/.config/goldwarden/goldwarden.json");
+            }
+            _ => panic!("Expected Migrate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_status() {
+        let cli = Cli::try_parse_from(["silverwarden", "status"]).expect("Should parse status");
+        assert!(matches!(cli.command, Commands::Status));
+    }
 }
