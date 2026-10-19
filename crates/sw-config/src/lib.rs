@@ -763,4 +763,169 @@ mod tests {
         let result = run_migration_in(temp_home.path());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_verify_pin_mismatched_length() {
+        let res = verify_pin("test_pin", "test_uuid", "short_hash").unwrap();
+        assert!(!res);
+    }
+
+    #[test]
+    fn test_decrypt_string_errors() {
+        let key = [42u8; 32];
+        assert!(decrypt_string("not_base_64?!", &key).is_err());
+
+        let too_short = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+        assert!(decrypt_string(&too_short, &key).is_err());
+
+        let fake_payload = vec![0u8; 35];
+        let fake_b64 = base64::engine::general_purpose::STANDARD.encode(&fake_payload);
+        assert!(decrypt_string(&fake_b64, &key).is_err());
+    }
+
+    #[test]
+    fn test_config_file_unlock_and_decrypt_token_errors() {
+        let cfg = ConfigFile::default();
+        assert!(matches!(
+            cfg.unlock("bad_pin"),
+            Err(ConfigError::InvalidPin)
+        ));
+
+        let key = [0u8; 32];
+        assert!(matches!(
+            cfg.decrypt_token(&key),
+            Err(ConfigError::Crypto(_))
+        ));
+
+        let enc_bad_json = encrypt_string("not_a_json", &key).unwrap();
+        let cfg_bad_json = ConfigFile {
+            encrypted_token: enc_bad_json,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg_bad_json.decrypt_token(&key),
+            Err(ConfigError::Json(_))
+        ));
+
+        let mut cfg_update = ConfigFile::default();
+        assert!(matches!(
+            cfg_update.update_pin("wrong_old", "new"),
+            Err(ConfigError::InvalidPin)
+        ));
+    }
+
+    #[test]
+    fn test_decrypt_token_synthetic_success() {
+        let key = [77u8; 32];
+        let token = LoginToken {
+            access_token: "mock_access".to_string(),
+            expires_in: 7200,
+            token_type: "Bearer".to_string(),
+            refresh_token: "mock_refresh".to_string(),
+            key: "mock_key".to_string(),
+        };
+        let token_json = serde_json::to_string(&token).unwrap();
+        let enc_token = encrypt_string(&token_json, &key).unwrap();
+
+        let cfg = ConfigFile {
+            encrypted_token: enc_token,
+            ..Default::default()
+        };
+
+        let decrypted = cfg
+            .decrypt_token(&key)
+            .expect("Should decrypt synthetic token");
+        assert_eq!(decrypted, token);
+    }
+
+    #[test]
+    fn test_backup_config_non_existent() {
+        let non_existent = Path::new("/path/that/does/not/exist/9999999");
+        assert!(backup_config(non_existent).is_err());
+    }
+
+    #[test]
+    fn test_run_migration_new_already_exists() {
+        let temp_home = tempfile::tempdir().expect("Create temp dir");
+        let new_path = get_new_config_path(temp_home.path());
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+
+        let valid_json = r#"{
+  "ConfigKeyHash": "validhash123",
+  "IdentityUrl": "https://identity.bitwarden.com"
+}"#;
+        std::fs::write(&new_path, valid_json).unwrap();
+
+        let result = run_migration_in(temp_home.path())
+            .expect("Should succeed when new path already exists");
+        assert_eq!(result, MIGRATION_SUCCESS_MSG);
+
+        let backups: Vec<_> = std::fs::read_dir(new_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("goldwarden.json.bak-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn test_run_migration_no_config_found() {
+        let temp_home = tempfile::tempdir().expect("Create temp dir");
+        let result = run_migration_in(temp_home.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_old_path_no_old_path_is_noop() {
+        let temp_home = tempfile::tempdir().expect("Create temp dir");
+        let res = migrate_old_path_in(temp_home.path());
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_env_home_migration_wrappers() {
+        let temp_home = tempfile::tempdir().expect("Create temp dir");
+        let old_path = get_old_config_path(temp_home.path());
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_path, r#"{"ConfigKeyHash":"env_hash"}"#).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let res = migrate_old_path();
+        assert!(res.is_ok());
+
+        let mig_res = run_migration();
+        assert!(mig_res.is_ok());
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    #[test]
+    fn test_config_error_display_coverage() {
+        let err_io = ConfigError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "io msg"));
+        assert!(err_io.to_string().contains("io msg"));
+
+        let err_json = ConfigError::Json(serde_json::from_str::<ConfigFile>("bad").unwrap_err());
+        assert!(err_json.to_string().contains("JSON error"));
+
+        let err_kdf = ConfigError::Kdf("kdf msg".to_string());
+        assert!(err_kdf.to_string().contains("kdf msg"));
+
+        let err_crypto = ConfigError::Crypto("crypto msg".to_string());
+        assert!(err_crypto.to_string().contains("crypto msg"));
+
+        let err_pin = ConfigError::InvalidPin;
+        assert!(err_pin.to_string().contains("Invalid PIN"));
+
+        let err_lock = ConfigError::Lock("lock msg".to_string());
+        assert!(err_lock.to_string().contains("lock msg"));
+    }
 }

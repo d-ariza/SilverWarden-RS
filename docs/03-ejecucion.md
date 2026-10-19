@@ -649,9 +649,19 @@ PASS
   - Tests exhaustivos con directorios temporales (`tempfile`):
     - `test_migrate_old_path_success`: verifica migración de archivo, creación de directorio `0700` y permisos `0600`.
     - `test_migrate_old_path_new_already_exists`: garantiza idempotencia sin sobreescritura destructiva.
+    - `test_migrate_old_path_no_old_path_is_noop`: verifica no-op limpio cuando no existe archivo previo.
     - `test_backup_config_creates_timestamped_file`: valida creación de respaldo `goldwarden.json.bak-<timestamp>`.
+    - `test_backup_config_non_existent`: valida error cuando el archivo a respaldar no existe.
     - `test_run_migration_full_flow`: valida el flujo integral con backup, migración, verificación de estructura y mensaje de retorno.
+    - `test_run_migration_new_already_exists`: valida migración cuando el destino ya existe previamente.
     - `test_run_migration_missing_hash_fails`: valida rechazo cuando `ConfigKeyHash` no existe o está vacío.
+    - `test_run_migration_no_config_found`: valida rechazo cuando no existe ningún archivo de configuración.
+    - `test_env_home_migration_wrappers`: valida wrappers de entorno `migrate_old_path()` y `run_migration()`.
+    - `test_verify_pin_mismatched_length`: valida rechazo temprano ante discrepancia de longitud en hash.
+    - `test_decrypt_string_errors`: cubre errores de base64 inválido, payload corto y tag corrupto.
+    - `test_config_file_unlock_and_decrypt_token_errors`: cubre errores de PIN inválido, token vacío y JSON corrupto.
+    - `test_decrypt_token_synthetic_success`: roundtrip verificado de `LoginToken` sintético descifrado.
+    - `test_config_error_display_coverage`: cubre el formateo y representación de todas las variantes de `ConfigError`.
 - `crates/sw-cli/src/main.rs`:
   - Subcomando `Commands::Migrate { source }` configurado con `clap`.
   - Invocación de `sw_config::run_migration()`, impresión de mensaje exitoso o salida con código de error 1.
@@ -662,14 +672,15 @@ PASS
 
 | Control | Comando | Resultado real |
 |---|---|---|
-| Pruebas unitarias `sw-config` | `cargo test -p sw-config -- --test-threads=1` | 15 pasan, 0 fallan (migración de ruta, idempotencia, backup con timestamp, flujo completo de migración, validación de hash) |
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config -- --test-threads=1` | 25 pasan, 0 fallan (migración de ruta, idempotencia, backup con timestamp, flujo completo de migración, validación de hash, ramas de error y synthetic token) |
 | Pruebas unitarias `sw-cli` | `cargo test -p sw-cli` | 2 pasan, 0 fallan (parseo de comando migrate y status) |
-| Pruebas workspace | `cargo test --workspace --exclude sw-gui -- --test-threads=1` | 78 tests pasan en total (61 `sw-crypto`, 15 `sw-config`, 2 `sw-cli`), 0 fallan |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui -- --test-threads=1` | 88 tests pasan en total (61 `sw-crypto`, 25 `sw-config`, 2 `sw-cli`), 0 fallan |
 | Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
 | Formato | `cargo fmt --all -- --check` | 0 diffs |
 | Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
-| Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only -- --test-threads=1` | 89.69% regiones / 88.62% líneas (umbral: ≥85%) |
+| Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only -- --test-threads=1` | **94.06% regiones / 95.33% líneas** (objetivo: ≥93%, superado) |
 
 **Estado:** ✅ SW-012 y SW-013 — Hecho (2026-10-18).  
 **Hito:** 🏁 **Milestone M2 (Configuración y Migración) COMPLETADO al 100%.**
+
 
