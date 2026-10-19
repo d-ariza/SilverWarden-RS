@@ -683,4 +683,55 @@ PASS
 **Estado:** ✅ SW-012 y SW-013 — Hecho (2026-10-18).  
 **Hito:** 🏁 **Milestone M2 (Configuración y Migración) COMPLETADO al 100%.**
 
+---
+
+## 3. Milestone M3: Agente + IPC (`sw-ipc`, `sw-agent`, `sw-systemauth`, `sw-cli`)
+
+### 3.0 Plan Definitivo y Decisiones Técnicas Aplicadas
+
+- **D36 (Endurecimiento de sesiones y CallingContext - D-IPC-3 mejorado):**
+  - En Go, `if sessionType == SSHKey || (session.ParentPid == ctx.ParentProcessPid && session.GrandParentPid == ctx.GrandParentProcessPid)` permitía que cualquier proceso hermano con el mismo PPID y Grand-PPID heredara la sesión SSH, y si el proceso moría la sesión seguía viva hasta el TTL (60 min).
+  - En Rust (`sw-systemauth`):
+    - **Para `AccessVault` y `Pin`:** validación estricta de los 3 PIDs (`PID`, `PPID` y `Grand-PPID`). Si el proceso muere y su PID es reciclado por el SO, la sesión expira inmediatamente.
+    - **Para `SSHKey`:** validación laxa (solo comparar tipo) **exclusivamente** si el proceso solicitante es un cliente SSH/Git conocido (`ssh`, `ssh-keygen`, `git`). Si es cualquier otro binario, se exige coincidencia estricta de los 3 PIDs.
+    - **Wipe:** al bloquear el vault (`lock`), todas las sesiones activas en el store son purgadas de inmediato.
+- **D37 (Aislamiento de socket y advertencia de Go activo):**
+  - Protocolo IPC propio en JSON limpio (sin tabla hash FNV-1a de Go). No se comunica en caliente con el socket de Go.
+  - El socket del daemon de SilverWarden corre en `~/.silverwarden.sock` con permisos Unix estrictos `0600`.
+  - Resiliencia ante crashes: si `~/.silverwarden.sock` existe huérfano, el daemon verifica si hay un proceso escuchando; si no, lo elimina de forma segura y crea uno nuevo.
+  - Si el CLI detecta que `~/.goldwarden.sock` está activo, muestra la advertencia: *"Goldwarden Go está corriendo. Te recomendamos detenerlo para evitar conflictos de estado"*.
+
+### 3.1 Desglose de Historias M3
+
+1. **[SW-020] Protocolo IPC (`sw-ipc`):**
+   - Struct `IpcMessage { action: String, payload: serde_json::Value }`.
+   - Framing: Prefijo de longitud `u32` big-endian + JSON UTF-8. Buffer máximo 4 MB.
+   - Handshake: el cliente envía la versión de protocolo; el agente valida compatibilidad.
+
+2. **[SW-021] Socket Unix del agente (`sw-agent`):**
+   - Socket en `~/.silverwarden.sock` con permisos Unix `0600`.
+   - Request-response: procesa un mensaje por conexión y responde.
+   - Detección y limpieza de sockets huérfanos.
+
+3. **[SW-022] CallingContext y resolución de procesos (`sw-systemauth`):**
+   - Peercred vía `nix`/`rustix` (`uid` y `pid`).
+   - Lectura de `/proc/<pid>/stat` (nombre ejecutable, PPID) y `/proc/<pid>/exe` (ruta).
+   - Anclaje a `git`: si el ejecutable es `ssh` o `ssh-keygen` y su padre es `git`, anclar el contexto a `git`.
+   - Falla segura si `/proc` es inaccesible devolviendo `authenticated: false`.
+
+4. **[SW-023] Session store endurecido (`sw-systemauth`):**
+   - Struct `Session` (`pid`, `ppid`, `grand_ppid`, `expires_at`, `type`).
+   - Match exacto de 3 PIDs para `AccessVault` y `Pin`.
+   - Match laxo de `SSHKey` condicionado a clientes SSH/Git (`ssh`, `ssh-keygen`, `git`).
+   - Purga total de sesiones ante bloqueo (`lock`).
+
+5. **[SW-024] Actions Registry del agente (`sw-agent`):**
+   - Action Registry: `ActionsRegistry { actions: HashMap<String, ActionFn> }`.
+   - Handlers mínimos: `Status`, `Unlock`, `Lock`, `PinSet`/`PinUpdate`, `ConfigGet`/`ConfigSet`.
+
+6. **[SW-025] CLI `silverwarden` y daemonización (`sw-cli`):**
+   - Subcomandos: `migrate`, `status`, `unlock`, `lock`, `pin set`, `pin update`, `agent start`.
+   - Mensajes amigables ante daemon inactivo (`"El agente no está corriendo. Ejecuta 'silverwarden agent start'"`).
+   - Advertencia si Goldwarden Go está activo (`"Goldwarden Go está corriendo. Te recomendamos detenerlo para evitar conflictos de estado"`).
+
 

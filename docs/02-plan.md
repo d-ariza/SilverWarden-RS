@@ -65,11 +65,11 @@ text
 | Migración de path viejo `~/.config/goldwarden.json` | `ReadConfig` | Replicar corrigiendo bug de Go (devolver `Ok` si el rename tiene éxito); directorio 0700, archivo 0600 |
 | Caché de vault `SyncData` JSON en disco | `sync.go` WriteVault/ReadVault | serde con structs equivalentes; ruta exacta y descarga completa se consolida en M4 (`silverwarden sync`) |
 | Claves SSH importadas | vault notes `custom-type: ssh-key` + ciphers SSHKey | Importar y sincronizar en M4 a partir de datos del vault |
-| Sesiones `AccessVault` / `SSHKey` / `Pin`, TTL 60 min, match por jerarquía de PID | `systemauth.go` | Semántica idéntica (incl. que SSHKey no exige ancestro PID) |
+| Sesiones `AccessVault` / `SSHKey` / `Pin`, TTL 60 min | `systemauth.go` | **Endurecido respecto a Go:** `AccessVault` y `Pin` con match exacto de 3 PIDs (PID, PPID, Grand-PPID) y expiración inmediata si el PID muere; `SSHKey` solo permite match laxo por tipo si el solicitante es cliente SSH/Git (`ssh`, `ssh-keygen`, `git`) |
 | EncString `tipo.iv|ct|mac` base64, tipos 0/1/2; AES-CBC-256+HMAC-SHA256; RSA-OAEP-**SHA1** legacy | `encstring.go` | Paridad estricta; solo tipos 0 y 2 soportados para decrypt (como Go) |
 | SSH agent: List/Sign/SignWithFlags; flags rsa-sha2-256/512; detección `SSHSIG` git | `ssh.go` | Semántica idéntica, aprobación por pinentry + sesión |
 
-**Protocolo IPC (cambio respecto al borrador anterior):** al elegir "importar una vez y seguir", **no** se replica el envelope Go con tabla FNV-1a-64. Se define un protocolo propio en `sw-ipc` (serde + framing length-prefixed). El importador de M2/M3 lee el estado Go una sola vez; a partir de ahí, silverWarden-rs es autónomo. Esto elimina la tabla hardcodeada y el riesgo de "tabla FNV incompleta".
+**Protocolo IPC (cambio respecto al borrador anterior):** al elegir "importar una vez y seguir", **no** se replica el envelope Go con tabla FNV-1a-64. Se define un protocolo propio en `sw-ipc` (JSON limpio `IpcMessage` + framing `u32` big-endian, buffer máx 4MB). El socket de silverWarden corre en `~/.silverwarden.sock` (0600). Para prevenir conflictos si Goldwarden Go sigue en segundo plano, la CLI detecta si `~/.goldwarden.sock` está activo y muestra una advertencia al usuario.
 
 ---
 
@@ -93,6 +93,8 @@ text
 | D33 | **Escritura atómica de archivos (tempfile + rename)** | Sobrescritura directa | Previene corrupción o pérdida total de datos por interrupción abrupta observada en la implementación de Go |
 | D34 | **Migración de ruta legacy devuelve Ok en éxito** | Replicar bug de Go | Go retornaba error tras un rename exitoso al buscar el archivo viejo inexistente; Rust retorna `Ok(())` si el movimiento es limpio |
 | D35 | **SW-013 migra estado local; descarga de Vault/SSH en M4** | Descarga remota en M2 | El archivo en disco solo contiene configuración; la sincronización y descarga de ciphers/claves SSH se realiza en M4 vía `silverwarden sync` |
+| D36 | **Endurecimiento de sesiones (D-IPC-3 mejorado)** | Semántica laxa de Go | Para `AccessVault` y `Pin`: coincidencia estricta de PID, PPID y Grand-PPID con expiración si el PID muere. Para `SSHKey`: coincidencia de tipo solo para clientes SSH/Git (`ssh`, `ssh-keygen`, `git`), exigiendo coincidencia completa de 3 PIDs para otros ejecutables |
+| D37 | **Aislamiento de socket y advertencia de Go activo** | Reusar socket Go | Socket propio en `~/.silverwarden.sock` (0600) con limpieza de huérfanos. Si `~/.goldwarden.sock` está activo, la CLI muestra advertencia de recomendación de detención para evitar colisiones |
 
 ---
 

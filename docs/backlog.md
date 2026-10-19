@@ -263,106 +263,156 @@ Una historia pasa a `Hecho` solo cuando:
 
 ## M3 — Agente + IPC `sw-ipc`, `sw-agent`, `sw-systemauth`, `sw-cli` (P0 — MVP)
 
-### [SW-020] Protocolo IPC propio
+### [SW-020] Protocolo IPC propio (`sw-ipc`)
 
-**Historia:** Como agente, quiero un protocolo IPC claro y versionado, para que el CLI y (post-MVP) la GUI se comuniquen de forma estable.
+**Historia:** Como agente y cliente CLI/GUI, quiero un protocolo IPC tipado, estructurado y versionado, para que la comunicación sea segura, robusta y libre de complejidades legacy.
 
-**Alcance:** envelope serde + framing length-prefixed; versionado; errores tipados. **No** se replica el envelope Go (decisión: importar y seguir).
+**Alcance:**
+- Struct `IpcMessage`:
+  ```rust
+  #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+  pub struct IpcMessage {
+      pub action: String,       // "Status", "Unlock", etc.
+      pub payload: serde_json::Value,
+  }
+  ```
+- Framing: Prefijo de longitud `u32` big-endian seguido de JSON en UTF-8. Buffer máximo definido de 4 MB; error controlado si se excede.
+- Handshake y versionado: El cliente envía la versión de protocolo en el handshake inicial; el agente valida compatibilidad de versión.
+- Decisión de diseño: Protocolo IPC propio en JSON limpio (sin tabla hash FNV-1a de Go).
 
 **Criterios de aceptación:**
-- Roundtrip de mensajes con framing correcto.
-- Buffer máximo definido (4MB) y error si se excede.
-- Versión de protocolo en el handshake.
-- Tests de mensajes malformados → error, no panic.
+- Serialización y deserialización roundtrip de `IpcMessage` con framing length-prefixed.
+- Límite de buffer de 4 MB respetado estrictamente; rechazo controlado con error tipado.
+- Handshake con validación de versión semántica de protocolo.
+- Manejo de payloads malformados sin panics.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con tests unitarios y de framing; evidencia en `03-ejecucion.md`.
 
 **Depende de:** — · **Estado:** Pendiente
 
 ---
 
-### [SW-021] Socket Unix del agente
+### [SW-021] Socket Unix del agente (`sw-agent`)
 
-**Historia:** Como CLI, quiero conectarme al agente por un socket Unix con permisos restrictivos, para que solo mi usuario pueda hablar con él.
+**Historia:** Como CLI, quiero conectarme al daemon `sw-agent` a través de un socket Unix con permisos restrictivos y gestión de sockets huérfanos, para garantizar comunicaciones locales exclusivas y resilientes.
 
-**Alcance:** servidor en `~/.goldwarden.sock`, un mensaje por conexión, buffer 4MB, permisos restrictivos.
+**Alcance:**
+- Ruta del socket: `~/.silverwarden.sock`.
+- Permisos de seguridad: creado exclusivamente con permisos Unix `0600` (solo el usuario propietario tiene acceso).
+- Ciclo de conexión: el agente escucha en el socket, acepta conexiones, procesa un mensaje por conexión y responde (arquitectura request-response limpia).
+- Resiliencia y casos borde: detección de socket huérfano dejado por crash o terminación abrupta; verificación activa de proceso escuchando y reemplazo limpio si está huérfano.
+- Limpieza en apagado: remoción ordenada del socket al cerrar el agente.
 
 **Criterios de aceptación:**
-- El socket se crea con permisos correctos.
-- Un cliente de prueba conecta y recibe respuestas válidas.
-- Mensaje mayor de 4MB → error controlado.
-- Socket se limpia al cerrar el agente.
+- Socket creado en `~/.silverwarden.sock` con permisos `0600`.
+- Conexión cliente/servidor funcional con procesamiento de request-response.
+- Detección y recuperación automática de sockets huérfanos inactivos sin colisión.
+- Cierre ordenado y eliminación de archivo socket.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con tests de conexión y recuperación; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-020 · **Estado:** Pendiente
 
 ---
 
-### [SW-022] CallingContext
+### [SW-022] CallingContext y resolución de procesos (`sw-systemauth`)
 
-**Historia:** Como agente, quiero saber qué proceso me llama, para aplicar reglas de sesión y seguridad.
+**Historia:** Como agente, quiero inspeccionar de forma fidedigna y segura las credenciales y la jerarquía de procesos del cliente conectado, para aplicar políticas de autorización contextuales robustas.
 
-**Alcance:** credenciales de par (`SO_PEERCRED`) + nombres de proceso vía `/proc` (paridad con `go-ps` + `peercred`).
+**Alcance:**
+- Credenciales del socket peer: extracción de UID y PID mediante `nix` o `rustix` (`SO_PEERCRED`).
+- Jerarquía de procesos: resolución de PPID, Grand-PPID y nombre de ejecutable leyendo `/proc/<pid>/stat`, y ruta completa mediante `/proc/<pid>/exe`.
+- Caso borde Git (anclaje): si el ejecutable es `ssh` o `ssh-keygen` y su padre es `git`, el contexto se ancla al proceso `git` (paridad funcional con Go).
+- Seguridad extra: si la lectura de `/proc` falla o no se tienen permisos suficientes, el contexto falla de forma segura estableciendo `authenticated: false`.
 
 **Criterios de aceptación:**
-- Se obtiene PID, UID y nombre del proceso cliente.
-- Mismo contexto que reporta el agente Go para el mismo cliente (validado con fixture).
-- Casos: proceso sin permisos de lectura → error controlado.
+- Extracción correcta de UID, PID, PPID, Grand-PPID y ejecutable desde el socket.
+- Anclaje de contexto al proceso `git` cuando invoca comandos SSH auxiliares.
+- Comportamiento seguro ante denegación o inaccesibilidad de `/proc`.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con tests simulados de procesos y socket; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-021 · **Estado:** Pendiente
 
 ---
 
-### [SW-023] Session store
+### [SW-023] Session store endurecido (`sw-systemauth`)
 
-**Historia:** Como agente, quiero gestionar sesiones con TTL y match por jerarquía de proceso, para no pedir aprobación en cada operación dentro de una sesión válida.
+**Historia:** Como agente, quiero gestionar sesiones de autenticación contextuales en memoria con TTL y validación estricta de jerarquía de procesos, para evitar aprobaciones redundantes sin comprometer la seguridad frente a procesos hermanos o reutilización de PIDs.
 
-**Alcance:** sesiones `AccessVault`/`SSHKey`/`Pin`, TTL 60 min, match por jerarquía PID (SSHKey no exige ancestro — paridad Go); wipe en bloqueo.
+**Alcance:**
+- Struct `Session`: `pid`, `ppid`, `grand_ppid`, `expires_at`, `session_type` (`AccessVault`, `SSHKey`, `Pin`). TTL estándar de 60 minutos.
+- Endurecimiento de sesiones (D36 — superior a Go):
+  - **Para `AccessVault` y `Pin`:** validación estricta de los 3 PIDs (PID exacto, PPID y Grand-PPID). Si el proceso muere y su PID es reciclado por el SO, la sesión expira inmediatamente.
+  - **Para `SSHKey`:** coincidencia laxa por tipo de sesión (`session_type == SSHKey`) permitida **únicamente** si el ejecutable solicitante es un cliente SSH/Git conocido (`ssh`, `ssh-keygen`, `git`) para preservar la experiencia fluida de firma de commits; para cualquier otro binario, se exige validación estricta de los 3 PIDs.
+- Wipe de seguridad: ante cualquier evento de bloqueo (`lock`), todas las sesiones activas en el store son purgadas de inmediato.
 
 **Criterios de aceptación:**
-- Tests de expiración (TTL).
-- Match por jerarquía PID correcto en los casos de Go.
-- `SSHKey` no exige ancestro PID.
-- Wipe de sesiones al bloquear.
+- Expiración estricta por TTL (60 min).
+- Coincidencia exacta de jerarquía (PID, PPID, Grand-PPID) requerida para `AccessVault` y `Pin`.
+- Excepción laxa de `SSHKey` restringida a binarios `ssh`, `ssh-keygen`, `git`.
+- Purga total de sesiones tras llamada a `lock`.
 
-**Cierre:** tabla de casos igual a Go verificada; evidencia en `03-ejecucion.md`.
+**Cierre:** pruebas unitarias de política de sesiones pasando; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-022 · **Estado:** Pendiente
 
 ---
 
-### [SW-024] Actions mínimas del agente
+### [SW-024] Actions Registry del agente (`sw-agent`)
 
-**Historia:** Como CLI, quiero ejecutar acciones contra el agente (status, vault status, lock/unlock, pin status/update, config get/set), para operar el gestor desde terminal.
+**Historia:** Como agente, quiero un registro modular de acciones (`ActionsRegistry`), para procesar comandos tipados despachando el estado del vault y el contexto del llamante a sus respectivos handlers.
 
-**Alcance:** registry de acciones + handlers para las acciones del MVP.
+**Alcance:**
+- Definición de tipos y handlers:
+  ```rust
+  pub type ActionFn = Box<dyn Fn(IpcMessage, &Arc<RwLock<AgentState>>, &CallingContext) -> Result<IpcMessage, AgentError> + Send + Sync>;
+  pub struct ActionsRegistry {
+      actions: HashMap<String, ActionFn>,
+  }
+  ```
+- Acciones mínimas implementadas:
+  - `Status`: reporta si el vault está bloqueado/desbloqueado, versión del agente y estado general.
+  - `Unlock`: recibe PIN, verifica contra `sw-config`, deriva clave y pasa a estado desbloqueado.
+  - `Lock`: borra la clave de memoria (`zeroize`/`LockedBuffer`) y purga todas las sesiones en `sw-systemauth`.
+  - `PinSet` / `PinUpdate`: actualiza PIN y recifra el archivo de configuración delegando en `sw-config`.
+  - `ConfigGet` / `ConfigSet`: consulta y actualiza parámetros de URLs o configuración general.
 
 **Criterios de aceptación:**
-- Cada acción responde con payload correcto.
-- Acción desconocida → error tipado, no panic.
-- `lock`/`unlock` cambian el estado real del vault.
+- Despacho determinista de cada acción registrada con respuesta tipada.
+- Acción desconocida retorna error controlado sin panic.
+- `Lock` limpia efectivamente la clave de memoria y el store de sesiones.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con tests de registro y handlers; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-021, SW-023, SW-011 · **Estado:** Pendiente
 
 ---
 
-### [SW-025] CLI `silverwarden` mínima
+### [SW-025] CLI `silverwarden` y daemonización (`sw-cli`)
 
-**Historia:** Como usuario, quiero una CLI con subcomandos básicos (status, unlock, lock, pin), para usar silverWarden-rs sin GUI.
+**Historia:** Como usuario, quiero interactuar con el agente a través del CLI `silverwarden` con subcomandos claros, gestión del daemon y advertencias ante procesos conflictivos, para operar mi bóveda de forma segura y sencilla.
 
-**Alcance:** binario CLI (clap) con subcomandos status/unlock/lock/pin que hablan IPC.
+**Alcance:**
+- Subcomandos `clap`:
+  - `silverwarden migrate`: migración de configuración existente con backup.
+  - `silverwarden status`: consulta estado del daemon y vault.
+  - `silverwarden unlock [--pin <pin>]`: desbloqueo interactivo o por parámetro.
+  - `silverwarden lock`: bloqueo inmediato del vault.
+  - `silverwarden pin set` / `pin update`: gestión de PIN de bóveda.
+  - `silverwarden agent start`: arranca el agente (daemoniza o bucle foreground).
+- Detección de daemon inactivo: si `~/.silverwarden.sock` no existe, mostrar:
+  `"El agente no está corriendo. Ejecuta 'silverwarden agent start'"`
+- Detección de Goldwarden Go activo (D37): si se detecta `~/.goldwarden.sock` activo, mostrar advertencia clara:
+  `"Goldwarden Go está corriendo. Te recomendamos detenerlo para evitar conflictos de estado"`
 
 **Criterios de aceptación:**
-- Flujo completo unlock→status→lock funciona manualmente contra el agente Rust.
-- Mensajes de error claros.
-- `--help` documenta los subcomandos.
+- Subcomandos de CLI funcionales contra el agente vía socket Unix.
+- Mensaje informativo claro cuando el agente no está corriendo.
+- Advertencia emitida si el socket legacy de Go está activo.
+- Flujo manual E2E de unlock → status → lock verificado.
 
-**Cierre:** flujo E2E manual verificado; evidencia en `03-ejecucion.md`.
+**Cierre:** flujo CLI manual y unitario verificado; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-024 · **Estado:** Pendiente
 
