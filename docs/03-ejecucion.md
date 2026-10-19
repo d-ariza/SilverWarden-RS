@@ -734,4 +734,57 @@ PASS
    - Mensajes amigables ante daemon inactivo (`"El agente no está corriendo. Ejecuta 'silverwarden agent start'"`).
    - Advertencia si Goldwarden Go está activo (`"Goldwarden Go está corriendo. Te recomendamos detenerlo para evitar conflictos de estado"`).
 
+### 3.2 Evidencia de Ejecución: [SW-020] Protocolo IPC propio (`sw-ipc`)
+
+**Fecha:** 2026-10-19  
+**Archivos modificados:**
+- `crates/sw-ipc/src/lib.rs`:
+  - Definición del struct `IpcMessage` (`action: String`, `payload: serde_json::Value`).
+  - Constante de seguridad de tamaño máximo: `MAX_IPC_MESSAGE_SIZE = 4 * 1024 * 1024` (4 MB).
+  - Funciones asíncronas de framing:
+    - `read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<IpcMessage, IpcError>`: lee prefijo `u32` big-endian, verifica el límite de 4MB, lee el payload exacto y deserializa el JSON en `IpcMessage`.
+    - `write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &IpcMessage) -> Result<(), IpcError>`: serializa `IpcMessage` a JSON, valida límite de 4MB, escribe longitud `u32` big-endian y datos, y realiza flush.
+  - Tests exhaustivos con `tokio::io::duplex`:
+    - `test_roundtrip_duplex`: envío bidireccional cliente-servidor validando `action` y `payload`.
+    - `test_write_message_too_large_fails`: rechazo controlado al intentar escribir mensajes > 4MB.
+    - `test_read_message_too_large_fails`: rechazo de tramas con cabecera de longitud > 4MB.
+    - `test_read_malformed_json_fails`: manejo de error `IpcError::Json` sin panic ante JSON corrupto.
+    - `test_ipc_error_display`: cobertura de formateo de variantes de error.
+
+### 3.3 Evidencia de Ejecución: [SW-021] Socket Unix del agente (`sw-agent`)
+
+**Fecha:** 2026-10-19  
+**Archivos modificados:**
+- `crates/sw-agent/Cargo.toml`: adición de `tempfile = { workspace = true }` en `[dev-dependencies]`.
+- `crates/sw-agent/src/lib.rs`:
+  - `default_socket_path() -> Result<PathBuf, AgentError>`: resolución de `~/.silverwarden.sock`.
+  - `check_and_prepare_socket(socket_path: &Path) -> Result<(), AgentError>`: comprueba si el archivo socket existe intentando conectar con `tokio::net::UnixStream`. Si hay un proceso escuchando, falla con `AgentError::SocketAlreadyInUse`. Si es huérfano (conexión rechazada), lo elimina de forma segura.
+  - `run_agent(socket_path: &Path)` y `run_agent_with_shutdown(socket_path, shutdown_signal)`:
+    - Bindea el `tokio::net::UnixListener` en el socket especificado.
+    - Asigna permisos Unix `0600` (`Permissions::from_mode(0o600)`).
+    - Bucle de aceptación de conexiones concurrentes (`tokio::spawn`), leyendo cada `IpcMessage` y retornando por ahora `IpcMessage { action: "Error", payload: "Not implemented" }`.
+    - Eliminación limpia del socket al recibir la señal de shutdown.
+  - Tests unitarios y de integración:
+    - `test_agent_socket_request_response_not_implemented`: test de integración en socket temporal con cliente real, validando conexión, permisos `0600`, roundtrip request-response con `"Not implemented"`, detección de colisión y cleanup en apagado.
+    - `test_agent_orphan_socket_removal`: detección y eliminación automática de socket huérfano.
+    - `test_default_socket_path`: resolución correcta de path de usuario.
+    - `test_agent_error_display`: formateo de errores `AgentError`.
+    - `test_agent_daemon_handle_request`: cobertura de handlers existentes.
+    - `test_run_agent_entrypoint_aborted` y `test_agent_corrupted_message_handled`: manejo de fallos y abortos.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-ipc` | `cargo test -p sw-ipc` | 5 pasan, 0 fallan (roundtrip duplex, límites 4MB, malformed JSON, error display) |
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 7 pasan, 0 fallan (integración de socket Unix, permisos 0600, huérfanos, colisión, Not implemented) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui -- --test-threads=1` | 100 tests pasan en total (61 `sw-crypto`, 25 `sw-config`, 5 `sw-ipc`, 7 `sw-agent`, 2 `sw-cli`), 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| Cobertura `sw-ipc` | `cargo llvm-cov -p sw-ipc --summary-only` | **94.92% regiones / 100.00% líneas** |
+| Cobertura `sw-agent` | `cargo llvm-cov -p sw-agent --lib --summary-only` | **92.22% regiones / 93.21% líneas** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-020 y SW-021 — Hecho (2026-10-19).
+
 
