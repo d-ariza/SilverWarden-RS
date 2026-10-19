@@ -61,10 +61,10 @@ text
 
 | Formato | Evidencia en código Go | Requisito Rust |
 | --- | --- | --- |
-| Config `~/.config/goldwarden/goldwarden.json` (0600) | `config.go` | serde JSON idéntico; campos cifrados = **ChaCha20-Poly1305** con clave **argon2(PIN, salt=DeviceUUID, t=2, m=2GB, p=8, 32B)**; `ConfigKeyHash` = **SHA3-256 hex** |
-| Migración de path viejo `~/.config/goldwarden.json` | `ReadConfig` | Replicar |
-| Caché de vault `SyncData` JSON en disco | `sync.go` WriteVault/ReadVault | serde con structs equivalentes; ruta exacta se confirma con repo local en M4 |
-| Claves SSH importadas | vault notes `custom-type: ssh-key` + ciphers SSHKey | Importar y preservar formato |
+| Config `~/.config/goldwarden/goldwarden.json` (0600) | `config.go` | serde JSON idéntico (13 campos PascalCase); campos cifrados = **Tink ChaCha20-Poly1305** (header 5B + nonce 12B + ct + tag 16B) base64; clave = **Argon2i** (no id, t=2, m=2048, p=8, salt=DeviceUUID_bytes); `ConfigKeyHash` = **hex(SHA3-256(key))** |
+| Migración de path viejo `~/.config/goldwarden.json` | `ReadConfig` | Replicar corrigiendo bug de Go (devolver `Ok` si el rename tiene éxito); directorio 0700, archivo 0600 |
+| Caché de vault `SyncData` JSON en disco | `sync.go` WriteVault/ReadVault | serde con structs equivalentes; ruta exacta y descarga completa se consolida en M4 (`silverwarden sync`) |
+| Claves SSH importadas | vault notes `custom-type: ssh-key` + ciphers SSHKey | Importar y sincronizar en M4 a partir de datos del vault |
 | Sesiones `AccessVault` / `SSHKey` / `Pin`, TTL 60 min, match por jerarquía de PID | `systemauth.go` | Semántica idéntica (incl. que SSHKey no exige ancestro PID) |
 | EncString `tipo.iv|ct|mac` base64, tipos 0/1/2; AES-CBC-256+HMAC-SHA256; RSA-OAEP-**SHA1** legacy | `encstring.go` | Paridad estricta; solo tipos 0 y 2 soportados para decrypt (como Go) |
 | SSH agent: List/Sign/SignWithFlags; flags rsa-sha2-256/512; detección `SSHSIG` git | `ssh.go` | Semántica idéntica, aprobación por pinentry + sesión |
@@ -87,6 +87,12 @@ text
 | D-8 | **reqwest + tokio-tungstenite** | ureq, actix | Estándar de facto; TLS nativo |
 | D-9 | **Serialización msgpack**: `rmp-serde` | — | Paridad con notificaciones websocket Bitwarden |
 | D-10 | FIDO2 vía `fido2`/`ctap-hid-fido2` en M4, aislado detrás de trait | Solo TOTP | FIDO2 es el 2FA más riesgoso; el trait permite degradar a TOTP/email sin tocar el flujo de login |
+| D30 | **KDF del config usa Argon2i (no id)**: $t=2, m=2048\text{ (2 GiB)}, p=8$ con salt = bytes de `DeviceUUID` | Argon2id, PBKDF2 | Paridad estricta con la derivación de clave de PIN en Goldwarden Go (`argon2.Key` variante `i`) |
+| D31 | **Cifrado ChaCha20-Poly1305 con formato Tink exacto**: cabecera 5 bytes (0x00 + key ID 4B) + nonce 12B + CT + tag 16B | ChaCha20-Poly1305 plano | Goldwarden Go utiliza Google Tink. Los campos cifrados en `goldwarden.json` son strings base64 que envuelven este wire format binario de Tink |
+| D32 | **ConfigKeyHash = hex(SHA3-256(key_derivado))** | SHA-256, bcrypt | Paridad exacta con Go para validar PIN; comparación segura en tiempo constante con `subtle::ConstantTimeEq` |
+| D33 | **Escritura atómica de archivos (tempfile + rename)** | Sobrescritura directa | Previene corrupción o pérdida total de datos por interrupción abrupta observada en la implementación de Go |
+| D34 | **Migración de ruta legacy devuelve Ok en éxito** | Replicar bug de Go | Go retornaba error tras un rename exitoso al buscar el archivo viejo inexistente; Rust retorna `Ok(())` si el movimiento es limpio |
+| D35 | **SW-013 migra estado local; descarga de Vault/SSH en M4** | Descarga remota en M2 | El archivo en disco solo contiene configuración; la sincronización y descarga de ciphers/claves SSH se realiza en M4 vía `silverwarden sync` |
 
 ---
 
@@ -120,7 +126,7 @@ text
 - **Versionado:** semver por milestone; tags `v0.x.0-mN`.
 - **Entrega:** cada milestone = conjunto de tareas del backlog aceptadas + evidencia de controles.
 - **Empaquetado (M10, post-MVP):** crates.io (libs núcleo), Flatpak (Linux), .msi (Windows), .dmg (macOS), vía CI.
-- **Migración y reversión:** `silverwarden migrate` hace **backup automático** (`goldwarden.json.bak-<fecha>`) antes de tocar nada, importa config + vault + claves SSH, y verifica desbloqueo post-migración. Rollback: detener silverWarden-rs, restaurar backup, arrancar Goldwarden Go.
+- **Migración y reversión:** `silverwarden migrate` hace **backup automático** (`goldwarden.json.bak-<timestamp>`) antes de tocar nada, importa la configuración local a la nueva ruta y verifica el desbloqueo con el PIN. Dado que las claves SSH y ciphers del vault no residen en texto claro en disco (o no deben presumirse locales), la migración local concluye guiando al usuario a ejecutar `silverwarden sync` (M4) para descargar y descifrar el vault completo. Rollback: detener silverWarden-rs, restaurar backup, arrancar Goldwarden Go.
 - **Roll-forward:** si la migración falla a mitad, no se destruye nada sin backup verificado.
 - **No hay coexistencia en caliente:** una vez migrado, el agente Go no se usa. El importador es de un solo sentido.
 
@@ -143,9 +149,9 @@ text
 ## 7. Criterios de éxito por etapa
 
 - **M1:** vectores de prueba criptográficos pasan; cobertura ≥90% en `sw-crypto`.
-- **M2:** se abre un `goldwarden.json` real, se desbloquea con PIN, se leen token/claves, y se importan claves SSH.
+- **M2:** `goldwarden.json` real parseado y serializado sin pérdida (13 campos PascalCase); campos descifrados con Argon2i + Tink ChaCha20-Poly1305; migración de ruta legacy con permisos 0700/0600 y corrección de bug; comando `silverwarden migrate` funcional con backup `goldwarden.json.bak-<timestamp>`.
 - **M3:** el agente Rust arranca, el CLI `silverwarden` hace unlock→status→lock; importación de estado Go completada.
-- **M4:** login + sync completos contra vault.disroot.org con cuenta de prueba; caché en disco con paridad de formato.
+- **M4:** login + sync completos contra vault.disroot.org con cuenta de prueba; caché en disco con paridad de formato; descarga y sincronización de ciphers y claves SSH.
 - **M5:** `ssh-add -L` lista claves del vault; `git commit -S` firma con aprobación; sin regresión en flags RSA.
 - **M6–M10 (post-MVP):** criterios en backlog por tarea.
 

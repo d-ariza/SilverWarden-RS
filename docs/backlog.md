@@ -160,18 +160,36 @@ Una historia pasa a `Hecho` solo cuando:
 
 ## M2 — Config + migración `sw-config` (P0 — MVP)
 
+### Decisiones técnicas aplicadas (M2)
+
+- **D30:** KDF del config usa **Argon2i** (no id), $t=2, m=2048\text{ (2 GiB)}, p=8$ con salt = bytes de `DeviceUUID`.
+- **D31:** Cifrado ChaCha20-Poly1305 con **formato Tink exacto** (cabecera de 5 bytes: `0x00` + key ID 4 bytes `0x00000000` + nonce 12 bytes + ciphertext + tag Poly1305 16 bytes). Implementación con crate `tink-rust` o wrapper `TinkChaCha20Poly1305` sobre RustCrypto. Los strings cifrados en `goldwarden.json` son este blob binario codificado en base64.
+- **D32:** `ConfigKeyHash` = `hex(SHA3-256(key_derivado))` con verificación y comparación en tiempo constante (`subtle::ConstantTimeEq`).
+- **D33:** Escritura atómica de archivos (archivo temporal + rename atómico) para evitar el bug de pérdida o corrupción de datos de Go.
+- **D34:** La migración de ruta legacy devuelve `Ok` si el rename tiene éxito, corrigiendo el bug de Go que devolvía error tras mover el archivo.
+- **D35:** `SW-013` realiza la migración del estado local con backup. La descarga y sincronización completa de claves SSH y ciphers se realiza en M4 (`silverwarden sync`), usando el export de Bitwarden como base.
+
+---
+
 ### [SW-010] Estructura ConfigFile con serde
 
-**Historia:** Como usuario migrante, quiero que silverWarden-rs lea mi `goldwarden.json` existente sin pérdida de datos, para no reconfigurar nada.
+**Historia:** Como usuario migrante, quiero que silverWarden-rs lea y escriba mi `goldwarden.json` existente sin pérdida de datos, para mantener compatibilidad total con la configuración de Goldwarden.
 
-**Alcance:** structs `ConfigFile`/`RuntimeConfig`/`LoginToken` con defaults idénticos a Go (URLs, DeviceUUID v4).
+**Alcance:**
+- Struct `ConfigFile` con los 13 campos exactos del código Go (`IdentityUrl`, `ApiUrl`, `NotificationsUrl`, `VaultUrl`, `DeviceUUID`, `EncryptedClientID`, `EncryptedClientSecret`, `EncryptedPin`, `ConfigKeyHash`, `LoginToken`, `RuntimeConfig`, `DeviceName`, `LastSynced`).
+- Struct `LoginToken` con los 5 campos JSON (`AccessToken`, `ExpiresIn`, `TokenType`, `RefreshToken`, `Key`).
+- Struct `RuntimeConfig` para configuración en tiempo de ejecución.
+- Serde: `#[serde(rename_all = "PascalCase")]` para paridad exacta con el JSON de Go.
+- Defaults: URLs por defecto (`vault.bitwarden.com`, etc.), `DeviceUUID` v4 aleatorio, campos cifrados como strings vacíos.
+- Escritura atómica de archivos (D33): tempfile + rename en el mismo directorio.
 
 **Criterios de aceptación:**
-- JSON de un `goldwarden.json` real parsea sin pérdida de campos.
-- serialize→deserialize es estable (roundtrip).
-- Defaults coinciden con Go.
+- Parsear el `goldwarden.json` real sin pérdida de campos.
+- Verificar que el JSON se serializa y deserializa de manera idéntica y estable (roundtrip completo sin pérdida de datos).
+- Defaults coinciden exactamente con los de Go.
+- Escritura atómica previene corrupción de archivo.
 
-**Cierre:** criterios pasan con fixture real; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con fixture real y tests de roundtrip; evidencia en `03-ejecucion.md`.
 
 **Depende de:** — · **Estado:** Pendiente
 
@@ -179,33 +197,43 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-011] Cifrado de campos de config
 
-**Historia:** Como usuario, quiero que mis datos sensibles en config sigan cifrados con mi PIN, para que nadie los lea sin desbloquear.
+**Historia:** Como usuario, quiero que mis datos sensibles en config sigan cifrados con mi PIN bajo el formato Tink ChaCha20-Poly1305, para que nadie los lea sin desbloquear y mantengan compatibilidad con Goldwarden.
 
-**Alcance:** ChaCha20-Poly1305 con clave argon2(PIN, salt=DeviceUUID, t=2, m=2GB, p=8, 32B); `ConfigKeyHash` = SHA3-256 hex; comparación en tiempo constante; `UpdatePin` re-cifra todos los campos.
+**Alcance:**
+- Derivación de clave (D30): `Argon2i` (variante `i`, no `id`), password = PIN, salt = bytes de `DeviceUUID`, $t=2, m=2048\text{ (2 GiB)}, p=8$.
+- Hash del PIN (D32): `hex(SHA3-256(derived_key))` y verificación en tiempo constante con `subtle::ConstantTimeEq`.
+- Cifrado con formato Tink exacto (D31): cabecera de 5 bytes (`0x00` + key ID `0x00000000`) + nonce de 12 bytes + ciphertext + tag Poly1305 de 16 bytes. El archivo almacena estos blobs binarios codificados en base64 estándar. Uso de `tink-rust` o wrapper `TinkChaCha20Poly1305` sobre RustCrypto.
+- Métodos del config: `encrypt_string`, `decrypt_string`, `VerifyPin`, `UpdatePin`, `Unlock`.
 
 **Criterios de aceptación:**
-- Desbloquea un `goldwarden.json` real con su PIN.
-- PIN incorrecto → false, sin timing leak evidente.
-- `UpdatePin` re-cifra todos los campos (paridad con Go).
+- Desbloquear `goldwarden.json` real con el PIN real.
+- Verificar que un PIN incorrecto falla sin timing leak.
+- `UpdatePin` re-deriva la clave y re-cifra todos los campos sensibles (`EncryptedClientID`, `EncryptedClientSecret`, `EncryptedPin`).
+- Formato binario coincide byte a byte con Tink (5B cabecera + 12B nonce + CT + 16B tag).
 
-**Cierre:** criterios pasan con fixture real anonimizado; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con fixture real y PIN real/inválido; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-001, SW-003, SW-010 · **Estado:** Pendiente
+**Depende de:** SW-001, SW-010 · **Estado:** Pendiente
 
 ---
 
 ### [SW-012] Lectura + migración de path viejo
 
-**Historia:** Como usuario con instalación antigua, quiero que mi config se migre de `~/.config/goldwarden.json` a la ruta nueva, para no perderla.
+**Historia:** Como usuario con instalación previa, quiero que mi configuración se migre de `~/.config/goldwarden.json` a `~/.config/goldwarden/goldwarden.json` con permisos estrictos y sin errores, para asegurar la continuidad de mis datos.
 
-**Alcance:** `ReadConfig` con migración de path (paridad Go), permisos 0700/0600.
+**Alcance:**
+- Detección de ruta legacy: buscar `~/.config/goldwarden.json` y moverlo a `~/.config/goldwarden/goldwarden.json`.
+- Crear el directorio padre con permisos `0700`.
+- Archivo con permisos `0600`.
+- Arreglo de bug de Go (D34): si el archivo viejo existe, el nuevo no, y el rename es exitoso, devolver `Ok(())` (en Go retornaba error al buscar el archivo viejo tras el movimiento).
 
 **Criterios de aceptación:**
-- Test con ambos layouts (viejo y nuevo).
-- Permisos correctos tras migración.
-- No se sobrescribe sin backup.
+- Probar con directorio falso y fixtures simulando rutas legacy y nuevas.
+- Permisos de directorio `0700` y archivo `0600` verificados.
+- Devolución limpia de `Ok(())` en rename exitoso.
+- No se sobrescribe destructivamente si el archivo de destino ya existe.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con tests de filesystem; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-010 · **Estado:** Pendiente
 
@@ -213,18 +241,21 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-013] Comando `silverwarden migrate` con backup
 
-**Historia:** Como usuario migrante, quiero un comando explícito que importe mi estado desde Goldwarden Go (config, vault, PIN y claves SSH), con backup automático, para poder volver atrás si algo falla.
+**Historia:** Como usuario migrante, quiero un comando explícito `silverwarden migrate` que importe mi configuración local desde Goldwarden Go, cree un backup preventivo y valide el desbloqueo, indicándome los pasos siguientes para sincronizar el vault.
 
-**Alcance:** backup `goldwarden.json.bak-<ts>`; importación de config + vault + claves SSH; verificación de desbloqueo post-migración; reporte.
+**Alcance:**
+- Backup preventivo obligatorio: crear `goldwarden.json.bak-<timestamp>` antes de modificar nada en disco.
+- Migración local: importar el config al nuevo path y verificar que se puede desbloquear con el PIN.
+- Delimitación de alcance Vault y SSH (D35): dado que no residen en texto claro en disco (o no deben presumirse locales), `SW-013` concluye con el mensaje informativo: *"Configuración migrada. Ejecuta silverwarden sync (M4) para descargar tus claves SSH y contraseñas."* La descarga completa de ciphers y claves SSH se realiza en M4.
 
 **Criterios de aceptación:**
-- Se crea backup antes de tocar nada.
-- Tras migrar, el desbloqueo con PIN funciona y el vault se lee.
-- Las claves SSH importadas son visibles.
-- Rollback documentado y probado: restaurar backup y arrancar Goldwarden Go funciona.
-- Nada se sobrescribe sin backup verificado.
+- Backup `goldwarden.json.bak-<timestamp>` creado y verificado antes de operar.
+- Migración e importación del config verificadas con desbloqueo por PIN.
+- Mensaje exacto de instrucción para `silverwarden sync` (M4) emitido en stdout.
+- Simulación de migración desde cero con archivo de prueba exitosa.
+- Procedimiento de rollback documentado y probado.
 
-**Cierre:** criterios pasan con instalación Go real; evidencia en `03-ejecucion.md`.
+**Cierre:** criterios pasan con simulación completa de migración; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-011, SW-012 · **Estado:** Pendiente
 

@@ -35,7 +35,10 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-005] Cifrado simétrico EncryptWith/DecryptWith | Hecho | `cargo test -p sw-crypto`: 51 tests pasan, paridad exacta en Tipo 0 y Tipo 2, mitigación padding oracle |
 | M1 | [SW-006] RSA legacy OAEP-SHA1 | Hecho | `cargo test -p sw-crypto`: 61 tests pasan, interop bidireccional Go↔Rust, clave privada en memoria bloqueada |
 | M1 | [SW-007] Suite de fuzzing en sw-crypto | Hecho | cargo-fuzz con 4 targets (EncString, pkcs7_unpad, decrypt_with, decrypt_asym), corpus semilla, CI job, 0 crashes |
-| M2 | Config y Migración `sw-config` | Pendiente | Por registrar |
+| M2 | [SW-010] Estructura ConfigFile con serde | Pendiente | 13 campos PascalCase, LoginToken (5 campos), escritura atómica |
+| M2 | [SW-011] Cifrado de campos de config | Pendiente | Argon2i (t=2, m=2048, p=8), Tink ChaCha20-Poly1305, SHA3-256 |
+| M2 | [SW-012] Lectura + migración de path viejo | Pendiente | Detección legacy ~/.config/goldwarden.json -> ~/.config/goldwarden/, 0700/0600, fix Go bug |
+| M2 | [SW-013] Comando silverwarden migrate con backup | Pendiente | Backup .bak-<timestamp>, migración estado local, instrucción sync M4 |
 | M3 | Agente e IPC `sw-ipc`, `sw-agent`, `sw-systemauth` | Pendiente | Por registrar |
 | M4 | Vault y Bitwarden API `sw-vault`, `sw-bitwarden-api` | Pendiente | Por registrar |
 | M5 | SSH Agent `sw-ssh-agent` | Pendiente | Por registrar |
@@ -535,10 +538,44 @@ PASS
 **Estado:** ✅ SW-007 — Hecho (2026-10-13).  
 **Hito:** 🏁 **Milestone M1 (Criptografía y Memoria Segura) COMPLETADO al 100%.**
 
+---
 
+## 2. Milestone M2: Configuración y Migración (sw-config)
 
+### 2.0 Plan Definitivo y Decisiones Técnicas Aplicadas
 
+- **D30 (KDF de Config):** Derivación de clave desde PIN usando **Argon2i** (variante `i`, no `id`), parámetros $t=2, m=2048\text{ (2 GiB según semántica Go/Tink)}, p=8$, con salt = bytes de `DeviceUUID`.
+- **D31 (Cifrado de Campos en Formato Tink Exacto):** ChaCha20-Poly1305 con cabecera de 5 bytes (`0x00` + ID de clave 4 bytes `0x00000000`) + nonce de 12 bytes + ciphertext + tag Poly1305 de 16 bytes. Serializado en base64 estándar en los campos string del archivo `goldwarden.json`. Usaremos la crate `tink-rust` o implementaremos el wrapper `TinkChaCha20Poly1305` sobre RustCrypto.
+- **D32 (Hash de Clave de Config):** `ConfigKeyHash` = `hex(SHA3-256(key_derivado))` con verificación y comparación en tiempo constante (`subtle::ConstantTimeEq`).
+- **D33 (Escritura Atómica):** Escritura a archivo temporal y rename atómico (`tempfile` + `rename`) en el mismo directorio para evitar el bug de pérdida y truncado de archivo identificado en el writer de Go ante interrupciones abruptas.
+- **D34 (Corrección de Migración de Ruta Legacy):** Si `~/.config/goldwarden.json` existe, el nuevo path no existe, y el rename es exitoso, devolver `Ok(())` (arreglando el bug de Go que devolvía error al buscar el archivo viejo inexistente). Directorio creado con permisos 0700, archivo con 0600.
+- **D35 (Alcance de SW-013 y Delimitación con M4):** SW-013 migra el estado local con backup (`goldwarden.json.bak-<timestamp>`) y verifica el desbloqueo con el PIN. Dado que las claves SSH y ciphers del vault no residen en texto claro en disco (o no deben presumirse locales), SW-013 concluye con el mensaje informativo: *"Configuración migrada. Ejecuta silverwarden sync (M4) para descargar tus claves SSH y contraseñas."* La sincronización y descarga completa se realiza en M4 a partir del export de Bitwarden.
 
+### 2.1 Desglose de Historias M2
 
+1. **[SW-010] Estructura ConfigFile con serde:**
+   - Struct `ConfigFile`: con los 13 campos exactos de Go (`IdentityUrl`, `ApiUrl`, `NotificationsUrl`, `VaultUrl`, `DeviceUUID`, `EncryptedClientID`, `EncryptedClientSecret`, `EncryptedPin`, `ConfigKeyHash`, `LoginToken`, `RuntimeConfig`, `DeviceName`, `LastSynced`).
+   - Struct `LoginToken`: los 5 campos JSON (`AccessToken`, `ExpiresIn`, `TokenType`, `RefreshToken`, `Key`).
+   - Struct `RuntimeConfig`: configuración en memoria / runtime.
+   - Serde: `#[serde(rename_all = "PascalCase")]` para paridad con Go.
+   - Defaults: URLs por defecto (`vault.bitwarden.com`, etc.), `DeviceUUID` v4 aleatorio, campos cifrados vacíos.
+   - Tests: parsear `goldwarden.json` real. Verificar que el JSON se serializa y deserializa sin perder datos (roundtrip).
 
+2. **[SW-011] Cifrado de campos de config:**
+   - Derivación de clave: Argon2i(password=PIN, salt=DeviceUUID_bytes, t=2, m=2048, p=8).
+   - Hash del PIN: hex(SHA3-256(key)) y comparación en tiempo constante (`subtle::ConstantTimeEq`).
+   - Cifrado Tink ChaCha20-Poly1305 (blob binario a base64).
+   - Métodos: `encrypt_string`, `decrypt_string`, `VerifyPin`, `UpdatePin`, `Unlock`.
+   - Tests: desbloquear `goldwarden.json` real con PIN correcto. Verificar que PIN incorrecto falla.
 
+3. **[SW-012] Lectura + migración de path viejo:**
+   - Buscar `~/.config/goldwarden.json` y moverlo a `~/.config/goldwarden/goldwarden.json`.
+   - Crear directorio padre con permisos 0700; archivo con permisos 0600.
+   - Arreglo de bug: retornar `Ok(())` si el rename es exitoso.
+   - Tests: probar con directorio simulado.
+
+4. **[SW-013] Comando silverwarden migrate con backup:**
+   - Backup: crear `goldwarden.json.bak-<timestamp>` antes de tocar nada.
+   - Migración local: importar el config al nuevo path y verificar que se puede desbloquear.
+   - Mensaje terminal a M4: *"Configuración migrada. Ejecuta silverwarden sync (M4) para descargar tus claves SSH y contraseñas."*
+   - Tests: simular una migración desde cero con archivo de prueba.
