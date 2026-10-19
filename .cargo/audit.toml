@@ -12,4 +12,13 @@ ignore = [
 
     # glib unsound (RUSTSEC-2024-0429): dependencia transitiva de Tauri/GTK, excluida del MVP CLI
     "RUSTSEC-2024-0429",
+
+    # zbus split-crate unmaintained advisories (RUSTSEC-2026-0370/0371/0372).
+    # zbus 6.0.0 folded zvariant, zbus_names and zvariant_derive into itself.
+    # Current Tauri v2 plugins and notify-rust still require zbus ^5, which
+    # depends on the standalone crates. No patched release exists for zbus 5.
+    # Remove when Tauri plugins migrate to zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
