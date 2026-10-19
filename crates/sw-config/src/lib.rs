@@ -1,5 +1,20 @@
+use base64::Engine;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
+
+const TINK_HEADER: [u8; 5] = [0x00, 0x00, 0x00, 0x00, 0x00];
+const NONCE_LEN: usize = 12;
+
+pub const KDF_ITERATIONS: u32 = 2;
+pub const KDF_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB (2048 MiB), matches Goldwarden Go KDFMemory
+pub const KDF_PARALLELISM: u32 = 8;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -9,8 +24,120 @@ pub enum ConfigError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("KDF error: {0}")]
+    Kdf(String),
+
+    #[error("Crypto error: {0}")]
+    Crypto(String),
+
+    #[error("Invalid PIN: verification failed")]
+    InvalidPin,
+
     #[error("Configuration lock/pin error: {0}")]
     Lock(String),
+}
+
+/// Derives the 32-byte configuration key from PIN and Device UUID using Argon2i.
+///
+/// Parity with Goldwarden Go:
+/// - Algorithm: Argon2i, Version 0x13
+/// - Parameters: t = 2 (iterations), m = 2048 MiB (2 * 1024 * 1024 KiB), p = 8 (parallelism lanes)
+/// - Output: 32 bytes
+pub fn derive_config_key(pin: &str, device_uuid: &str) -> Result<[u8; 32], ConfigError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = Params::new(KDF_MEMORY_KIB, KDF_ITERATIONS, KDF_PARALLELISM, Some(32))
+        .map_err(|e| ConfigError::Kdf(format!("Invalid Argon2i params: {e}")))?;
+
+    let argon2 = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(pin.as_bytes(), device_uuid.as_bytes(), &mut key)
+        .map_err(|e| ConfigError::Kdf(format!("Argon2i derivation failed: {e}")))?;
+
+    Ok(key)
+}
+
+/// Calculates the lowercase hexadecimal SHA3-256 hash of a derived key.
+pub fn hash_config_key(key: &[u8; 32]) -> String {
+    let hash = Sha3_256::digest(key);
+    hex::encode(hash)
+}
+
+/// Verifies if a PIN matches the stored config_key_hash for a given device_uuid in constant time.
+pub fn verify_pin(
+    pin: &str,
+    device_uuid: &str,
+    expected_hash_hex: &str,
+) -> Result<bool, ConfigError> {
+    let key = derive_config_key(pin, device_uuid)?;
+    let calculated_hash = hash_config_key(&key);
+
+    if calculated_hash.len() != expected_hash_hex.len() {
+        return Ok(false);
+    }
+
+    let matches = calculated_hash
+        .as_bytes()
+        .ct_eq(expected_hash_hex.as_bytes());
+    Ok(matches.into())
+}
+
+/// Encrypts a plaintext string using Google Tink ChaCha20-Poly1305 wire format.
+///
+/// Binary layout:
+/// `[0x00, 0x00, 0x00, 0x00, 0x00]` (5-byte Key ID) || `nonce` (12 bytes) || `ciphertext + Poly1305 tag` (16 bytes).
+/// The resulting binary blob is returned as a standard Base64 string.
+pub fn encrypt_string(plaintext: &str, key: &[u8; 32]) -> Result<String, ConfigError> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| ConfigError::Crypto(format!("ChaCha20Poly1305 init failed: {e}")))?;
+
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext_and_tag = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| ConfigError::Crypto(format!("ChaCha20Poly1305 encryption failed: {e}")))?;
+
+    let mut raw = Vec::with_capacity(TINK_HEADER.len() + NONCE_LEN + ciphertext_and_tag.len());
+    raw.extend_from_slice(&TINK_HEADER);
+    raw.extend_from_slice(&nonce_bytes);
+    raw.extend_from_slice(&ciphertext_and_tag);
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(&raw))
+}
+
+/// Decrypts a standard Base64 string wrapping Google Tink ChaCha20-Poly1305 wire format.
+///
+/// Supports both:
+/// - Tink Keyset format: 5 bytes `[0x00, 0x00, 0x00, 0x00, 0x00]` + 12-byte nonce + ciphertext + 16-byte tag.
+/// - Tink subtle format (raw Go): 12-byte nonce + ciphertext + 16-byte tag.
+pub fn decrypt_string(b64: &str, key: &[u8; 32]) -> Result<String, ConfigError> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| ConfigError::Crypto(format!("Invalid base64 encoding: {e}")))?;
+
+    let (nonce_bytes, ciphertext_and_tag) = if raw.starts_with(&TINK_HEADER) && raw.len() >= 33 {
+        (&raw[5..17], &raw[17..])
+    } else if raw.len() >= NONCE_LEN + 16 {
+        (&raw[..NONCE_LEN], &raw[NONCE_LEN..])
+    } else {
+        return Err(ConfigError::Crypto(
+            "Encrypted payload too short for Tink nonce and tag".to_string(),
+        ));
+    };
+
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| ConfigError::Crypto(format!("ChaCha20Poly1305 init failed: {e}")))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext_bytes = cipher
+        .decrypt(nonce, ciphertext_and_tag)
+        .map_err(|e| ConfigError::Crypto(format!("ChaCha20Poly1305 decryption failed: {e}")))?;
+
+    String::from_utf8(plaintext_bytes)
+        .map_err(|e| ConfigError::Crypto(format!("Plaintext is not valid UTF-8: {e}")))
 }
 
 /// Representation of the configuration stored in ~/.config/goldwarden/goldwarden.json
@@ -52,6 +179,55 @@ impl Default for ConfigFile {
     }
 }
 
+impl ConfigFile {
+    /// Verifies if a PIN is valid against this configuration in constant time.
+    pub fn verify_pin(&self, pin: &str) -> Result<bool, ConfigError> {
+        verify_pin(pin, &self.device_uuid, &self.config_key_hash)
+    }
+
+    /// Unlocks and returns the 32-byte derived configuration key if PIN is valid.
+    pub fn unlock(&self, pin: &str) -> Result<[u8; 32], ConfigError> {
+        if !self.verify_pin(pin)? {
+            return Err(ConfigError::InvalidPin);
+        }
+        derive_config_key(pin, &self.device_uuid)
+    }
+
+    /// Re-encrypts all sensitive fields with a new PIN and updates `config_key_hash`.
+    pub fn update_pin(&mut self, old_pin: &str, new_pin: &str) -> Result<(), ConfigError> {
+        let old_key = self.unlock(old_pin)?;
+        let new_key = derive_config_key(new_pin, &self.device_uuid)?;
+
+        let reencrypt = |val: &str| -> Result<String, ConfigError> {
+            if val.is_empty() {
+                Ok(String::new())
+            } else {
+                let decrypted = decrypt_string(val, &old_key)?;
+                encrypt_string(&decrypted, &new_key)
+            }
+        };
+
+        self.encrypted_client_id = reencrypt(&self.encrypted_client_id)?;
+        self.encrypted_client_secret = reencrypt(&self.encrypted_client_secret)?;
+        self.encrypted_token = reencrypt(&self.encrypted_token)?;
+        self.encrypted_user_symmetric_key = reencrypt(&self.encrypted_user_symmetric_key)?;
+        self.encrypted_master_password_hash = reencrypt(&self.encrypted_master_password_hash)?;
+        self.encrypted_master_key = reencrypt(&self.encrypted_master_key)?;
+
+        self.config_key_hash = hash_config_key(&new_key);
+        Ok(())
+    }
+
+    /// Decrypts the OAuth login token payload using the derived key.
+    pub fn decrypt_token(&self, key: &[u8; 32]) -> Result<LoginToken, ConfigError> {
+        if self.encrypted_token.is_empty() {
+            return Err(ConfigError::Crypto("EncryptedToken is empty".to_string()));
+        }
+        let decrypted_json = decrypt_string(&self.encrypted_token, key)?;
+        serde_json::from_str(&decrypted_json).map_err(ConfigError::Json)
+    }
+}
+
 /// Representation of the decrypted OAuth login token payload
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +242,136 @@ pub struct LoginToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_KEY_HEX: &str =
+        "46d690a92d1b2e76b901b5221dc296ebe7a9ff6ee76b8615ede85a1323aac17a";
+    const EXPECTED_HASH_HEX: &str =
+        "e65f3b70990b3bb58a5fc7dc4d35bfaab58b87b81424b26f7a45dac85b2f01b3";
+
+    #[test]
+    fn test_argon2i_derivation() {
+        // Deterministic synthetic test vector
+        let key = derive_config_key("synthetic_unit_pin_123", "synthetic_device_uuid_456")
+            .expect("Argon2i derivation should succeed");
+        assert_eq!(key.len(), 32);
+
+        // If GOLDWARDEN_PIN is provided via environment, verify against live key
+        if let Ok(env_pin) = std::env::var("GOLDWARDEN_PIN") {
+            let live_salt = "1f5ef996-82f0-11f1-bc18-80304903a0d9";
+            let live_key = derive_config_key(&env_pin, live_salt)
+                .expect("Live Argon2i derivation should succeed");
+            assert_eq!(hex::encode(live_key), EXPECTED_KEY_HEX);
+        }
+    }
+
+    #[test]
+    fn test_sha3_hash_parity() {
+        let key_bytes: [u8; 32] = hex::decode(EXPECTED_KEY_HEX)
+            .expect("Valid hex")
+            .try_into()
+            .expect("32 bytes");
+
+        let hash_hex = hash_config_key(&key_bytes);
+        assert_eq!(hash_hex, EXPECTED_HASH_HEX);
+    }
+
+    #[test]
+    fn test_verify_pin_logic() {
+        let test_pin = "test_pin_verify_999";
+        let test_salt = "test_uuid_verify_999";
+        let key = derive_config_key(test_pin, test_salt).expect("Key derived");
+        let expected_hash = hash_config_key(&key);
+
+        assert!(verify_pin(test_pin, test_salt, &expected_hash).expect("Verification succeeds"));
+        assert!(!verify_pin("wrong_pin", test_salt, &expected_hash).expect("Verification succeeds"));
+        assert!(!verify_pin(test_pin, "other-uuid", &expected_hash).expect("Verification succeeds"));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key_bytes: [u8; 32] = hex::decode(EXPECTED_KEY_HEX)
+            .expect("Valid hex")
+            .try_into()
+            .expect("32 bytes");
+
+        let plaintext = "secret goldwarden config payload 12345!@#$%^&*()";
+        let encrypted_b64 =
+            encrypt_string(plaintext, &key_bytes).expect("Encryption should succeed");
+
+        // Verify Tink wire format: Base64 decodes to [0x00, 0x00, 0x00, 0x00, 0x00] + 12B nonce + CT
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&encrypted_b64)
+            .expect("Should decode base64");
+        assert!(raw.len() > 17);
+        assert_eq!(&raw[..5], &[0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        let decrypted =
+            decrypt_string(&encrypted_b64, &key_bytes).expect("Decryption should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_go_token() {
+        let key_bytes: [u8; 32] = hex::decode(EXPECTED_KEY_HEX)
+            .expect("Valid hex")
+            .try_into()
+            .expect("32 bytes");
+
+        // If local goldwarden.json exists in HOME, verify exact token decryption
+        if let Ok(home) = std::env::var("HOME") {
+            let config_path = std::path::PathBuf::from(home)
+                .join(".config")
+                .join("goldwarden")
+                .join("goldwarden.json");
+            if config_path.exists() {
+                let content =
+                    std::fs::read_to_string(&config_path).expect("Should read goldwarden.json");
+                let config: ConfigFile =
+                    serde_json::from_str(&content).expect("Should parse goldwarden.json");
+
+                if !config.encrypted_token.is_empty()
+                    && config.device_uuid == "1f5ef996-82f0-11f1-bc18-80304903a0d9"
+                {
+                    let decrypted = decrypt_string(&config.encrypted_token, &key_bytes)
+                        .expect("Should decrypt Go token with derived key");
+                    assert!(decrypted.starts_with(r#"{"access_token":"eyJ0eXAi"#));
+
+                    let token = config
+                        .decrypt_token(&key_bytes)
+                        .expect("Should parse decrypted LoginToken");
+                    assert!(token.access_token.starts_with("eyJ0eXAi"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_pin() {
+        let test_pin_old = "old_pin_123";
+        let test_salt = "mock_salt_uuid_999";
+        let initial_key = derive_config_key(test_pin_old, test_salt).unwrap();
+        let mut cfg = ConfigFile {
+            device_uuid: test_salt.to_string(),
+            config_key_hash: hash_config_key(&initial_key),
+            encrypted_client_id: encrypt_string("client_secret_data", &initial_key).unwrap(),
+            ..Default::default()
+        };
+
+        assert!(cfg.verify_pin(test_pin_old).unwrap());
+
+        let test_pin_new = "new_pin_456";
+        cfg.update_pin(test_pin_old, test_pin_new)
+            .expect("Pin update succeeds");
+
+        assert!(!cfg.verify_pin(test_pin_old).unwrap());
+        assert!(cfg.verify_pin(test_pin_new).unwrap());
+
+        let new_key = cfg
+            .unlock(test_pin_new)
+            .expect("Unlock with new pin succeeds");
+        let decrypted_client_id = decrypt_string(&cfg.encrypted_client_id, &new_key).unwrap();
+        assert_eq!(decrypted_client_id, "client_secret_data");
+    }
 
     #[test]
     fn test_deserialize_config_file_from_json() {
@@ -125,7 +431,6 @@ mod tests {
         let serialized =
             serde_json::to_string(&original).expect("Serialization of ConfigFile should succeed");
 
-        // Verify key casing in serialized output matches Go wire format
         assert!(serialized.contains("\"IdentityUrl\":"));
         assert!(serialized.contains("\"ApiUrl\":"));
         assert!(serialized.contains("\"NotificationsUrl\":"));

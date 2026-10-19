@@ -36,7 +36,7 @@ Este documento registra la evidencia de ejecución real requerida por las reglas
 | M1 | [SW-006] RSA legacy OAEP-SHA1 | Hecho | `cargo test -p sw-crypto`: 61 tests pasan, interop bidireccional Go↔Rust, clave privada en memoria bloqueada |
 | M1 | [SW-007] Suite de fuzzing en sw-crypto | Hecho | cargo-fuzz con 4 targets (EncString, pkcs7_unpad, decrypt_with, decrypt_asym), corpus semilla, CI job, 0 crashes |
 | M2 | [SW-010] Estructura ConfigFile con serde | Hecho | `cargo test -p sw-config`: 4 tests pasan (12 campos PascalCase, LoginToken, roundtrip, parseo de goldwarden.json real) |
-| M2 | [SW-011] Cifrado de campos de config | Pendiente | Argon2i (t=2, m=2048, p=8), Tink ChaCha20-Poly1305, SHA3-256 |
+| M2 | [SW-011] Cifrado de campos de config | Hecho | `cargo test -p sw-config`: 10 tests pasan (Argon2i, Tink ChaCha20-Poly1305, SHA3-256, descifrado token Go real, update_pin) |
 | M2 | [SW-012] Lectura + migración de path viejo | Pendiente | Detección legacy ~/.config/goldwarden.json -> ~/.config/goldwarden/, 0700/0600, fix Go bug |
 | M2 | [SW-013] Comando silverwarden migrate con backup | Pendiente | Backup .bak-<timestamp>, migración estado local, instrucción sync M4 |
 | M3 | Agente e IPC `sw-ipc`, `sw-agent`, `sw-systemauth` | Pendiente | Por registrar |
@@ -599,4 +599,30 @@ PASS
 | Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only` | 98.87% regiones / 98.37% líneas |
 
 **Estado:** ✅ SW-010 — Hecho (2026-10-18).
+
+### 2.3 Evidencia de Ejecución: [SW-011] Cifrado de campos de config
+
+**Fecha:** 2026-10-18  
+**Archivos modificados:**
+- `Cargo.toml`: adición de `hex = "0.4"` a `workspace.dependencies` y perfil optimizado `[profile.dev.package.argon2]` / `[profile.test.package.argon2]` (`opt-level = 3`).
+- `crates/sw-config/Cargo.toml`: dependencias `argon2`, `sha3`, `chacha20poly1305`, `base64`, `subtle`, `hex`, `rand`.
+- `crates/sw-config/src/lib.rs`:
+  - `derive_config_key`: KDF con `Argon2i` (v1.3), $t=2, m=2\text{ GiB (2048 MiB / } 2\times 1024\times 1024\text{ KiB)}, p=8$ (paridad byte a byte con Go `KDFMemory`).
+  - `hash_config_key`: hash `SHA3-256` en formato hexadecimal.
+  - `verify_pin`: comparación en tiempo constante con `subtle::ConstantTimeEq`.
+  - `encrypt_string` / `decrypt_string`: wire format Tink ChaCha20-Poly1305 compatible tanto con cabecera Tink Keyset (`[0, 0, 0, 0, 0]`) como con Tink `subtle` de Go (`nonce 12B || ciphertext + tag 16B`).
+  - Métodos `verify_pin`, `unlock`, `update_pin`, `decrypt_token` en `ConfigFile`.
+  - Tests unitarios y de integración: paridad SHA3-256, roundtrip Tink, verificación de PIN, `update_pin` y descifrado verificado del token real de Goldwarden Go.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config -- --test-threads=1` | 10 pasan, 0 fallan (roundtrip Tink, SHA3-256 parity, token Go descifrado a `{"access_token":"eyJ0eXAi...`, update_pin, verify_pin) |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| Cobertura `sw-config` | `cargo llvm-cov -p sw-config --summary-only -- --test-threads=1` | 91.99% regiones / 92.92% líneas (umbral: ≥85%) |
+
+**Estado:** ✅ SW-011 — Hecho (2026-10-18).
 

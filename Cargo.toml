@@ -71,6 +71,7 @@ base64 = "0.22"
 subtle = "2.6"
 rand = "0.8"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+hex = "0.4"
 
 # Network & WebSockets
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -82,3 +83,10 @@ ssh-key = { version = "0.6", features = ["rsa", "ed25519", "crypto"] }
 
 # Linux / System integrations
 zbus = "5.0"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.test.package.argon2]
+opt-level = 3
+
