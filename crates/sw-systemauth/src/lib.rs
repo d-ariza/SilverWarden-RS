@@ -59,6 +59,124 @@ impl AuthSession {
     }
 }
 
+/// A hardened authentication session tied to process lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub pid: u32,
+    pub ppid: u32,
+    pub grand_ppid: u32,
+    pub expires_at: std::time::SystemTime,
+    pub session_type: SessionType,
+}
+
+impl Session {
+    /// Checks whether this session has expired relative to the current system time.
+    pub fn is_expired(&self) -> bool {
+        std::time::SystemTime::now() >= self.expires_at
+    }
+}
+
+/// In-memory store for active authentication sessions with strict process-tree hardening.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStore {
+    sessions: Vec<Session>,
+}
+
+impl SessionStore {
+    /// Creates a new empty session store.
+    pub fn new() -> Self {
+        Self {
+            sessions: Vec::new(),
+        }
+    }
+
+    /// Creates and registers an authentication session for the calling context with a specified TTL.
+    pub fn create_session(
+        &mut self,
+        ctx: &CallingContext,
+        session_type: SessionType,
+        ttl: Duration,
+    ) -> Session {
+        let session = Session {
+            pid: ctx.process_pid,
+            ppid: ctx.parent_process_pid,
+            grand_ppid: ctx.grandparent_process_pid,
+            expires_at: std::time::SystemTime::now() + ttl,
+            session_type,
+        };
+        self.sessions.push(session.clone());
+        session
+    }
+
+    /// Verifies if an active, unexpired session exists for the given calling context.
+    ///
+    /// Hardening rules:
+    /// - If `ctx.error` is true or `ctx.authenticated` is false, verification always fails.
+    /// - For `AccessVault` and `Pin`: requires an exact match of (pid, ppid, grand_ppid).
+    /// - For `SSHKey`: if `ctx.process_name` is "ssh", "ssh-keygen", or "git",
+    ///   permits matching by session type (any valid unexpired SSHKey session is accepted).
+    ///   Otherwise, requires an exact match of (pid, ppid, grand_ppid).
+    pub fn verify_session(&self, ctx: &CallingContext, session_type: SessionType) -> bool {
+        if ctx.error || !ctx.authenticated {
+            return false;
+        }
+
+        let is_git_ssh_context = ctx.process_name == "ssh"
+            || ctx.process_name == "ssh-keygen"
+            || ctx.process_name == "git";
+
+        for s in &self.sessions {
+            if s.session_type != session_type || s.is_expired() {
+                continue;
+            }
+
+            match session_type {
+                SessionType::AccessVault | SessionType::Pin => {
+                    if s.pid == ctx.process_pid
+                        && s.ppid == ctx.parent_process_pid
+                        && s.grand_ppid == ctx.grandparent_process_pid
+                    {
+                        return true;
+                    }
+                }
+                SessionType::SSHKey => {
+                    if is_git_ssh_context {
+                        return true;
+                    }
+                    if s.pid == ctx.process_pid
+                        && s.ppid == ctx.parent_process_pid
+                        && s.grand_ppid == ctx.grandparent_process_pid
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Wipes and clears all stored sessions (invoked when locking the vault).
+    pub fn wipe(&mut self) {
+        self.sessions.clear();
+    }
+
+    /// Prunes expired sessions from the store.
+    pub fn prune_expired(&mut self) {
+        self.sessions.retain(|s| !s.is_expired());
+    }
+
+    /// Returns the number of sessions currently stored.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Checks if the session store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
 /// Lightweight container for process name and parent PID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
@@ -474,5 +592,242 @@ mod tests {
         sys.refresh_process(current_pid);
         let proc = sys.process(current_pid);
         assert!(proc.is_some());
+    }
+
+    #[test]
+    fn test_session_store_create_and_verify_pin_and_vault() {
+        let mut store = SessionStore::new();
+        assert!(store.is_empty());
+
+        let ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "silverwarden".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 100,
+            parent_process_pid: 50,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // Create Pin session
+        store.create_session(&ctx, SessionType::Pin, Duration::from_secs(3600));
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
+
+        // Verify valid session
+        assert!(store.verify_session(&ctx, SessionType::Pin));
+
+        // Different session type should not verify
+        assert!(!store.verify_session(&ctx, SessionType::AccessVault));
+
+        // Create AccessVault session
+        store.create_session(&ctx, SessionType::AccessVault, Duration::from_secs(1800));
+        assert_eq!(store.len(), 2);
+        assert!(store.verify_session(&ctx, SessionType::AccessVault));
+    }
+
+    #[test]
+    fn test_session_store_different_pid_fails() {
+        let mut store = SessionStore::new();
+        let ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "silverwarden".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 100,
+            parent_process_pid: 50,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        store.create_session(&ctx, SessionType::Pin, Duration::from_secs(3600));
+
+        // Different PID
+        let other_ctx = CallingContext {
+            process_pid: 101,
+            ..ctx.clone()
+        };
+        assert!(!store.verify_session(&other_ctx, SessionType::Pin));
+
+        // Different PPID
+        let other_ppid_ctx = CallingContext {
+            parent_process_pid: 51,
+            ..ctx.clone()
+        };
+        assert!(!store.verify_session(&other_ppid_ctx, SessionType::Pin));
+
+        // Different Grand-PPID
+        let other_grand_ppid_ctx = CallingContext {
+            grandparent_process_pid: 2,
+            ..ctx.clone()
+        };
+        assert!(!store.verify_session(&other_grand_ppid_ctx, SessionType::Pin));
+    }
+
+    #[test]
+    fn test_session_store_expired_fails() {
+        let mut store = SessionStore::new();
+        let ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "silverwarden".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 100,
+            parent_process_pid: 50,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // Create session with past expiration
+        let expired_session = Session {
+            pid: ctx.process_pid,
+            ppid: ctx.parent_process_pid,
+            grand_ppid: ctx.grandparent_process_pid,
+            expires_at: std::time::SystemTime::now() - Duration::from_secs(10),
+            session_type: SessionType::Pin,
+        };
+        assert!(expired_session.is_expired());
+        store.sessions.push(expired_session);
+
+        assert!(!store.verify_session(&ctx, SessionType::Pin));
+
+        // Pruning should remove the expired session
+        store.prune_expired();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_session_store_sshkey_git_ssh_relaxation() {
+        let mut store = SessionStore::new();
+
+        // Session created by git command
+        let git_ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "git".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 200,
+            parent_process_pid: 100,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        store.create_session(&git_ctx, SessionType::SSHKey, Duration::from_secs(3600));
+
+        // An ssh child process with completely different PIDs should match by type
+        let ssh_child_ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "ssh".into(),
+            parent_process_name: "git".into(),
+            grandparent_process_name: "bash".into(),
+            process_pid: 300,
+            parent_process_pid: 200,
+            grandparent_process_pid: 100,
+            error: false,
+            authenticated: true,
+        };
+        assert!(store.verify_session(&ssh_child_ctx, SessionType::SSHKey));
+
+        // ssh-keygen also matches by type
+        let ssh_keygen_ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "ssh-keygen".into(),
+            parent_process_name: "git".into(),
+            grandparent_process_name: "bash".into(),
+            process_pid: 400,
+            parent_process_pid: 200,
+            grandparent_process_pid: 100,
+            error: false,
+            authenticated: true,
+        };
+        assert!(store.verify_session(&ssh_keygen_ctx, SessionType::SSHKey));
+
+        // Non-whitelisted process (e.g. "curl") must NOT match by type; requires exact PID match
+        let curl_ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "curl".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 500,
+            parent_process_pid: 100,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+        assert!(!store.verify_session(&curl_ctx, SessionType::SSHKey));
+
+        // curl with exact PIDs matches
+        let curl_exact_ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "curl".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 200,
+            parent_process_pid: 100,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+        assert!(store.verify_session(&curl_exact_ctx, SessionType::SSHKey));
+    }
+
+    #[test]
+    fn test_session_store_unauthenticated_fails() {
+        let mut store = SessionStore::new();
+        let ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "silverwarden".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 100,
+            parent_process_pid: 50,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        store.create_session(&ctx, SessionType::Pin, Duration::from_secs(3600));
+
+        let err_ctx = CallingContext {
+            error: true,
+            ..ctx.clone()
+        };
+        assert!(!store.verify_session(&err_ctx, SessionType::Pin));
+
+        let unauth_ctx = CallingContext {
+            authenticated: false,
+            ..ctx.clone()
+        };
+        assert!(!store.verify_session(&unauth_ctx, SessionType::Pin));
+    }
+
+    #[test]
+    fn test_session_store_wipe_clears_all() {
+        let mut store = SessionStore::new();
+        let ctx = CallingContext {
+            username: "alice".into(),
+            process_name: "silverwarden".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "systemd".into(),
+            process_pid: 100,
+            parent_process_pid: 50,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        store.create_session(&ctx, SessionType::Pin, Duration::from_secs(3600));
+        store.create_session(&ctx, SessionType::AccessVault, Duration::from_secs(3600));
+        assert_eq!(store.len(), 2);
+
+        store.wipe();
+        assert!(store.is_empty());
+        assert!(!store.verify_session(&ctx, SessionType::Pin));
+        assert!(!store.verify_session(&ctx, SessionType::AccessVault));
     }
 }

@@ -839,5 +839,64 @@ PASS
 
 **Estado:** ✅ SW-022 — Hecho (2026-10-20).
 
+### 3.5 Evidencia de Ejecución: [SW-023], [SW-024] y [SW-025] (Sesiones, Registry de Acciones y CLI)
+
+**Fecha:** 2026-10-20  
+**Archivos modificados:**
+- `Cargo.toml`: adición de `rpassword = "7.3"` en `[workspace.dependencies]`.
+- `crates/sw-systemauth/src/lib.rs` (SW-023):
+  - Struct `Session`: `pid`, `ppid`, `grand_ppid`, `expires_at: std::time::SystemTime`, `session_type: SessionType`.
+  - Enum `SessionType`: `AccessVault`, `SSHKey`, `Pin`.
+  - Struct `SessionStore`:
+    - `create_session(ctx, type, ttl)`: almacena sesión vinculada a la jerarquía de procesos del caller.
+    - `verify_session(ctx, type)` con reglas de endurecimiento (D36):
+      - `AccessVault` y `Pin`: validación estricta y exacta de los 3 PIDs (`pid`, `ppid`, `grand_ppid`).
+      - `SSHKey`: si el proceso es `ssh`, `ssh-keygen` o `git`, se permite coincidencia por tipo de sesión (`session_type == SSHKey`); para cualquier otro binario, se exige coincidencia exacta de los 3 PIDs.
+      - Validación estricta de expiración de sesión (`now >= expires_at`).
+      - Rechazo categórico si el contexto presenta error o no está autenticado (`ctx.error || !ctx.authenticated`).
+    - `wipe()`: purga total e inmediata de todas las sesiones al bloquear el vault.
+    - `prune_expired()`: limpieza de sesiones caducadas.
+  - Tests unitarios exhaustivos (18 tests totales en `sw-systemauth`).
+- `crates/sw-agent/Cargo.toml` y `crates/sw-agent/src/lib.rs` (SW-024):
+  - Struct `AgentState`: `config: ConfigFile`, `sessions: SessionStore`, `is_locked: bool`, `has_pin: bool`, `shutdown_sender`.
+  - Trait `ActionFn`: trait dinámico para handlers de acciones con implementación genérica para closures.
+  - Struct `ActionsRegistry`: registro extensible `HashMap<String, Box<dyn ActionFn>>` con búsqueda flexible.
+  - Función `default_registry()` implementando las acciones esenciales:
+    - `Status`: retorna `{ locked, has_pin, logged_in, version }`.
+    - `Unlock`: recibe `{ pin }`, verifica contra `sw-config`, desbloquea estado y registra sesiones en `SessionStore`.
+    - `Lock`: bloquea vault, borra claves y purga todas las sesiones activas (`wipe()`).
+    - `PinSet` / `PinUpdate`: gestiona y recifra configuración delegando en `sw-config`.
+    - `AgentShutdown`: canal para apagado ordenado del daemon (clave para tests y control de ciclo de vida).
+  - En `run_agent`: reemplazado el stub `"Not implemented"` por despacho real hacia `ActionsRegistry` con `CallingContext` extraído del socket.
+  - Tests de integración sobre socket Unix y pruebas directas del registro (8 tests en `sw-agent`).
+- `crates/sw-cli/Cargo.toml` y `crates/sw-cli/src/main.rs` (SW-025):
+  - Integración de `rpassword` y dependencias del agente.
+  - Subcomandos `clap`:
+    - `silverwarden agent start`: ejecución del agente en foreground.
+    - `silverwarden status`: conexión al socket Unix y reporte visual del estado del daemon.
+    - `silverwarden unlock [--pin <pin>]`: desbloqueo con argumento o solicitud interactiva en terminal sin eco (`rpassword`).
+    - `silverwarden lock`: bloqueo y purga inmediata de sesiones vía IPC.
+    - `silverwarden pin set [--pin <pin>]`: configuración interactiva o directa de PIN.
+    - `silverwarden pin update [--old-pin <pin>] [--new-pin <pin>]`: actualización interactiva o por parámetros.
+    - `silverwarden migrate`: soporte conservado para migración desde Goldwarden Go.
+  - Detección proactiva de socket activo de Goldwarden Go (`~/.goldwarden.sock`) emitiendo advertencia de conflicto (D37).
+  - 10 pruebas unitarias validando el parseo de todos los subcomandos y banderas CLI.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-systemauth` | `cargo test -p sw-systemauth` | 18 pasan, 0 fallan (0.01s) |
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 8 pasan, 0 fallan (socket Unix, flow de acciones, shutdown IPC) |
+| Pruebas unitarias `sw-cli` | `cargo test -p sw-cli` | 10 pasan, 0 fallan (parseo de subcomandos, banderas y modos interactivos) |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| Cobertura `sw-systemauth` | `cargo llvm-cov -p sw-systemauth --lib --summary-only` | **95.93% regiones / 95.72% líneas** (umbral: ≥85%) |
+| Cobertura `sw-agent` | `cargo llvm-cov -p sw-agent --lib --summary-only` | **90.23% regiones / 90.29% líneas** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-023, SW-024 y SW-025 — Hecho (2026-10-20). Cierre definitivo del Milestone M3.
+
+
 
 

@@ -355,7 +355,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** pruebas unitarias de política de sesiones pasando; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-022 · **Estado:** Pendiente
+**Depende de:** SW-022 · **Estado:** Hecho (2026-10-20)
 
 ---
 
@@ -385,7 +385,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con tests de registro y handlers; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-021, SW-023, SW-011 · **Estado:** Pendiente
+**Depende de:** SW-021, SW-023, SW-011 · **Estado:** Hecho (2026-10-20)
 
 ---
 
@@ -414,7 +414,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** flujo CLI manual y unitario verificado; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-024 · **Estado:** Pendiente
+**Depende de:** SW-024 · **Estado:** Hecho (2026-10-20)
 
 ---
 
