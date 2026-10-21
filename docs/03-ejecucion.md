@@ -787,4 +787,57 @@ PASS
 
 **Estado:** ✅ SW-020 y SW-021 — Hecho (2026-10-19).
 
+### 3.4 Evidencia de Ejecución: [SW-022] CallingContext y resolución de procesos (`sw-systemauth`)
+
+**Fecha:** 2026-10-20  
+**Archivos modificados:**
+- `Cargo.toml`: adición de características `["mm", "net", "process"]` a `rustix`, y dependencia compartida `sysinfo = "0.30"` en `[workspace.dependencies]`.
+- `crates/sw-systemauth/Cargo.toml`: adición de dependencias `rustix = { workspace = true }` y `sysinfo = { workspace = true }`, y dependencias de test `tempfile = { workspace = true }` y `tokio = { workspace = true, features = ["net", "io-util", "macros"] }`.
+- `crates/sw-systemauth/src/lib.rs`:
+  - Struct `CallingContext`:
+    - `username: String`
+    - `process_name: String`
+    - `parent_process_name: String`
+    - `grandparent_process_name: String`
+    - `process_pid: u32`
+    - `parent_process_pid: u32`
+    - `grandparent_process_pid: u32`
+    - `error: bool`
+    - `authenticated: bool`
+  - Implementación de `get_calling_context<S: AsFd>(conn: &S) -> CallingContext`:
+    - En Linux: extracción de credenciales del socket peer mediante `rustix::net::sockopt::get_socket_peercred(conn)`.
+    - En otras plataformas (macOS/Windows): stub seguro preparado para M10 devolviendo `error: true, authenticated: false`.
+    - Regla de seguridad root: si `uid == 0`, se rechaza explícitamente (`error: true, authenticated: false`) garantizando que root no interactúe con el agente de contraseñas de usuario.
+    - Validación de PID: si `pid == 0`, se rechaza con error.
+    - Resolución de usuario: lectura y parseo directo de `/etc/passwd` buscando coincidencia exacta de UID en campo 3, con fallback a `sysinfo::Users`.
+    - Inspección del árbol de procesos (`PID` -> `PPID` -> `Grand-PPID`): lectura de `/proc/<pid>/stat` con parsing robusto de la cadena `(comm)` (incluso con espacios y paréntesis anidados), y fallback transparente a `sysinfo::System`.
+    - Caso especial Git (anclaje de contexto): si el proceso que llama es `ssh` o `ssh-keygen` y su padre directo es `git`, el contexto se ancla a `git` (el proceso actual pasa a ser `git`, y su PPID y Grand-PPID corresponden a los de `git`), logrando paridad con el comportamiento de Goldwarden.
+    - Resiliencia y seguridad ante fallos: cualquier error de lectura en `/proc`, proceso inexistente o denegación de permisos retorna `CallingContext { error: true, authenticated: false, ..Default::default() }`.
+  - Batería de pruebas unitarias (`12 pruebas en sw-systemauth`):
+    - `test_calling_context_unix_stream_pair`: extracción de credenciales peer en `UnixStream::pair()` en Linux.
+    - `test_calling_context_root_rejected`: verificación de rechazo estricto si `uid == 0`.
+    - `test_calling_context_zero_pid_rejected`: verificación de rechazo si `pid == 0`.
+    - `test_calling_context_fake_pid_error`: retorno seguro ante PIDs inexistentes (`error: true`).
+    - `test_parse_proc_stat`: prueba de parseo de `/proc/<pid>/stat` con nombres estándar y nombres complejos con espacios y paréntesis.
+    - `test_git_anchoring_ssh_keygen_and_ssh`: verificación del anclaje de contexto hacia `git` cuando el comando es `ssh-keygen` o `ssh` y su padre es `git`.
+    - `test_no_git_anchoring_for_normal_ssh`: verificación de que `ssh` o `ssh-keygen` lanzados fuera de `git` (ej. desde una shell) no anclan falsamente a `git`.
+    - `test_sysinfo_fallback_for_process_info`: cobertura de la ruta de fallback con `sysinfo`.
+    - `test_resolve_username_from_etc_passwd`: verificación de resolución de UID a username desde archivo sintético `/etc/passwd`.
+    - `test_calling_context_display`: verificación del formateo en `Display`.
+    - `test_calling_context_for_current_process`: comprobación con el proceso actual en ejecución en el sistema anfitrión.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-systemauth` | `cargo test -p sw-systemauth` | 12 pasan, 0 fallan (0.01s) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui -- --test-threads=1` | 112 tests pasan en total (61 `sw-crypto`, 25 `sw-config`, 5 `sw-ipc`, 7 `sw-agent`, 12 `sw-systemauth`, 2 `sw-cli`), 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0; dependencias saneadas) |
+| Cobertura `sw-systemauth` | `cargo llvm-cov -p sw-systemauth --lib --summary-only` | **92.87% regiones / 92.23% líneas** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-022 — Hecho (2026-10-20).
+
+
 

@@ -332,7 +332,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con tests simulados de procesos y socket; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-021 · **Estado:** Pendiente
+**Depende de:** SW-021 · **Estado:** Hecho (2026-10-20)
 
 ---
 
