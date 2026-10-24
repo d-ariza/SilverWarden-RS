@@ -1235,4 +1235,167 @@ mod tests {
         assert_eq!(token_guard.access_token, "refreshed_access");
         assert_eq!(token_guard.key, "new_updated_key");
     }
+
+    // =========================================================================
+    // Go <-> Rust Parity Tests for SW-033 Login
+    // =========================================================================
+
+    const TEST_EMAIL: &str = "3227908@tcs.com";
+    const TEST_PASSWORD: &str = "Unloader-Woof";
+    const TEST_KDF_ITERATIONS: u32 = 600000;
+    const TEST_DEVICE_UUID: &str = "1f5ef996-82f0-11f1-bc18-80304903a0d9";
+
+    const EXPECTED_MASTER_KEY_HEX: &str =
+        "199221c920d67649464da15df7b019bd4df1accc0c90e0cea2d68a358c254afe";
+    const EXPECTED_MASTER_PASSWORD_HASH_B64: &str = "n9L+3LdK2Z1IhAPRnLzerrdLBKjMhhr3LSpXfIDNLUQ=";
+    const EXPECTED_STRETCHED_KEY_HEX: &str =
+        "d173d39056e02e5ae2af53316d6cc21492db044de5641a2230bb4e2a33933566f4b7362e746996055d1b31cddd2be0c43bfb79b7c667013d7e4cc99d497532f0";
+    const EXPECTED_ENC_KEY: &str =
+        "2.VnAx2h55dzHVslHktja+Tg==|AyhiUxbTIoISm6sVOhjwuGSvZLT/SNde/6qXFKKFD+pqg/ZWeWKTu8mvx66ppWBgorkfYRALqpem37JM8viJOdK5/GfrwMPEy+NZ2Ll9oCo=|I5h2Vl4BQkPZ3hD1nwNmaCug+PfS6YjfDB0L6S0ekz8=";
+    const EXPECTED_USER_SYMMETRIC_KEY_HEX: &str =
+        "f7e4fce1ebe2b9af92bfd98aea39b0705410b59277ba3efce9034896610e3fd6fdb48d82574e3db63252bc14fe40a9cdd81038074a1cada65cf8413c11919830";
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn test_parity_master_key() {
+        let config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: TEST_KDF_ITERATIONS,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(TEST_PASSWORD.as_bytes(), TEST_EMAIL, &config)
+                .expect("Master key derivation should succeed");
+        assert_eq!(hex_encode(master_key.as_slice()), EXPECTED_MASTER_KEY_HEX);
+    }
+
+    #[test]
+    fn test_parity_master_password_hash() {
+        let config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: TEST_KDF_ITERATIONS,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(TEST_PASSWORD.as_bytes(), TEST_EMAIL, &config)
+                .expect("Master key derivation should succeed");
+        let hash = derive_master_password_hash(master_key.as_slice(), TEST_PASSWORD);
+        assert_eq!(hash, EXPECTED_MASTER_PASSWORD_HASH_B64);
+    }
+
+    #[test]
+    fn test_parity_stretch_key() {
+        let config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: TEST_KDF_ITERATIONS,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(TEST_PASSWORD.as_bytes(), TEST_EMAIL, &config)
+                .expect("Master key derivation should succeed");
+        let stretched_key =
+            sw_crypto::stretch_key(&master_key).expect("Stretch key derivation should succeed");
+        assert_eq!(
+            hex_encode(&stretched_key.bytes()),
+            EXPECTED_STRETCHED_KEY_HEX
+        );
+    }
+
+    #[test]
+    fn test_parity_decrypt_enc_key() {
+        let config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: TEST_KDF_ITERATIONS,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(TEST_PASSWORD.as_bytes(), TEST_EMAIL, &config)
+                .expect("Master key derivation should succeed");
+        let stretched_key =
+            sw_crypto::stretch_key(&master_key).expect("Stretch key derivation should succeed");
+
+        // Verify with decrypt_enc_key
+        let decrypted = decrypt_enc_key(EXPECTED_ENC_KEY, &stretched_key.bytes())
+            .expect("Decryption of enc_key should succeed");
+        assert_eq!(hex_encode(&decrypted), EXPECTED_USER_SYMMETRIC_KEY_HEX);
+
+        // Verify directly with sw_crypto::EncString and decrypt_with
+        let enc_string = sw_crypto::EncString::from_str(EXPECTED_ENC_KEY)
+            .expect("EncString parsing should succeed");
+        let decrypted_direct = sw_crypto::decrypt_with(&enc_string, &stretched_key)
+            .expect("Direct decrypt_with should succeed");
+        assert_eq!(
+            hex_encode(&decrypted_direct),
+            EXPECTED_USER_SYMMETRIC_KEY_HEX
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parity_full_login_pipeline() {
+        let server = MockServer::start().await;
+
+        // Prelogin returning the exact Go parity parameters
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": TEST_KDF_ITERATIONS,
+                "kdfMemory": null,
+                "kdfParallelism": null
+            })))
+            .mount(&server)
+            .await;
+
+        // Connect token returning the exact Go parity enc_key
+        let encoded_password_param =
+            url::form_urlencoded::byte_serialize(EXPECTED_MASTER_PASSWORD_HASH_B64.as_bytes())
+                .collect::<String>();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .and(body_string_contains(format!(
+                "username={}",
+                url::form_urlencoded::byte_serialize(TEST_EMAIL.as_bytes()).collect::<String>()
+            )))
+            .and(body_string_contains(format!(
+                "password={}",
+                encoded_password_param
+            )))
+            .and(body_string_contains(format!(
+                "deviceIdentifier={}",
+                TEST_DEVICE_UUID
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "parity_access_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "parity_refresh_token",
+                "key": EXPECTED_ENC_KEY
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let (token, user_symmetric_key) = client
+            .login(TEST_EMAIL, TEST_PASSWORD, TEST_DEVICE_UUID)
+            .await
+            .expect("Full login with parity vectors should succeed");
+
+        assert_eq!(token.access_token, "parity_access_token");
+        assert_eq!(token.key, EXPECTED_ENC_KEY);
+        assert_eq!(
+            hex_encode(&user_symmetric_key),
+            EXPECTED_USER_SYMMETRIC_KEY_HEX
+        );
+    }
 }

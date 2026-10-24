@@ -1142,7 +1142,7 @@ PASS
       5. `login_with_password(email, &master_password_hash, device_uuid)` $\rightarrow$ `LoginToken`.
       6. `decrypt_enc_key(&token.key, &stretched_bytes)` $\rightarrow$ `user_symmetric_key` (64 bytes).
   - Funciones standalone de alto nivel: `prelogin`, `login_with_password`, `login`.
-  - Batería de 10 pruebas unitarias añadidas (20 tests en total en `sw-bitwarden-api`):
+  - Batería de 15 pruebas unitarias añadidas (25 tests en total en `sw-bitwarden-api`):
     - `test_derive_master_password_hash_rfc6070_vector`: verificación con vector RFC 6070 adaptado (`Eg+2z/z4syxD5yJSVsT4N6hlSMkszDVICAWYfLcL4Xs=`).
     - `test_decrypt_enc_key_synthetic`: generación sintética de `EncString` (AES-256-CBC + HMAC-SHA256), descifrado y validación de coincidencia de bytes de la cuenta.
     - `test_decrypt_enc_key_error_cases`: cobertura de cadena vacía, formato inválido, clave de tamaño incorrecto y MAC corrupta.
@@ -1153,20 +1153,26 @@ PASS
     - `test_prelogin_404_fallback_to_identity_mount`: fallback transparente entre rutas de prelogin.
     - `test_login_missing_key_returns_auth_error`: validación de error si el servidor no incluye clave.
     - `test_standalone_functions`: wrappers a nivel de módulo.
+    - **Tests de paridad Go $\leftrightarrow$ Rust (con vectores reales de Goldwarden Go):**
+      - `test_parity_master_key`: deriva con PBKDF2 (600,000 iteraciones) sobre `"Unloader-Woof"` y `"3227908@tcs.com"`, validando coincidencia exacta de `EXPECTED_MASTER_KEY_HEX` (`199221c9...`).
+      - `test_parity_master_password_hash`: calcula hash PBKDF2-HMAC-SHA256 (1 iteración) y verifica Base64 exacto `EXPECTED_MASTER_PASSWORD_HASH_B64` (`n9L+3LdK...`).
+      - `test_parity_stretch_key`: expande clave maestra con HKDF-SHA256 (`"enc"`, `"mac"`) y verifica coincidencia exacta de los 64 bytes hex `EXPECTED_STRETCHED_KEY_HEX` (`d173d390...`).
+      - `test_parity_decrypt_enc_key`: descifra `EXPECTED_ENC_KEY` (`2.VnAx2h55...`) con la clave extendida y verifica coincidencia exacta con `EXPECTED_USER_SYMMETRIC_KEY_HEX` (`f7e4fce1...`) tanto vía `decrypt_enc_key` como directamente con `sw_crypto::decrypt_with`.
+      - `test_parity_full_login_pipeline`: simulación completa de prelogin y connect/token con todos los vectores de Goldwarden Go validando token y clave simétrica final.
 
 #### Controles obligatorios y resultados reales
 
 | Control | Comando | Resultado real |
 |---|---|---|
-| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 20 pasan, 0 fallan (6.38s) |
-| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 198 pasan en total, 0 fallan |
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 25 pasan, 0 fallan (22.20s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 203 pasan en total, 0 fallan |
 | Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
 | Formato | `cargo fmt --all -- --check` | 0 diffs |
 | Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
-| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **96.29% regiones / 96.67% líneas** (umbral: ≥85%) |
-| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.75% regiones / 94.31% líneas** |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **96.81% regiones / 97.38% líneas** (umbral: ≥85%) |
+| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.85% regiones / 94.40% líneas** |
 
-**Estado:** ✅ SW-033 (Parte 1) — Hecho (2026-10-24).
+**Estado:** ✅ SW-033 (Parte 1: Mock server + Paridad Go) — Hecho (2026-10-24).
 
 
 
