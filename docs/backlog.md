@@ -455,7 +455,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Headers exactos verificados.
 - Token refrescado y persistido en memoria.
 
-**Depende de:** SW-010 · **Estado:** Pendiente
+**Depende de:** SW-010 · **Estado:** Hecho (2026-10-24)
 
 ---
 

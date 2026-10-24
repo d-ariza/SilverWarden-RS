@@ -1015,6 +1015,57 @@ PASS
 7. **[SW-034] 2FA (`sw-bitwarden-api`):**
    - Captura y reenvío de desafíos de segundo factor para TOTP y Email.
 
+### 4.3 Evidencia de Ejecución: [SW-030] HTTP autenticado con refresh automático (`sw-bitwarden-api`)
+
+**Fecha:** 2026-10-24  
+**Archivos modificados:**
+- `crates/sw-config/src/lib.rs`:
+  - Añadido atributo `#[serde(default)]` al campo `key` de `LoginToken` para evitar fallos de deserialización cuando el endpoint `/connect/token` responde a solicitudes `grant_type=refresh_token` (las cuales no devuelven la llave simétrica).
+- `crates/sw-bitwarden-api/Cargo.toml`:
+  - Dependencias: `sw-crypto`, `sw-config`, `sw-vault`, `reqwest`, `tokio`, `tokio-tungstenite`, `rmp-serde`, `serde`, `serde_json`, `thiserror`, `base64`, `url`.
+  - Dev-dependency: `wiremock = "0.6"`.
+- `crates/sw-bitwarden-api/src/lib.rs`:
+  - Definición de cabeceras de cliente Bitwarden:
+    - `User-Agent: silverwarden/0.0.1`
+    - `Device-Type: 10`
+    - `Bitwarden-Client-Name: silverwarden`
+    - `Bitwarden-Client-Version: 0.0.1`
+  - Re-export de `LoginToken` desde `sw-config`.
+  - Enum `ApiError`: variantes `Reqwest`, `Auth`, `Json`, `Url`, `Status`.
+  - Enum `RequestBody`: soporte para `Empty`, `Json`, `Form` y `RawForm` con inyección automática de cabecera `Auth-Email: base64(username)` en codificación base64 url-safe sin padding (`URL_SAFE_NO_PAD`).
+  - Struct `AuthenticatedClient`:
+    - `client: reqwest::Client`, `token: Arc<Mutex<LoginToken>>`, `identity_url: String`, `api_url: String`.
+    - Constructores `new()`, `from_token()` y `with_client()`.
+    - Métodos de acceso y resolución de endpoints: `token()`, `identity_url()`, `api_url()`, `resolve_api_url()`.
+    - `refresh_token(&self) -> Result<(), ApiError>`: POST `/connect/token` con `grant_type=refresh_token`, `refresh_token` y `client_id=connector`. Preserva la llave de cifrado existente si el servidor no la retorna en la rotación de token.
+    - `fetch_with_auth(&self, method, url, body) -> Result<Response, ApiError>`: inyecta autorización Bearer y cabeceras estándar; ante respuesta 401 Unauthorized, sincroniza con `Mutex`, ejecuta `refresh_token()` y reintenta la solicitud automáticamente.
+  - Batería de pruebas con `wiremock` (10 pruebas unitarias):
+    - `test_fetch_with_auth_success_200`: petición HTTP normal con token válido y verificación de cabeceras.
+    - `test_fetch_with_auth_401_then_refresh_and_retry_200`: simulación de 401 inicial, refresco exitoso vía `/connect/token` y reintento automático con código 200. Verificación de actualización del token y conservación de `key`.
+    - `test_fetch_with_auth_refresh_fails_returns_error`: servidor devuelve 401 y el refresh falla (400 `invalid_grant`) $\rightarrow$ retorno controlado de `ApiError::Auth`.
+    - `test_fetch_with_auth_form_sets_auth_email_header`: inyección de `Auth-Email` en peticiones `Form` con campo `username`.
+    - `test_fetch_with_auth_json_body`: inyección de `Content-Type: application/json`.
+    - `test_refresh_token_missing_returns_auth_error`: error inmediato ante ausencia de `refresh_token`.
+    - `test_prelogin_success`: verificación de llamada al endpoint `/api/accounts/prelogin`.
+    - `test_fetch_with_auth_raw_form`: soporte para formularios url-encoded crudos con `Auth-Email`.
+    - `test_client_accessors_and_resolve_api_url`: resolución de URLs relativas y absolutas.
+    - `test_refresh_updates_new_key_when_provided`: actualización de `key` cuando el servidor la provee.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 10 pasan, 0 fallan (0.02s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 173 pasan en total, 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **97.75% regiones / 98.96% líneas** (umbral: ≥85%) |
+| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **92.86% regiones / 93.39% líneas** |
+
+**Estado:** ✅ SW-030 — Hecho (2026-10-24).
+
+
 
 
 
