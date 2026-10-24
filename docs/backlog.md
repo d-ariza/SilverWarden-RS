@@ -474,7 +474,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Serialización y deserialización roundtrip estable.
 - Campos desconocidos o extensiones manejados sin panic.
 
-**Depende de:** SW-002 · **Estado:** Pendiente
+**Depende de:** SW-002 · **Estado:** Hecho (2026-10-24)
 
 ---
 

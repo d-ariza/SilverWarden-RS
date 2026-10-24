@@ -1065,6 +1065,56 @@ PASS
 
 **Estado:** ✅ SW-030 — Hecho (2026-10-24).
 
+### 4.4 Evidencia de Ejecución: [SW-031] Modelos de SyncData y Cipher (`sw-vault`)
+
+**Fecha:** 2026-10-24  
+**Archivos modificados:**
+- `crates/sw-crypto/src/encstring.rs`:
+  - Implementación de `serde::Serialize` y `serde::Deserialize` para `EncString` permitiendo serializar a la representación estándar de Bitwarden (`type.iv|ct[|mac]`) y deserializar desde JSON strings con soporte para valores nulos o cadenas vacías (`EncString::default()`).
+  - Prueba unitaria `test_encstring_serde_roundtrip` (62 tests en `sw-crypto`).
+- `crates/sw-vault/Cargo.toml`:
+  - Adición de `uuid = { workspace = true }`.
+- `crates/sw-vault/src/lib.rs`:
+  - Definición completa con paridad estricta respecto al código Go (`models.go`):
+    - `CipherType`: enum `Login = 1`, `Note = 2`, `Card = 3`, `Identity = 4`, `SshKey = 5`.
+    - `FieldType`: enum `Text = 0`, `Hidden = 1`, `Boolean = 2`, `Linked = 3`, `Other(i32)`.
+    - `URIMatch`: enum `Domain = 0`, `Host = 1`, `StartsWith = 2`, `Exact = 3`, `RegularExpression = 4`, `Never = 5`, `Other(i32)`.
+    - `SecureNoteType`: enum `Generic = 0`, `Other(i32)`.
+    - `URI`: `uri: Option<String>`, `match: Option<URIMatch>`.
+    - `Field`: `type: Option<FieldType>`, `name: Option<EncString>`, `value: Option<EncString>`.
+    - `LoginCipher`: `username`, `password`, `totp`, `uri`, `uris: Vec<URI>`.
+    - `SSHKeyCipher`: `private_key: Option<EncString>`, `public_key: Option<EncString>`, `key_fingerprint: Option<EncString>`.
+    - `Card`: `cardholder_name`, `brand`, `number`, `exp_month`, `exp_year`, `code`.
+    - `Identity`: 17 campos estándar de identidad (`first_name`, `last_name`, `ssn`, `email`, `phone`, etc.).
+    - `SecureNoteCipher`: `type: Option<SecureNoteType>`.
+    - `Folder`: `id: Option<Uuid>`, `name: Option<String>`, `revision_date: Option<String>`.
+    - `Organization`: `id`, `name`, `key`, `seats`, flags de permisos y características.
+    - `Profile`: datos de usuario, organizaciones, claves cifradas (`key`, `private_key`), `security_stamp`.
+    - `Cipher`: modelo unificado de elemento de bóveda con `type: CipherType`, `id: Option<Uuid>`, `name: EncString`, `login`, `card`, `identity`, `secure_note`, `ssh_key`, `key: Option<EncString>`, `fields`, `collection_ids`, etc.
+    - `SyncData`: estructura raíz de sincronización conteniendo `profile: Profile`, `folders: Vec<Folder>`, `ciphers: Vec<Cipher>`.
+    - `VaultStore`: almacén en memoria indexado por `Uuid` con operaciones `insert`, `get`, `all`, `len`, `clear`.
+  - Atributos serde homogéneos: `#[serde(rename_all = "camelCase")]` y `#[serde(default)]` en todos los tipos opcionales y listas.
+  - Batería de pruebas unitarias:
+    - `test_sync_data_full_deserialization`: deserialización completa de un payload complejo de `/sync` conteniendo perfil, organizaciones, carpetas, ciphers de tipo Login y ciphers de tipo SSHKey con validación de todos los campos.
+    - `test_roundtrip_serialization`: ciclo completo serialize $\rightarrow$ deserialize sin pérdida de información para Cards, Identities y SecureNotes.
+    - `test_vault_store_operations`: inserción, consulta por Uuid, conteo y vaciado del almacén en memoria.
+    - `test_cipher_type_conversion_and_fallback`: mapeo bidireccional de discriminantes numéricos de ciphers, fields, URIs y notas.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-vault` | `cargo test -p sw-vault` | 4 pasan, 0 fallan (0.01s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 178 pasan en total, 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-vault`** | `cargo llvm-cov -p sw-vault --summary-only` | **97.30% regiones / 97.44% líneas** (umbral: ≥85%) |
+| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.40% regiones / 94.03% líneas** |
+
+**Estado:** ✅ SW-031 — Hecho (2026-10-24).
+
+
 
 
 

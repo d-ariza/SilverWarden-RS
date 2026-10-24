@@ -247,6 +247,29 @@ impl FromStr for EncString {
     }
 }
 
+impl serde::Serialize for EncString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.to_string_repr().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EncString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) if !s.trim().is_empty() => s.parse().map_err(serde::de::Error::custom),
+            _ => Ok(Self::default()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +500,28 @@ mod tests {
         assert!("4.aaaa|bbbb|cccc".parse::<EncString>().is_err());
         // type 5 requires 2 parts
         assert!("5.aaaa".parse::<EncString>().is_err());
+    }
+
+    #[test]
+    fn test_encstring_serde_roundtrip() {
+        let raw = "2.2048g97+mYI/wHjHqE123Q==|vXQ5sY9hWqQ9r1Y2+XyZmA==|B7HhE9vUeHk5dM5q7XkFw2uP8yA0J4m1N2vX8qY3sZ0=";
+        let enc: EncString = raw.parse().unwrap();
+
+        // Serialize
+        let json = serde_json::to_string(&enc).unwrap();
+        assert_eq!(json, format!("\"{raw}\""));
+
+        // Deserialize
+        let deserialized: EncString = serde_json::from_str(&json).unwrap();
+        assert_eq!(enc, deserialized);
+
+        // Null / default
+        let empty_json = "\"\"";
+        let empty_enc: EncString = serde_json::from_str(empty_json).unwrap();
+        assert!(empty_enc.is_null());
+
+        let null_json = "null";
+        let null_enc: EncString = serde_json::from_str(null_json).unwrap();
+        assert!(null_enc.is_null());
     }
 }
