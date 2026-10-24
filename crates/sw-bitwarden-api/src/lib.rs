@@ -32,6 +32,9 @@ pub enum ApiError {
     #[error("Crypto error: {0}")]
     Crypto(#[from] sw_crypto::CryptoError),
 
+    #[error("Vault error: {0}")]
+    Vault(#[from] sw_vault::VaultError),
+
     #[error("Server error ({status}): {message}")]
     Status {
         status: reqwest::StatusCode,
@@ -458,6 +461,67 @@ impl AuthenticatedClient {
         let user_symmetric_key = decrypt_enc_key(&token.key, &stretched_bytes)?;
         Ok((token, user_symmetric_key))
     }
+
+    /// Fetches the full synchronization data (`SyncData`) from the Bitwarden `/sync` endpoint.
+    ///
+    /// Automatically handles fallback between `/sync` and `/api/sync` for compatibility
+    /// with official Bitwarden servers and self-hosted instances.
+    pub async fn sync(&self) -> Result<sw_vault::SyncData, ApiError> {
+        let mut resp = self
+            .fetch_with_auth(reqwest::Method::GET, "sync", RequestBody::Empty)
+            .await?;
+
+        // Fallback for self-hosted instances if api_url is root and sync is at /api/sync
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && !self.api_url.ends_with("/api") {
+            let alt_resp = self
+                .fetch_with_auth(reqwest::Method::GET, "api/sync", RequestBody::Empty)
+                .await?;
+            if alt_resp.status().is_success() {
+                resp = alt_resp;
+            }
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status {
+                status,
+                message: body,
+            });
+        }
+
+        let sync_data: sw_vault::SyncData = resp.json().await?;
+        Ok(sync_data)
+    }
+
+    /// Performs a full synchronization:
+    /// 1. Queries the remote `/sync` endpoint via `self.sync()`.
+    /// 2. Persists the raw `SyncData` atomically to disk in `vault_paths.vault_file()`
+    ///    with Unix permissions 0600.
+    /// 3. Populates the in-memory `VaultStore` with ciphers, folders, profile and updates `last_synced`.
+    ///
+    /// Returns the synchronized `SyncData`.
+    pub async fn do_full_sync(
+        &self,
+        vault_paths: &sw_vault::VaultPaths,
+        vault_store: &sw_vault::VaultStore,
+    ) -> Result<sw_vault::SyncData, ApiError> {
+        let sync_data = self.sync().await?;
+
+        // Atomically save to disk with 0600 permissions
+        sw_vault::save_vault(&vault_paths.vault_file(), &sync_data)?;
+
+        // Populate in-memory store
+        vault_store.load_sync_data(sync_data.clone()).await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        vault_store.set_last_synced(now).await;
+
+        Ok(sync_data)
+    }
 }
 
 /// Derives the master password hash used to authenticate against Bitwarden.
@@ -524,6 +588,20 @@ pub async fn login(
     device_uuid: &str,
 ) -> Result<(LoginToken, Vec<u8>), ApiError> {
     client.login(email, password, device_uuid).await
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::sync`.
+pub async fn sync(client: &AuthenticatedClient) -> Result<sw_vault::SyncData, ApiError> {
+    client.sync().await
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::do_full_sync`.
+pub async fn do_full_sync(
+    client: &AuthenticatedClient,
+    vault_paths: &sw_vault::VaultPaths,
+    vault_store: &sw_vault::VaultStore,
+) -> Result<sw_vault::SyncData, ApiError> {
+    client.do_full_sync(vault_paths, vault_store).await
 }
 
 #[cfg(test)]
@@ -1397,5 +1475,245 @@ mod tests {
             hex_encode(&user_symmetric_key),
             EXPECTED_USER_SYMMETRIC_KEY_HEX
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_success() {
+        let server = MockServer::start().await;
+
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+
+        let sample_sync_json = serde_json::json!({
+            "profile": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "name": "Test User",
+                "email": "user@example.com"
+            },
+            "folders": [
+                {
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "name": "Personal"
+                }
+            ],
+            "ciphers": [
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "type": 1,
+                    "name": valid_enc,
+                    "notes": null,
+                    "login": {
+                        "username": valid_enc,
+                        "password": valid_enc
+                    }
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .and(header("Authorization", "Bearer sync_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_sync_json))
+            .mount(&server)
+            .await;
+
+        let token = LoginToken {
+            access_token: "sync_token".to_string(),
+            ..LoginToken::default()
+        };
+        let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
+
+        let sync_data = client.sync().await.expect("Sync should succeed");
+        assert_eq!(sync_data.profile.email.as_deref(), Some("user@example.com"));
+        assert_eq!(sync_data.folders.len(), 1);
+        assert_eq!(sync_data.ciphers.len(), 1);
+        assert_eq!(sync_data.ciphers[0].r#type, sw_vault::CipherType::Login);
+    }
+
+    #[tokio::test]
+    async fn test_sync_error_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal error"))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        let err = client.sync().await.unwrap_err();
+        match err {
+            ApiError::Status { status, message } => {
+                assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(message, "Internal error");
+            }
+            other => panic!("Expected Status error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_fallback_to_api_sync() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profile": { "email": "fallback@example.com" },
+                "folders": [],
+                "ciphers": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        let sync_data = client.sync().await.expect("Sync fallback should succeed");
+        assert_eq!(
+            sync_data.profile.email.as_deref(),
+            Some("fallback@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_do_full_sync_wiremock_cache_and_memory() {
+        let server = MockServer::start().await;
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+
+        let sample_sync_json = serde_json::json!({
+            "profile": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "name": "Synced User",
+                "email": "synced@example.com"
+            },
+            "folders": [
+                {
+                    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "name": "Folder 1"
+                }
+            ],
+            "ciphers": [
+                {
+                    "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "type": 1,
+                    "name": valid_enc,
+                    "login": {
+                        "username": valid_enc,
+                        "password": valid_enc
+                    }
+                },
+                {
+                    "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                    "type": 5,
+                    "name": valid_enc,
+                    "sshKey": {
+                        "publicKey": valid_enc
+                    }
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_sync_json))
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir failed");
+        let vault_paths = sw_vault::VaultPaths::new(temp_dir.path().join("silverwarden_cache"));
+        let vault_store = sw_vault::VaultStore::new();
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let sync_result = client
+            .do_full_sync(&vault_paths, &vault_store)
+            .await
+            .expect("do_full_sync should succeed");
+
+        assert_eq!(sync_result.ciphers.len(), 2);
+
+        // 1. Check file exists on disk
+        let vault_file = vault_paths.vault_file();
+        assert!(vault_file.exists());
+
+        // 2. Check 0600 permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&vault_file).expect("metadata failed");
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "Cache file must have 0600 permissions");
+        }
+
+        // 3. Check load_vault roundtrip from disk
+        let loaded_from_disk = sw_vault::load_vault(&vault_file).expect("load_vault failed");
+        assert_eq!(loaded_from_disk, sync_result);
+
+        // 4. Check memory store populated
+        assert_eq!(vault_store.len().await, 2);
+        let id1 = uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let cipher1 = vault_store
+            .get(&id1)
+            .await
+            .expect("cipher1 should be in store");
+        assert_eq!(cipher1.r#type, sw_vault::CipherType::Login);
+
+        let id2 = uuid::Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        let cipher2 = vault_store
+            .get(&id2)
+            .await
+            .expect("cipher2 should be in store");
+        assert_eq!(cipher2.r#type, sw_vault::CipherType::SshKey);
+
+        let profile = vault_store.profile().await;
+        assert_eq!(
+            profile.unwrap().email.as_deref(),
+            Some("synced@example.com")
+        );
+
+        let folders = vault_store.folders().await;
+        assert_eq!(folders.len(), 1);
+
+        assert!(vault_store.last_synced().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_standalone_sync_and_do_full_sync() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profile": { "email": "standalone@example.com" },
+                "folders": [],
+                "ciphers": []
+            })))
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir failed");
+        let vault_paths = sw_vault::VaultPaths::new(temp_dir.path().join("cache"));
+        let vault_store = sw_vault::VaultStore::new();
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        // Test standalone sync
+        let s1 = sync(&client).await.expect("sync standalone should succeed");
+        assert_eq!(s1.profile.email.as_deref(), Some("standalone@example.com"));
+
+        // Test standalone do_full_sync
+        let s2 = do_full_sync(&client, &vault_paths, &vault_store)
+            .await
+            .expect("do_full_sync standalone should succeed");
+        assert_eq!(s2.profile.email.as_deref(), Some("standalone@example.com"));
+        assert!(vault_paths.vault_file().exists());
+        assert!(vault_store.last_synced().await.is_some());
     }
 }

@@ -1174,6 +1174,72 @@ PASS
 
 **Estado:** ✅ SW-033 (Parte 1: Mock server + Paridad Go) — Hecho (2026-10-24).
 
+### 4.6 Evidencia de Ejecución: [SW-032] Sync completo + Caché en disco (`sw-vault`, `sw-bitwarden-api`)
+
+**Fecha:** 2026-10-24  
+**Archivos modificados:**
+- `Cargo.toml` (raíz):
+  - Añadida dependencia de workspace `dirs = "5.0"`.
+- `crates/sw-vault/Cargo.toml`:
+  - Dependencias añadidas: `dirs = { workspace = true }`, `tokio = { workspace = true, features = ["sync", "fs", "rt"] }`, `tempfile = { workspace = true }`.
+- `crates/sw-vault/src/lib.rs`:
+  - Enum de error de bóveda `VaultError`: variantes `Io`, `Json`, `NotFound`, `Api`, `Other`.
+  - Struct `VaultPaths`:
+    - Métodos `new()`, `default_paths()`, `base_dir()`, `vault_file()`.
+    - Resolución estándar de ruta base vía `dirs::data_dir()` (`~/.local/share/silverwarden` en Linux con fallback) y archivo `vault.json`.
+    - `ensure_dirs(&self) -> Result<(), VaultError>`: creación segura de directorios con permisos Unix `0700`.
+  - Persistencia atómica en disco:
+    - `save_vault(path: &Path, data: &SyncData) -> Result<(), VaultError>`:
+      - Crea archivo temporal en el directorio destino (`tempfile::NamedTempFile::new_in(parent)`).
+      - Escribe JSON serializado, vacía buffers con `flush()` y `sync_all()`.
+      - Aplica permisos Unix estrictos `0600` en el archivo temporal antes del renombre.
+      - Renombra atómicamente a la ruta de destino vía `.persist(path)`.
+      - Reasegura permisos `0600` en la ruta final.
+    - `load_vault(path: &Path) -> Result<SyncData, VaultError>`:
+      - Validación de existencia previa (`VaultError::NotFound`).
+      - Deserialización segura mediante `BufReader` y `serde_json::from_reader`.
+    - Envoltorios asíncronos sin bloqueo de event-loop: `save_vault_async` y `load_vault_async` con `tokio::task::spawn_blocking`.
+  - Almacén en memoria seguro `VaultStore`:
+    - Protegido por `tokio::sync::RwLock` en memoria: `ciphers: RwLock<HashMap<Uuid, Cipher>>`, `folders: RwLock<Vec<Folder>>`, `profile: RwLock<Option<Profile>>`, `last_synced: RwLock<Option<u64>>`.
+    - Métodos asíncronos: `load_sync_data` (carga sin descifrado masivo preliminar), `to_sync_data`, `insert`, `get`, `delete`, `all`, `len`, `is_empty`, `clear`, `profile`, `folders`, `last_synced`, `set_last_synced`.
+    - Métodos bloqueantes síncronos: `blocking_insert`, `blocking_get`, `blocking_delete`, `blocking_all`, `blocking_len`, `blocking_clear`, `blocking_load_sync_data`, `blocking_to_sync_data`, `blocking_last_synced`, `blocking_set_last_synced`.
+- `crates/sw-bitwarden-api/Cargo.toml`:
+  - Adición de dev-dependencies `tempfile = { workspace = true }` y `uuid = { workspace = true }`.
+- `crates/sw-bitwarden-api/src/lib.rs`:
+  - Integración de variante `Vault(#[from] sw_vault::VaultError)` en `ApiError`.
+  - Implementación de `sync(&self) -> Result<sw_vault::SyncData, ApiError>` en `AuthenticatedClient`:
+    - Llamada GET al endpoint `/sync` con autorización y cabeceras estándar.
+    - Fallback transparente a `/api/sync` ante 404 para compatibilidad total con servidores autoalojados / proxies.
+  - Implementación de `do_full_sync(&self, vault_paths: &sw_vault::VaultPaths, vault_store: &sw_vault::VaultStore) -> Result<sw_vault::SyncData, ApiError>` en `AuthenticatedClient`:
+    - Descarga remota de `SyncData` vía `self.sync().await`.
+    - Persistencia atómica en disco en `vault_paths.vault_file()` con permisos Unix `0600`.
+    - Carga en memoria sin descifrado en `vault_store`.
+    - Registro de marca temporal Unix en `vault_store.set_last_synced()`.
+  - Wrappers standalone: `sw_bitwarden_api::sync` y `sw_bitwarden_api::do_full_sync`.
+  - Batería de pruebas obligatorias completada (11 pruebas en `sw-vault`, 5 nuevas en `sw-bitwarden-api`):
+    - **Test 1 (Roundtrip save/load):** `test_vault_save_and_load_roundtrip` y `test_vault_async_save_and_load`.
+    - **Test 2 (Permisos 0600 en Unix):** `test_vault_file_permissions_0600`.
+    - **Test 3 (Concurrencia RwLock):** `test_vault_store_rwlock_concurrency`.
+    - **Test 4 (Errores de archivo inexistente / corrupto):** `test_vault_load_nonexistent_and_corrupt_errors`.
+    - **Test 5 (do_full_sync con Wiremock y verificación de caché/memoria):** `test_do_full_sync_wiremock_cache_and_memory` y `test_standalone_sync_and_do_full_sync`.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-vault` | `cargo test -p sw-vault` | 11 pasan, 0 fallan (0.01s) |
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 30 pasan, 0 fallan (26.96s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 219 pasan en total, 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-vault`** | `cargo llvm-cov -p sw-vault --summary-only` | **95.64% regiones / 96.50% líneas** (umbral: ≥85%) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **97.06% regiones / 97.79% líneas** (umbral: ≥85%) |
+| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.92% regiones / 94.53% líneas** |
+
+**Estado:** ✅ SW-032 — Hecho (2026-10-24).
+
+
 
 
 

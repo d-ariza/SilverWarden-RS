@@ -24,4 +24,6 @@ url = "2.5"
 
 [dev-dependencies]
 wiremock = "0.6"
+tempfile = { workspace = true }
+uuid = { workspace = true }
 

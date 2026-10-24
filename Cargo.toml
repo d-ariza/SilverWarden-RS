@@ -86,6 +86,7 @@ ssh-key = { version = "0.6", features = ["rsa", "ed25519", "crypto"] }
 
 # Linux / System integrations
 zbus = "5.0"
+dirs = "5.0"
 
 [profile.dev.package.argon2]
 opt-level = 3

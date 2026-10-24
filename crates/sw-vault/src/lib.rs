@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use sw_crypto::EncString;
+use thiserror::Error;
 use uuid::Uuid;
 
 /// Bitwarden cipher types
@@ -404,43 +406,310 @@ pub struct SyncData {
     pub ciphers: Vec<Cipher>,
 }
 
-/// In-memory secure vault store indexed by cipher UUID
-#[derive(Debug, Default, Clone)]
+/// Errors that can occur during vault caching, persistence, and synchronization.
+#[derive(Error, Debug)]
+pub enum VaultError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Vault file not found at: {0}")]
+    NotFound(PathBuf),
+
+    #[error("API error during sync: {0}")]
+    Api(String),
+
+    #[error("Vault error: {0}")]
+    Other(String),
+}
+
+/// Configurable paths for local vault caching and persistent storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultPaths {
+    base_dir: PathBuf,
+}
+
+impl VaultPaths {
+    /// Creates a `VaultPaths` with a custom base directory.
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+        }
+    }
+
+    /// Resolves the default system data directory for SilverWarden:
+    /// e.g. `~/.local/share/silverwarden` on Linux via `dirs::data_dir()`.
+    pub fn default_paths() -> Result<Self, VaultError> {
+        let base = dirs::data_dir()
+            .ok_or_else(|| {
+                VaultError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Could not determine system data directory",
+                ))
+            })?
+            .join("silverwarden");
+        Ok(Self::new(base))
+    }
+
+    /// The base directory containing the vault data.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// The path to `vault.json`.
+    pub fn vault_file(&self) -> PathBuf {
+        self.base_dir.join("vault.json")
+    }
+
+    /// Ensures the parent directory exists with secure permissions (0700 on Unix).
+    pub fn ensure_dirs(&self) -> Result<(), VaultError> {
+        if !self.base_dir.exists() {
+            std::fs::create_dir_all(&self.base_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &self.base_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for VaultPaths {
+    fn default() -> Self {
+        Self::default_paths().unwrap_or_else(|_| Self::new(PathBuf::from(".silverwarden")))
+    }
+}
+
+/// Saves `SyncData` atomically to `path` using a temporary file and rename.
+///
+/// On Unix, permissions are strictly restricted to 0600 (owner read/write only).
+pub fn save_vault(path: &Path, data: &SyncData) -> Result<(), VaultError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    let serialized = serde_json::to_vec_pretty(data)?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+
+    use std::io::Write;
+    temp_file.write_all(&serialized)?;
+    temp_file.flush()?;
+    temp_file.as_file().sync_all()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(temp_file.path(), perms)?;
+    }
+
+    temp_file
+        .persist(path)
+        .map_err(|e| VaultError::Io(e.error))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+
+    Ok(())
+}
+
+/// Asynchronous wrapper for `save_vault`.
+pub async fn save_vault_async(path: PathBuf, data: SyncData) -> Result<(), VaultError> {
+    tokio::task::spawn_blocking(move || save_vault(&path, &data))
+        .await
+        .map_err(|e| VaultError::Other(e.to_string()))?
+}
+
+/// Loads `SyncData` from `path`.
+pub fn load_vault(path: &Path) -> Result<SyncData, VaultError> {
+    if !path.exists() {
+        return Err(VaultError::NotFound(path.to_path_buf()));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let data: SyncData = serde_json::from_reader(reader)?;
+    Ok(data)
+}
+
+/// Asynchronous wrapper for `load_vault`.
+pub async fn load_vault_async(path: PathBuf) -> Result<SyncData, VaultError> {
+    tokio::task::spawn_blocking(move || load_vault(&path))
+        .await
+        .map_err(|e| VaultError::Other(e.to_string()))?
+}
+
+/// In-memory secure vault store protected by a `RwLock`.
+#[derive(Debug, Default)]
 pub struct VaultStore {
-    ciphers: HashMap<Uuid, Cipher>,
+    ciphers: tokio::sync::RwLock<HashMap<Uuid, Cipher>>,
+    folders: tokio::sync::RwLock<Vec<Folder>>,
+    profile: tokio::sync::RwLock<Option<Profile>>,
+    last_synced: tokio::sync::RwLock<Option<u64>>,
 }
 
 impl VaultStore {
+    /// Creates a new empty `VaultStore`.
     pub fn new() -> Self {
-        Self {
-            ciphers: HashMap::new(),
+        Self::default()
+    }
+
+    /// Loads a full `SyncData` payload into the store in memory without preliminary mass decryption.
+    pub async fn load_sync_data(&self, sync_data: SyncData) {
+        let mut c_guard = self.ciphers.write().await;
+        let mut f_guard = self.folders.write().await;
+        let mut p_guard = self.profile.write().await;
+
+        c_guard.clear();
+        for cipher in sync_data.ciphers {
+            if let Some(id) = cipher.id {
+                c_guard.insert(id, cipher);
+            }
+        }
+
+        *f_guard = sync_data.folders;
+        *p_guard = Some(sync_data.profile);
+    }
+
+    /// Exports the current in-memory store state to a `SyncData` snapshot.
+    pub async fn to_sync_data(&self) -> SyncData {
+        let c_guard = self.ciphers.read().await;
+        let f_guard = self.folders.read().await;
+        let p_guard = self.profile.read().await;
+
+        SyncData {
+            profile: p_guard.clone().unwrap_or_default(),
+            folders: f_guard.clone(),
+            ciphers: c_guard.values().cloned().collect(),
         }
     }
 
-    pub fn insert(&mut self, cipher: Cipher) {
+    /// Inserts or updates a cipher in the store.
+    pub async fn insert(&self, cipher: Cipher) {
         if let Some(id) = cipher.id {
-            self.ciphers.insert(id, cipher);
+            self.ciphers.write().await.insert(id, cipher);
         }
     }
 
-    pub fn get(&self, id: &Uuid) -> Option<&Cipher> {
-        self.ciphers.get(id)
+    /// Retrieves a cloned cipher by its UUID.
+    pub async fn get(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.read().await.get(id).cloned()
     }
 
-    pub fn all(&self) -> Vec<&Cipher> {
-        self.ciphers.values().collect()
+    /// Removes a cipher by its UUID.
+    pub async fn delete(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.write().await.remove(id)
     }
 
-    pub fn len(&self) -> usize {
-        self.ciphers.len()
+    /// Returns a list of all ciphers currently in memory.
+    pub async fn all(&self) -> Vec<Cipher> {
+        self.ciphers.read().await.values().cloned().collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ciphers.is_empty()
+    /// Number of ciphers in the store.
+    pub async fn len(&self) -> usize {
+        self.ciphers.read().await.len()
     }
 
-    pub fn clear(&mut self) {
-        self.ciphers.clear();
+    /// Whether the store contains any ciphers.
+    pub async fn is_empty(&self) -> bool {
+        self.ciphers.read().await.is_empty()
+    }
+
+    /// Clears all ciphers, folders, and profile from memory.
+    pub async fn clear(&self) {
+        self.ciphers.write().await.clear();
+        self.folders.write().await.clear();
+        *self.profile.write().await = None;
+        *self.last_synced.write().await = None;
+    }
+
+    /// Gets the timestamp of the last successful sync.
+    pub async fn last_synced(&self) -> Option<u64> {
+        *self.last_synced.read().await
+    }
+
+    /// Sets the timestamp of the last successful sync.
+    pub async fn set_last_synced(&self, ts: u64) {
+        *self.last_synced.write().await = Some(ts);
+    }
+
+    /// Gets the cached user profile.
+    pub async fn profile(&self) -> Option<Profile> {
+        self.profile.read().await.clone()
+    }
+
+    /// Gets the cached list of folders.
+    pub async fn folders(&self) -> Vec<Folder> {
+        self.folders.read().await.clone()
+    }
+
+    // Synchronous / blocking convenience methods for sync contexts
+    pub fn blocking_insert(&self, cipher: Cipher) {
+        if let Some(id) = cipher.id {
+            self.ciphers.blocking_write().insert(id, cipher);
+        }
+    }
+
+    pub fn blocking_get(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.blocking_read().get(id).cloned()
+    }
+
+    pub fn blocking_delete(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.blocking_write().remove(id)
+    }
+
+    pub fn blocking_all(&self) -> Vec<Cipher> {
+        self.ciphers.blocking_read().values().cloned().collect()
+    }
+
+    pub fn blocking_len(&self) -> usize {
+        self.ciphers.blocking_read().len()
+    }
+
+    pub fn blocking_is_empty(&self) -> bool {
+        self.ciphers.blocking_read().is_empty()
+    }
+
+    pub fn blocking_clear(&self) {
+        self.ciphers.blocking_write().clear();
+        self.folders.blocking_write().clear();
+        *self.profile.blocking_write() = None;
+        *self.last_synced.blocking_write() = None;
+    }
+
+    pub fn blocking_load_sync_data(&self, sync_data: SyncData) {
+        let mut c_guard = self.ciphers.blocking_write();
+        let mut f_guard = self.folders.blocking_write();
+        let mut p_guard = self.profile.blocking_write();
+
+        c_guard.clear();
+        for cipher in sync_data.ciphers {
+            if let Some(id) = cipher.id {
+                c_guard.insert(id, cipher);
+            }
+        }
+        *f_guard = sync_data.folders;
+        *p_guard = Some(sync_data.profile);
     }
 }
 
@@ -643,10 +912,10 @@ mod tests {
         assert_eq!(original, deserialized);
     }
 
-    #[test]
-    fn test_vault_store_operations() {
-        let mut store = VaultStore::new();
-        assert!(store.is_empty());
+    #[tokio::test]
+    async fn test_vault_store_operations() {
+        let store = VaultStore::new();
+        assert!(store.is_empty().await);
 
         let id1 = Uuid::new_v4();
         let c1 = Cipher {
@@ -662,19 +931,236 @@ mod tests {
             ..Default::default()
         };
 
-        store.insert(c1);
-        store.insert(c2);
+        store.insert(c1).await;
+        store.insert(c2).await;
 
-        assert_eq!(store.len(), 2);
-        assert!(!store.is_empty());
+        assert_eq!(store.len().await, 2);
+        assert!(!store.is_empty().await);
 
-        assert_eq!(store.get(&id1).unwrap().r#type, CipherType::Login);
-        assert_eq!(store.get(&id2).unwrap().r#type, CipherType::SshKey);
-        assert_eq!(store.all().len(), 2);
+        assert_eq!(store.get(&id1).await.unwrap().r#type, CipherType::Login);
+        assert_eq!(store.get(&id2).await.unwrap().r#type, CipherType::SshKey);
+        assert_eq!(store.all().await.len(), 2);
 
-        store.clear();
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
+        // Delete test
+        let deleted = store.delete(&id1).await;
+        assert!(deleted.is_some());
+        assert_eq!(store.len().await, 1);
+        assert!(store.get(&id1).await.is_none());
+
+        // SyncData load & export
+        let sync_data = SyncData {
+            profile: Profile {
+                name: Some("Bob".to_string()),
+                ..Default::default()
+            },
+            folders: vec![Folder {
+                name: Some("Folder1".to_string()),
+                ..Default::default()
+            }],
+            ciphers: vec![Cipher {
+                id: Some(id1),
+                r#type: CipherType::Card,
+                ..Default::default()
+            }],
+        };
+
+        store.load_sync_data(sync_data).await;
+        assert_eq!(store.len().await, 1);
+        assert_eq!(store.folders().await.len(), 1);
+        assert_eq!(store.profile().await.unwrap().name.as_deref(), Some("Bob"));
+
+        let exported = store.to_sync_data().await;
+        assert_eq!(exported.ciphers.len(), 1);
+        assert_eq!(exported.folders.len(), 1);
+
+        // Timestamps
+        store.set_last_synced(1234567890).await;
+        assert_eq!(store.last_synced().await, Some(1234567890));
+
+        store.clear().await;
+        assert!(store.is_empty().await);
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[test]
+    fn test_vault_store_blocking_operations() {
+        let store = VaultStore::new();
+        let id1 = Uuid::new_v4();
+
+        assert!(store.blocking_is_empty());
+        assert_eq!(store.blocking_len(), 0);
+
+        store.blocking_insert(Cipher {
+            id: Some(id1),
+            r#type: CipherType::Note,
+            ..Default::default()
+        });
+        assert_eq!(store.blocking_len(), 1);
+        assert_eq!(store.blocking_get(&id1).unwrap().r#type, CipherType::Note);
+        assert_eq!(store.blocking_all().len(), 1);
+        assert!(store.blocking_delete(&id1).is_some());
+        assert_eq!(store.blocking_len(), 0);
+
+        store.blocking_load_sync_data(SyncData {
+            ciphers: vec![Cipher {
+                id: Some(id1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(store.blocking_len(), 1);
+        store.blocking_clear();
+        assert_eq!(store.blocking_len(), 0);
+    }
+
+    #[test]
+    fn test_vault_save_and_load_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_path = temp_dir.path().join("sub").join("vault.json");
+
+        let id = Uuid::new_v4();
+        let original_data = SyncData {
+            profile: Profile {
+                id: Some(Uuid::new_v4()),
+                email: Some("test@example.com".to_string()),
+                name: Some("Tester".to_string()),
+                ..Default::default()
+            },
+            folders: vec![Folder {
+                id: Some(Uuid::new_v4()),
+                name: Some("Personal".to_string()),
+                revision_date: Some("2026-10-24T12:00:00Z".to_string()),
+            }],
+            ciphers: vec![Cipher {
+                id: Some(id),
+                r#type: CipherType::Login,
+                favorite: true,
+                ..Default::default()
+            }],
+        };
+
+        // Atomic write
+        save_vault(&vault_path, &original_data).expect("save_vault should succeed");
+        assert!(vault_path.exists());
+
+        // Load back
+        let loaded_data = load_vault(&vault_path).expect("load_vault should succeed");
+        assert_eq!(original_data, loaded_data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_vault_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("secure_vault"));
+        vault_paths.ensure_dirs().unwrap();
+
+        // Check directory perms 0700
+        let dir_meta = std::fs::metadata(vault_paths.base_dir()).unwrap();
+        let dir_mode = dir_meta.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "Directory permissions must be 0700");
+
+        let data = SyncData::default();
+        let vault_file = vault_paths.vault_file();
+        save_vault(&vault_file, &data).unwrap();
+
+        let file_meta = std::fs::metadata(&vault_file).unwrap();
+        let file_mode = file_meta.permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "Vault file permissions must be exactly 0600"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vault_store_rwlock_concurrency() {
+        use std::sync::Arc;
+
+        let store = Arc::new(VaultStore::new());
+        let mut handles = Vec::new();
+
+        // Spawn 5 concurrent writers
+        for i in 0..5 {
+            let s = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let id = Uuid::new_v4();
+                let cipher = Cipher {
+                    id: Some(id),
+                    r#type: CipherType::Login,
+                    notes: Some(EncString::default()),
+                    ..Default::default()
+                };
+                s.insert(cipher).await;
+                s.set_last_synced(1000 + i).await;
+            }));
+        }
+
+        // Spawn 10 concurrent readers
+        for _ in 0..10 {
+            let s = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let _len = s.len().await;
+                let _all = s.all().await;
+                let _sync = s.last_synced().await;
+                let _snap = s.to_sync_data().await;
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("Task should join cleanly without deadlocks");
+        }
+
+        assert_eq!(store.len().await, 5);
+        assert!(store.last_synced().await.is_some());
+    }
+
+    #[test]
+    fn test_vault_load_nonexistent_and_corrupt_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Nonexistent
+        let missing_path = temp_dir.path().join("does_not_exist.json");
+        let res = load_vault(&missing_path);
+        assert!(matches!(res, Err(VaultError::NotFound(_))));
+
+        // Corrupted JSON
+        let corrupt_path = temp_dir.path().join("corrupt.json");
+        std::fs::write(&corrupt_path, b"{ this is invalid json ]").unwrap();
+        let res_corrupt = load_vault(&corrupt_path);
+        assert!(matches!(res_corrupt, Err(VaultError::Json(_))));
+    }
+
+    #[tokio::test]
+    async fn test_vault_paths_custom_and_default() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::new(temp_dir.path());
+        assert_eq!(paths.base_dir(), temp_dir.path());
+        assert_eq!(paths.vault_file(), temp_dir.path().join("vault.json"));
+
+        let def_paths = VaultPaths::default();
+        assert!(def_paths.vault_file().ends_with("vault.json"));
+    }
+
+    #[tokio::test]
+    async fn test_vault_async_save_and_load() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("async_vault.json");
+
+        let sync_data = SyncData {
+            profile: Profile {
+                name: Some("Async User".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        save_vault_async(path.clone(), sync_data.clone())
+            .await
+            .unwrap();
+        let loaded = load_vault_async(path).await.unwrap();
+        assert_eq!(loaded.profile.name.as_deref(), Some("Async User"));
     }
 
     #[test]

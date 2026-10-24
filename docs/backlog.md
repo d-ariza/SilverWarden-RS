@@ -519,7 +519,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Verificación de archivo `~/.cache/silverwarden/vault.json` con permisos 0600.
 - Carga íntegra de ciphers en memoria.
 
-**Depende de:** SW-030, SW-031, SW-033 · **Estado:** Pendiente
+**Depende de:** SW-030, SW-031, SW-033 · **Estado:** Hecho (2026-10-24)
 
 ---
 
