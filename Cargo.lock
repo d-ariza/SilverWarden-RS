@@ -4568,10 +4568,12 @@ name = "sw-bitwarden-api"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "pbkdf2",
  "reqwest 0.12.28",
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "sw-config",
  "sw-crypto",
  "sw-vault",
@@ -4580,6 +4582,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

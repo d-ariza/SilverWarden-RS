@@ -1,11 +1,14 @@
 use base64::Engine;
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use zeroize::Zeroize;
 
 pub use sw_config::LoginToken;
+pub use sw_crypto::{KdfConfig, KdfType};
 
 pub const BITWARDEN_USER_AGENT: &str = "silverwarden/0.0.1";
 pub const BITWARDEN_DEVICE_TYPE: &str = "10";
@@ -26,6 +29,9 @@ pub enum ApiError {
     #[error("URL parse error: {0}")]
     Url(#[from] url::ParseError),
 
+    #[error("Crypto error: {0}")]
+    Crypto(#[from] sw_crypto::CryptoError),
+
     #[error("Server error ({status}): {message}")]
     Status {
         status: reqwest::StatusCode,
@@ -40,6 +46,28 @@ pub struct PreloginResponse {
     pub kdf_iterations: Option<u32>,
     pub kdf_memory: Option<u32>,
     pub kdf_parallelism: Option<u32>,
+}
+
+impl TryFrom<PreloginResponse> for sw_crypto::KdfConfig {
+    type Error = ApiError;
+
+    fn try_from(resp: PreloginResponse) -> Result<Self, Self::Error> {
+        let kdf_type = sw_crypto::KdfType::from_i32(resp.kdf)
+            .map_err(|e| ApiError::Auth(format!("Unsupported KDF type {}: {e}", resp.kdf)))?;
+        let iterations = resp
+            .kdf_iterations
+            .unwrap_or(if kdf_type == sw_crypto::KdfType::Pbkdf2 {
+                100_000
+            } else {
+                3
+            });
+        Ok(sw_crypto::KdfConfig {
+            kdf_type,
+            iterations,
+            memory: resp.kdf_memory,
+            parallelism: resp.kdf_parallelism,
+        })
+    }
 }
 
 /// Request body payloads supported by `fetch_with_auth`.
@@ -296,13 +324,13 @@ impl AuthenticatedClient {
         Ok(resp)
     }
 
-    /// Helper for prelogin endpoint (SW-033 integration).
-    pub async fn prelogin(&self, email: &str) -> Result<PreloginResponse, ApiError> {
+    /// Queries the prelogin endpoint to obtain the account's KDF configuration.
+    pub async fn prelogin(&self, email: &str) -> Result<sw_crypto::KdfConfig, ApiError> {
         let url = format!(
             "{}/api/accounts/prelogin",
             self.api_url.trim_end_matches('/')
         );
-        let resp = self
+        let mut resp = self
             .client
             .post(&url)
             .header("User-Agent", BITWARDEN_USER_AGENT)
@@ -311,11 +339,191 @@ impl AuthenticatedClient {
             .header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION)
             .json(&serde_json::json!({ "email": email }))
             .send()
-            .await?
-            .json::<PreloginResponse>()
             .await?;
-        Ok(resp)
+
+        // Fallback for self-hosted / identity endpoint mount
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let alt_url = format!(
+                "{}/accounts/prelogin",
+                self.identity_url.trim_end_matches('/')
+            );
+            resp = self
+                .client
+                .post(&alt_url)
+                .header("User-Agent", BITWARDEN_USER_AGENT)
+                .header("Device-Type", BITWARDEN_DEVICE_TYPE)
+                .header("Bitwarden-Client-Name", BITWARDEN_CLIENT_NAME)
+                .header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION)
+                .json(&serde_json::json!({ "email": email }))
+                .send()
+                .await?;
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status {
+                status,
+                message: body,
+            });
+        }
+
+        let prelogin_resp: PreloginResponse = resp.json().await?;
+        let kdf_config: sw_crypto::KdfConfig = prelogin_resp.try_into()?;
+        Ok(kdf_config)
     }
+
+    /// Authenticates with email and derived master password hash against `/connect/token`.
+    pub async fn login_with_password(
+        &self,
+        email: &str,
+        master_password_hash: &str,
+        device_uuid: &str,
+    ) -> Result<LoginToken, ApiError> {
+        let url = format!("{}/connect/token", self.identity_url.trim_end_matches('/'));
+
+        let b64_email = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(email.as_bytes());
+
+        let params = [
+            ("scope", "api offline_access"),
+            ("client_id", "web"),
+            ("deviceType", BITWARDEN_DEVICE_TYPE),
+            ("deviceIdentifier", device_uuid),
+            ("deviceName", "firefox"),
+            ("grant_type", "password"),
+            ("username", email),
+            ("password", master_password_hash),
+        ];
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Auth-Email", b64_email)
+            .header("User-Agent", BITWARDEN_USER_AGENT)
+            .header("Device-Type", BITWARDEN_DEVICE_TYPE)
+            .header("Bitwarden-Client-Name", BITWARDEN_CLIENT_NAME)
+            .header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION)
+            .form(&params)
+            .send()
+            .await
+            .map_err(ApiError::Reqwest)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Auth(format!(
+                "Login with password failed with status {status}: {body}"
+            )));
+        }
+
+        let token: LoginToken = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Auth(format!("Failed to parse login token response: {e}")))?;
+
+        // Update stored token in client
+        *self.token.lock().await = token.clone();
+
+        Ok(token)
+    }
+
+    /// Full end-to-end login orchestration:
+    /// prelogin -> derive master key -> derive master password hash -> stretch key ->
+    /// login_with_password -> decrypt_enc_key.
+    ///
+    /// Returns the active `LoginToken` and the decrypted 64-byte user symmetric key.
+    pub async fn login(
+        &self,
+        email: &str,
+        password: &str,
+        device_uuid: &str,
+    ) -> Result<(LoginToken, Vec<u8>), ApiError> {
+        let kdf_config = self.prelogin(email).await?;
+        let master_key = sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config)?;
+        let master_password_hash = derive_master_password_hash(master_key.as_slice(), password);
+        let stretched_sym_key = sw_crypto::stretch_key(&master_key)?;
+        let stretched_bytes = stretched_sym_key.bytes();
+
+        let token = self
+            .login_with_password(email, &master_password_hash, device_uuid)
+            .await?;
+
+        if token.key.is_empty() {
+            return Err(ApiError::Auth(
+                "Login succeeded but server did not return an encryption key".to_string(),
+            ));
+        }
+
+        let user_symmetric_key = decrypt_enc_key(&token.key, &stretched_bytes)?;
+        Ok((token, user_symmetric_key))
+    }
+}
+
+/// Derives the master password hash used to authenticate against Bitwarden.
+///
+/// Uses PBKDF2-HMAC-SHA256 with 1 iteration over the derived master key bytes
+/// and the password as salt, encoded as standard Base64.
+/// Parity with Goldwarden Go: `pbkdf2.Key(masterKey.GetBytes(), []byte(password), 1, 32, sha256.New)`
+pub fn derive_master_password_hash(master_key: &[u8], password: &str) -> String {
+    let mut hash = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(master_key, password.as_bytes(), 1, &mut hash);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(hash);
+    hash.zeroize();
+    encoded
+}
+
+/// Decrypts the user symmetric key from the wire EncString returned during login or sync.
+///
+/// Parses `enc_key_wire` as `sw_crypto::EncString` and decrypts using the stretched master key.
+pub fn decrypt_enc_key(
+    enc_key_wire: &str,
+    stretched_master_key: &[u8],
+) -> Result<Vec<u8>, ApiError> {
+    if enc_key_wire.is_empty() {
+        return Err(ApiError::Auth("enc_key is empty".to_string()));
+    }
+
+    let enc_string = sw_crypto::EncString::from_str(enc_key_wire)
+        .map_err(|e| ApiError::Auth(format!("Failed to parse EncString from wire: {e}")))?;
+
+    let sym_key = sw_crypto::SymmetricKey::from_bytes(stretched_master_key)
+        .map_err(|e| ApiError::Auth(format!("Invalid stretched master key: {e}")))?;
+
+    let decrypted = sw_crypto::decrypt_with(&enc_string, &sym_key)
+        .map_err(|e| ApiError::Auth(format!("Failed to decrypt enc_key: {e}")))?;
+
+    Ok(decrypted)
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::prelogin`.
+pub async fn prelogin(
+    client: &AuthenticatedClient,
+    email: &str,
+) -> Result<sw_crypto::KdfConfig, ApiError> {
+    client.prelogin(email).await
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::login_with_password`.
+pub async fn login_with_password(
+    client: &AuthenticatedClient,
+    email: &str,
+    master_password_hash: &str,
+    device_uuid: &str,
+) -> Result<LoginToken, ApiError> {
+    client
+        .login_with_password(email, master_password_hash, device_uuid)
+        .await
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::login`.
+pub async fn login(
+    client: &AuthenticatedClient,
+    email: &str,
+    password: &str,
+    device_uuid: &str,
+) -> Result<(LoginToken, Vec<u8>), ApiError> {
+    client.login(email, password, device_uuid).await
 }
 
 #[cfg(test)]
@@ -571,8 +779,356 @@ mod tests {
             .await
             .expect("Prelogin should succeed");
 
-        assert_eq!(prelogin_resp.kdf, 1);
-        assert_eq!(prelogin_resp.kdf_iterations, Some(600000));
+        assert_eq!(prelogin_resp.kdf_type, sw_crypto::KdfType::Argon2id);
+        assert_eq!(prelogin_resp.iterations, 600000);
+    }
+
+    #[tokio::test]
+    async fn test_derive_master_password_hash_rfc6070_vector() {
+        // Known RFC 6070 test vector 1 for PBKDF2-HMAC-SHA256:
+        // password = "password", salt = "salt", c = 1, dkLen = 32
+        // In Bitwarden parity: master_key is passed as PBKDF2 password, and user password as salt.
+        let master_key = b"password";
+        let password = "salt";
+        let hash = derive_master_password_hash(master_key, password);
+
+        // Expected base64 of the 32-byte RFC 6070 PBKDF2-HMAC-SHA256 output:
+        // [0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4,
+        //  0xf8, 0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c,
+        //  0xb7, 0x0b, 0xe1, 0x7b]
+        assert_eq!(hash, "Eg+2z/z4syxD5yJSVsT4N6hlSMkszDVICAWYfLcL4Xs=");
+    }
+
+    #[test]
+    fn test_decrypt_enc_key_synthetic() {
+        // Create 64-byte stretched master key (32 bytes enc + 32 bytes mac)
+        let mut stretched_key_bytes = [0u8; 64];
+        for (i, b) in stretched_key_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&stretched_key_bytes).unwrap();
+
+        // 64-byte secret account symmetric key to encrypt
+        let user_key_plaintext =
+            b"super_secret_64_byte_account_symmetric_key_payload_for_testing!!";
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            user_key_plaintext,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &sym_key,
+        )
+        .expect("Synthetic encryption should succeed");
+
+        assert!(enc_key_wire.starts_with("2."));
+
+        let decrypted = decrypt_enc_key(&enc_key_wire, &stretched_key_bytes)
+            .expect("Decryption should succeed");
+        assert_eq!(decrypted, user_key_plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_enc_key_error_cases() {
+        let valid_key = [5u8; 64];
+
+        // Empty wire string
+        assert!(matches!(
+            decrypt_enc_key("", &valid_key),
+            Err(ApiError::Auth(_))
+        ));
+
+        // Invalid format
+        assert!(matches!(
+            decrypt_enc_key("not-an-enc-string", &valid_key),
+            Err(ApiError::Auth(_))
+        ));
+
+        // Invalid key length (e.g. 32 bytes instead of 64)
+        assert!(matches!(
+            decrypt_enc_key("2.aXZfMTY=|Y3Q=|bWFj", &[1u8; 32]),
+            Err(ApiError::Auth(_))
+        ));
+
+        // Tampered MAC / wrong key
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&valid_key).unwrap();
+        let enc_wire = sw_crypto::encrypt_with_to_string(
+            b"secret",
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &sym_key,
+        )
+        .unwrap();
+
+        let wrong_key = [6u8; 64];
+        assert!(matches!(
+            decrypt_enc_key(&enc_wire, &wrong_key),
+            Err(ApiError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_login_with_password_success() {
+        let server = MockServer::start().await;
+
+        let expected_auth_email =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("user@example.com".as_bytes());
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(header("Content-Type", "application/x-www-form-urlencoded"))
+            .and(header("Auth-Email", expected_auth_email.as_str()))
+            .and(header("User-Agent", BITWARDEN_USER_AGENT))
+            .and(header("Device-Type", BITWARDEN_DEVICE_TYPE))
+            .and(header("Bitwarden-Client-Name", BITWARDEN_CLIENT_NAME))
+            .and(header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION))
+            .and(body_string_contains("grant_type=password"))
+            .and(body_string_contains("username=user%40example.com"))
+            .and(body_string_contains("password=test_master_hash"))
+            .and(body_string_contains("deviceIdentifier=device-uuid-123"))
+            .and(body_string_contains("deviceName=firefox"))
+            .and(body_string_contains("client_id=web"))
+            .and(body_string_contains("scope=api+offline_access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token_abc_123",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "refresh_xyz_789",
+                "key": "2.iv|ct|mac"
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let token = client
+            .login_with_password("user@example.com", "test_master_hash", "device-uuid-123")
+            .await
+            .expect("Login with password should succeed");
+
+        assert_eq!(token.access_token, "token_abc_123");
+        assert_eq!(token.refresh_token, "refresh_xyz_789");
+        assert_eq!(token.key, "2.iv|ct|mac");
+
+        // Verify stored token was updated
+        let stored_token = client.token().lock().await.clone();
+        assert_eq!(stored_token.access_token, "token_abc_123");
+    }
+
+    #[tokio::test]
+    async fn test_login_with_password_error_400() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login_with_password("user@example.com", "bad_hash", "device-uuid-123")
+            .await;
+
+        assert!(matches!(res, Err(ApiError::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn test_login_full_orchestration_success() {
+        let server = MockServer::start().await;
+
+        let email = "user@example.com";
+        let password = "MyMasterPassword123!";
+        let device_uuid = "device-555";
+
+        // Step 1: Prelogin mock
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 100000,
+                "kdfMemory": null,
+                "kdfParallelism": null
+            })))
+            .mount(&server)
+            .await;
+
+        // Compute expected master key and stretched key
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 100000,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let expected_master_hash = derive_master_password_hash(master_key.as_slice(), password);
+        let stretched_key = sw_crypto::stretch_key(&master_key).unwrap();
+
+        // Synthetic 64-byte account symmetric key
+        let expected_user_sym_key =
+            b"0123456789012345678901234567890101234567890123456789012345678901";
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            expected_user_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched_key,
+        )
+        .unwrap();
+
+        let encoded_password_param =
+            url::form_urlencoded::byte_serialize(expected_master_hash.as_bytes())
+                .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .and(body_string_contains(format!(
+                "password={}",
+                encoded_password_param
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "full_login_access_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "full_login_refresh_token",
+                "key": enc_key_wire
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let (token, decrypted_key) = client
+            .login(email, password, device_uuid)
+            .await
+            .expect("Full login orchestration should succeed");
+
+        assert_eq!(token.access_token, "full_login_access_token");
+        assert_eq!(token.refresh_token, "full_login_refresh_token");
+        assert_eq!(decrypted_key, expected_user_sym_key);
+
+        // Verify client token updated and fetch_with_auth uses the new token
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .and(header("Authorization", "Bearer full_login_access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("sync ok"))
+            .mount(&server)
+            .await;
+
+        let sync_resp = client
+            .fetch_with_auth(Method::GET, "/api/sync", RequestBody::Empty)
+            .await
+            .unwrap();
+        assert_eq!(sync_resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_login_full_orchestration_prelogin_fails() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal error"))
+            .mount(&server)
+            .await;
+
+        // When /api/accounts/prelogin is 500, fallback is NOT triggered (only 404 falls back)
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login("user@example.com", "pass", "device-uuid")
+            .await;
+
+        assert!(matches!(res, Err(ApiError::Status { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_prelogin_404_fallback_to_identity_mount() {
+        let server = MockServer::start().await;
+
+        // /api/accounts/prelogin returns 404
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // /accounts/prelogin returns 200
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 100000,
+                "kdfMemory": null,
+                "kdfParallelism": null
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let kdf_config = client.prelogin("user@example.com").await.unwrap();
+        assert_eq!(kdf_config.kdf_type, sw_crypto::KdfType::Pbkdf2);
+        assert_eq!(kdf_config.iterations, 100000);
+    }
+
+    #[tokio::test]
+    async fn test_login_missing_key_returns_auth_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 100000
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "refresh",
+                "key": ""
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login("user@example.com", "pass", "device-uuid")
+            .await;
+
+        assert!(matches!(res, Err(ApiError::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn test_standalone_functions() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 5000
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let cfg = prelogin(&client, "standalone@example.com").await.unwrap();
+        assert_eq!(cfg.iterations, 5000);
     }
 
     #[tokio::test]

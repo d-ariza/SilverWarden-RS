@@ -1114,6 +1114,61 @@ PASS
 
 **Estado:** ✅ SW-031 — Hecho (2026-10-24).
 
+### 4.5 Evidencia de Ejecución: [SW-033] Login con mock server (parte 1) (`sw-bitwarden-api`)
+
+**Fecha:** 2026-10-24  
+**Archivos modificados:**
+- `crates/sw-bitwarden-api/Cargo.toml`:
+  - Adición de dependencias `pbkdf2 = { workspace = true }`, `sha2 = { workspace = true }`, `zeroize = { workspace = true }`.
+- `crates/sw-bitwarden-api/src/lib.rs`:
+  - Integración de variante `Crypto(#[from] sw_crypto::CryptoError)` en `ApiError`.
+  - Re-export de `sw_crypto::{KdfConfig, KdfType}`.
+  - Conversión segura `TryFrom<PreloginResponse> for sw_crypto::KdfConfig`.
+  - Implementación de `derive_master_password_hash(master_key: &[u8], password: &str) -> String`:
+    - PBKDF2-HMAC-SHA256 con 1 iteración sobre bytes del `master_key` y `password` como sal, longitud 32 bytes y codificación Base64 estándar (paridad exacta con Go `pbkdf2.Key(masterKey.GetBytes(), []byte(password), 1, 32, sha256.New)`). Limpieza de memoria con `Zeroize`.
+  - Implementación de `decrypt_enc_key(enc_key_wire: &str, stretched_master_key: &[u8]) -> Result<Vec<u8>, ApiError>`:
+    - Parsea `enc_key_wire` a `sw_crypto::EncString`, construye el `SymmetricKey` desde los 64 bytes del stretched key y descifra usando `sw_crypto::decrypt_with` con verificación anti-padding oracle de HMAC.
+  - Actualización de `prelogin(&self, email: &str) -> Result<sw_crypto::KdfConfig, ApiError>`:
+    - Consulta `POST /api/accounts/prelogin` con fallback automático a `/accounts/prelogin` ante 404 para compatibilidad con servidores autoalojados / Vaultwarden.
+  - Implementación de `login_with_password(&self, email: &str, master_password_hash: &str, device_uuid: &str) -> Result<LoginToken, ApiError>`:
+    - `POST /connect/token` con cabeceras completas de cliente Bitwarden, `Auth-Email` (base64 url-safe sin padding), y campos de formulario: `grant_type=password`, `client_id=web`, `scope=api offline_access`, `deviceType=10`, `deviceIdentifier=device_uuid`, `deviceName=firefox`, `username=email`, `password=master_password_hash`.
+    - Actualización atómica en cliente del token recibido.
+  - Implementación de `login(&self, email: &str, password: &str, device_uuid: &str) -> Result<(LoginToken, Vec<u8>), ApiError>`:
+    - Orquestación completa de 6 etapas:
+      1. `prelogin(email)` $\rightarrow$ `KdfConfig`.
+      2. `derive_master_key(password, email, &config)` $\rightarrow$ `MasterKey`.
+      3. `derive_master_password_hash(master_key, password)` $\rightarrow$ hash base64.
+      4. `stretch_key(&master_key)` $\rightarrow$ `SymmetricKey` (64 bytes).
+      5. `login_with_password(email, &master_password_hash, device_uuid)` $\rightarrow$ `LoginToken`.
+      6. `decrypt_enc_key(&token.key, &stretched_bytes)` $\rightarrow$ `user_symmetric_key` (64 bytes).
+  - Funciones standalone de alto nivel: `prelogin`, `login_with_password`, `login`.
+  - Batería de 10 pruebas unitarias añadidas (20 tests en total en `sw-bitwarden-api`):
+    - `test_derive_master_password_hash_rfc6070_vector`: verificación con vector RFC 6070 adaptado (`Eg+2z/z4syxD5yJSVsT4N6hlSMkszDVICAWYfLcL4Xs=`).
+    - `test_decrypt_enc_key_synthetic`: generación sintética de `EncString` (AES-256-CBC + HMAC-SHA256), descifrado y validación de coincidencia de bytes de la cuenta.
+    - `test_decrypt_enc_key_error_cases`: cobertura de cadena vacía, formato inválido, clave de tamaño incorrecto y MAC corrupta.
+    - `test_login_with_password_success`: mock server con `wiremock` validando cabeceras, formulario url-encoded y deserialización de `LoginToken`.
+    - `test_login_with_password_error_400`: validación de rechazo `invalid_grant` propagado como `ApiError::Auth`.
+    - `test_login_full_orchestration_success`: orquestación de extremo a extremo simulada con prelogin, derivación de hash, login y descifrado de la clave de usuario, seguido de llamada autenticada exitosa.
+    - `test_login_full_orchestration_prelogin_fails`: propagación de error 500 de prelogin.
+    - `test_prelogin_404_fallback_to_identity_mount`: fallback transparente entre rutas de prelogin.
+    - `test_login_missing_key_returns_auth_error`: validación de error si el servidor no incluye clave.
+    - `test_standalone_functions`: wrappers a nivel de módulo.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 20 pasan, 0 fallan (6.38s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 198 pasan en total, 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **96.29% regiones / 96.67% líneas** (umbral: ≥85%) |
+| **Cobertura Total Workspace** | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.75% regiones / 94.31% líneas** |
+
+**Estado:** ✅ SW-033 (Parte 1) — Hecho (2026-10-24).
+
+
 
 
 
