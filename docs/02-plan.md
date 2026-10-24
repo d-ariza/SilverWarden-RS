@@ -95,6 +95,11 @@ text
 | D35 | **SW-013 migra estado local; descarga de Vault/SSH en M4** | Descarga remota en M2 | El archivo en disco solo contiene configuración; la sincronización y descarga de ciphers/claves SSH se realiza en M4 vía `silverwarden sync` |
 | D36 | **Endurecimiento de sesiones (D-IPC-3 mejorado)** | Semántica laxa de Go | Para `AccessVault` y `Pin`: coincidencia estricta de PID, PPID y Grand-PPID con expiración si el PID muere. Para `SSHKey`: coincidencia de tipo solo para clientes SSH/Git (`ssh`, `ssh-keygen`, `git`), exigiendo coincidencia completa de 3 PIDs para otros ejecutables |
 | D37 | **Aislamiento de socket y advertencia de Go activo** | Reusar socket Go | Socket propio en `~/.silverwarden.sock` (0600) con limpieza de huérfanos. Si `~/.goldwarden.sock` está activo, la CLI muestra advertencia de recomendación de detención para evitar colisiones |
+| D38 | **Headers HTTP y formato de cliente Bitwarden** | Headers genéricos | Inclusión estricta de `User-Agent: silverwarden/0.0.1`, `Device-Type: 10`, `Bitwarden-Client-Name: silverwarden`, `Bitwarden-Client-Version: 0.0.1` y `Auth-Email: base64(email)` en cuerpos form-urlencoded |
+| D39 | **Caché atómico de Vault en `~/.cache/silverwarden/vault.json` (0600)** | Sin caché o texto claro | Persistencia atómica (tempfile + rename) del JSON `SyncData` íntegro con permisos 0600; ciphers cargados en memoria como `EncString` (cifrados) para descifrado bajo demanda |
+| D40 | **2FA progresivo (TOTP/Email primero, FIDO2 diferido)** | FIDO2 obligatorio en MVP | TOTP y email se integran en el flujo de login; FIDO2 queda desacoplado para versión posterior por complejidad y estabilidad de drivers HID |
+| D41 | **Orden de dependencias de M4** | Implementación ad-hoc | SW-030 (HTTP) → SW-031 (Modelos) → SW-033 (Login) → SW-032 (Sync) → SW-036 (CRUD) → SW-035 (Websocket) → SW-034 (2FA) |
+
 
 ---
 

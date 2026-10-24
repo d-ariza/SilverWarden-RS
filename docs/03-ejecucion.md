@@ -961,6 +961,61 @@ PASS
 
 **Estado:** ✅ SW-025 Cobertura — Hecho (2026-10-24). Objetivo de cobertura ampliamente superado.
 
+---
+
+## 4. Milestone M4: Bóveda y API de Bitwarden (`sw-vault`, `sw-bitwarden-api`)
+
+**Objetivo:** Implementar la capa completa de transporte HTTP autenticado con refresh automático, el modelo de datos de la bóveda (`SyncData`/`Cipher`), el flujo de autenticación/login (prelogin, derivación KDF, master password hash y descifrado de llaves de perfil), la sincronización completa con persistencia atómica en disco (`~/.cache/silverwarden/vault.json` con permisos `0600`), el CRUD y filtrado de accesos en memoria/remoto, la recepción de eventos push en tiempo real vía Websocket (MessagePack), y el desafío de doble factor (2FA).
+
+### 4.1 Decisiones Arquitectónicas de M4
+- **D38:** Inclusión estricta de headers HTTP de cliente (`Authorization: Bearer <token>`, `User-Agent: silverwarden/0.0.1`, `Device-Type: 10`, `Bitwarden-Client-Name: silverwarden`, `Bitwarden-Client-Version: 0.0.1`, y `Auth-Email: base64(email)` en cuerpos form-urlencoded).
+- **D39:** Caché atómico de Vault en `~/.cache/silverwarden/vault.json` con permisos Unix `0600` (escritura vía tempfile + rename atómico). Los ciphers se cargan en `VaultStore` en memoria manteniendo los campos cifrados (`EncString`) para descifrado bajo demanda.
+- **D40:** 2FA en fases: TOTP y Email integrados en el flujo de login; FIDO2 diferido a versión posterior para aislar dependencias HID en el MVP.
+- **D41:** Orden de implementación por dependencias de transporte y datos:
+  1. **SW-030 (HTTP autenticado + Refresh Token):** Base de red y transporte para todas las operaciones.
+  2. **SW-031 (Modelos SyncData/Cipher):** Base de modelado y deserialización de estructuras.
+  3. **SW-033 (Login):** Necesario para obtener el token de acceso y la clave del usuario.
+  4. **SW-032 (Sync completo + Caché en disco):** Descarga remota, persistencia atómica y carga en memoria.
+  5. **SW-036 (CRUD de ciphers):** Consultas, filtrado bajo demanda y operaciones de bóveda.
+  6. **SW-035 (Websocket de notificaciones):** Actualizaciones push en tiempo real vía SignalR/Hub MessagePack.
+  7. **SW-034 (2FA):** Soporte de doble factor para cuentas protegidas con TOTP/Email.
+
+### 4.2 Desglose de Historias M4
+
+1. **[SW-030] HTTP autenticado + refresh de token (`sw-bitwarden-api`):**
+   - Struct `AuthenticatedClient` envolviendo `reqwest::Client` y `Arc<Mutex<LoginToken>>`.
+   - Método `fetch_with_auth(&self, method, url, body) -> Result<Response, ApiError>`.
+   - Manejo concurrente de 401 con refresco automático de token bajo mutex y reintento.
+   - Mock server con wiremock/httpmock para verificar flujo normal y reintento post-refresh.
+
+2. **[SW-031] Modelos SyncData/Cipher (`sw-vault`):**
+   - Modelado de `SyncData`, `Profile`, `Organization`, `Folder`, `Cipher`, `LoginCipher`, `Card`, `Identity`, `SSHKeyCipher`, `Field`, `URI`.
+   - Compatibilidad completa con `EncString` (SW-002) y wire format camelCase con serde defaults.
+
+3. **[SW-033] Login (`sw-bitwarden-api`):**
+   - Endpoint `POST /accounts/prelogin` para obtener configuración KDF.
+   - Derivación KDF con `sw-crypto`.
+   - Generación de `master_password_hash` con PBKDF2-HMAC-SHA256 (1 iteración, base64) con paridad exacta de Go.
+   - `POST /connect/token` con grant password y descifrado de la `UserSymmetricKey`.
+
+4. **[SW-032] Sync completo + Caché en disco (`sw-vault`, `sw-bitwarden-api`):**
+   - `DoFullSync` vía endpoint `GET /sync`.
+   - Persistencia segura en `~/.cache/silverwarden/vault.json` (0600) con escritura atómica.
+   - Carga en `VaultStore` en memoria sin descifrado masivo preliminar.
+
+5. **[SW-036] CRUD de ciphers (`sw-bitwarden-api`, `sw-vault`):**
+   - Operaciones remotas GET, POST, PUT, DELETE de ciphers.
+   - Filtrado local en memoria por nombre, usuario y URI descifrando bajo demanda.
+
+6. **[SW-035] Websocket de notificaciones (`sw-bitwarden-api`):**
+   - Daemon de conexión a `wss://<notifications_url>/hub?access_token=<token>`.
+   - Handshake MessagePack + lectura continua con `tokio-tungstenite` y `rmp-serde`.
+   - Despacho de eventos de actualización y reconexión resiliente con backoff.
+
+7. **[SW-034] 2FA (`sw-bitwarden-api`):**
+   - Captura y reenvío de desafíos de segundo factor para TOTP y Email.
+
+
 
 
 

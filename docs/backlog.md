@@ -420,18 +420,40 @@ Una historia pasa a `Hecho` solo cuando:
 
 ## M4 — Vault + API Bitwarden `sw-vault`, `sw-bitwarden-api` (P0 — MVP)
 
+**Orden de Implementación:**
+1. **[SW-030]** HTTP autenticado + Refresh Token (`sw-bitwarden-api`) $\rightarrow$ Base para todo el transporte.
+2. **[SW-031]** Modelos SyncData/Cipher (`sw-vault`) $\rightarrow$ Base para estructurar el vault y ciphers.
+3. **[SW-033]** Login (`sw-bitwarden-api`) $\rightarrow$ Flujo de obtención de tokens y claves del perfil.
+4. **[SW-032]** Sync completo + Caché en disco (`sw-vault`, `sw-bitwarden-api`) $\rightarrow$ Población del vault y persistencia offline.
+5. **[SW-036]** CRUD de ciphers (`sw-bitwarden-api`, `sw-vault`) $\rightarrow$ Operaciones y filtros sobre el vault activo.
+6. **[SW-035]** Websocket de notificaciones (`sw-bitwarden-api`) $\rightarrow$ Sincronización en tiempo real vía hub.
+7. **[SW-034]** 2FA (`sw-bitwarden-api`) $\rightarrow$ Integración de TOTP/Email en login (FIDO2 diferido).
+
+---
+
 ### [SW-030] HTTP autenticado + refresh de token
 
 **Historia:** Como núcleo de API, quiero un cliente REST autenticado con refresh automático, para que las operaciones contra el servidor no fallen por token caducado.
 
-**Alcance:** cliente REST con `Authorization`, refresh token, manejo de errores por status code (paridad `http.go`).
+**Crate:** `sw-bitwarden-api`.  
+**Dependencias:** `reqwest` (workspace), `tokio`, `serde_json`, `base64` (Auth-Email).
+
+**Diseño técnico:**
+- Struct `AuthenticatedClient` que envuelve un `reqwest::Client` y un `Arc<Mutex<LoginToken>>`.
+- Método `fetch_with_auth(&self, method, url, body) -> Result<Response, ApiError>`.
+- Inyección estricta de headers:
+  - `Authorization: Bearer <token>`
+  - `User-Agent: silverwarden/0.0.1`
+  - `Device-Type: 10`
+  - `Bitwarden-Client-Name: silverwarden`
+  - `Bitwarden-Client-Version: 0.0.1`
+- Si el cuerpo es `url::FormUrlEncoded`, añade cabecera `Auth-Email: base64(email)`.
+- Si la respuesta es `401 Unauthorized`, realiza refresh automático del token protegido con `Mutex` (evitando ráfagas concurrentes) y reintenta la petición.
 
 **Criterios de aceptación:**
-- Request autenticado funciona contra vault.disroot.org.
-- Token caducado → refresh automático y reintento.
-- Errores HTTP mapeados a errores tipados.
-
-**Cierre:** criterios pasan contra servidor real; evidencia en `03-ejecucion.md`.
+- Mock server (wiremock/httpmock) simulando 401 y reintento exitoso 200.
+- Headers exactos verificados.
+- Token refrescado y persistido en memoria.
 
 **Depende de:** SW-010 · **Estado:** Pendiente
 
@@ -439,104 +461,130 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-031] Modelos SyncData/Cipher
 
-**Historia:** Como núcleo de vault, quiero modelar toda la jerarquía de sync, para representar el vault en memoria con fidelidad.
+**Historia:** Como núcleo de vault, quiero modelar toda la jerarquía de sync con paridad estricta con Bitwarden y Goldwarden Go, para representar el vault en memoria con fidelidad.
 
-**Alcance:** structs serde para Profile, Organizations, Ciphers, Folders, Sends.
-
-**Criterios de aceptación:**
-- JSON real de `/sync` de vault.disroot.org deserializa completo.
-- Roundtrip serialize→deserialize estable.
-- Campos desconocidos se preservan o se documenta su descarte.
-
-**Cierre:** criterio pasa con fixture real; evidencia en `03-ejecucion.md`.
-
-**Depende de:** — · **Estado:** Pendiente
-
----
-
-### [SW-032] Sync completo + caché en disco
-
-**Historia:** Como usuario, quiero que mi vault se sincronice y se guarde en disco cifrado, para trabajar offline y no re-sincronizar cada vez.
-
-**Alcance:** `DoFullSync` (org keys, keyring init, clear, add ciphers por tipo), `WriteVault`/`ReadVault` con formato JSON idéntico al Go; stores en memoria con indexación.
+**Crate:** `sw-vault`.  
+**Diseño técnico:**
+- Structs serde con paridad de Go: `SyncData`, `Profile`, `Organization`, `Folder`, `Cipher`, `LoginCipher`, `Card`, `Identity`, `SSHKeyCipher`, `Field`, `URI`.
+- Inclusión de `#[serde(default)]` en campos opcionales y `#[serde(rename_all = "camelCase")]` (wire format de Bitwarden).
+- Soporte e integración nativa con `EncString` (SW-002) para todos los campos cifrados.
 
 **Criterios de aceptación:**
-- Sync completo contra vault.disroot.org con cuenta de prueba.
-- Caché generado por Rust lo lee el Go y viceversa.
-- `lastSynced` correcto.
-- Indexación por tipo y por URI funciona.
+- Deserialización completa y sin pérdidas de un JSON real de `/sync`.
+- Serialización y deserialización roundtrip estable.
+- Campos desconocidos o extensiones manejados sin panic.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
-
-**Depende de:** SW-031, SW-005, SW-004 · **Estado:** Pendiente
+**Depende de:** SW-002 · **Estado:** Pendiente
 
 ---
 
 ### [SW-033] Login
 
-**Historia:** Como usuario, quiero iniciar sesión con contraseña maestra o API key, para acceder a mi vault.
+**Historia:** Como usuario, quiero iniciar sesión con contraseña maestra y correo, derivando las claves necesarias para autenticarme y descifrar la clave simétrica del usuario.
 
-**Alcance:** prelogin (KDF config) → derivación → master password hash → login; también API key; persistencia de token/keys cifrada en config.
+**Crate:** `sw-bitwarden-api`.  
+**Diseño técnico:**
+- `prelogin(email) -> Result<KdfConfig, ApiError>`: `POST /accounts/prelogin`.
+- `derive_master_key(password, email, kdf_config)`: delega en `sw_crypto::derive_master_key`.
+- `derive_master_password_hash(master_key, password) -> String`: PBKDF2-HMAC-SHA256 con 1 iteración sobre bytes de masterKey y password, codificado en base64 (paridad exacta con Go).
+- `login_with_password(email, master_password_hash, device_uuid) -> Result<LoginToken, ApiError>`:
+  - `POST /connect/token` con `grant_type=password`, `client_id=web`, `scope=api offline_access`, `deviceType=10`, `deviceIdentifier=device_uuid`, `deviceName=firefox`.
+- `decrypt_enc_key(enc_key_str, user_symmetric_key)`: descifrado con `sw_crypto` para obtener la `UserSymmetricKey` a partir de la `Key` del perfil.
+- Persistencia de `LoginToken` y `UserSymmetricKey` en `sw-config` cifrados con el PIN.
 
 **Criterios de aceptación:**
-- Login real contra cuenta de prueba en vault.disroot.org.
-- Login con API key funciona.
-- Token y claves persisten cifrados tras login.
-
-**Cierre:** criterios pasan contra servidor real; evidencia en `03-ejecucion.md`.
+- Mock server simulando prelogin y login exitoso.
+- Verificación de derivación del master password hash (1 iteración PBKDF2).
+- Descifrado de la clave del perfil.
 
 **Depende de:** SW-030, SW-011, SW-003 · **Estado:** Pendiente
 
 ---
 
-### [SW-034] 2FA
+### [SW-032] Sync completo + caché en disco
 
-**Historia:** Como usuario con 2FA, quiero completar el segundo factor (TOTP o email primero, FIDO2 después), para poder iniciar sesión.
+**Historia:** Como usuario, quiero sincronizar mi bóveda y conservarla en caché local con permisos restringidos, permitiendo operación rápida y offline.
 
-**Alcance:** TOTP y email primero; trait `TwoFactor` para FIDO2 posterior.
-
-**Criterios de aceptación:**
-- Login con 2FA TOTP real funciona.
-- Trait `TwoFactor` permite stub para FIDO2.
-- Error claro si el factor no está soportado aún.
-
-**Cierre:** criterio pasa con cuenta de prueba; evidencia en `03-ejecucion.md`.
-
-**Depende de:** SW-033 · **Estado:** Pendiente
-
----
-
-### [SW-035] Websocket de notificaciones
-
-**Historia:** Como usuario, quiero recibir notificaciones de sync en tiempo real, para que mi vault se actualice cuando cambia en otro dispositivo.
-
-**Alcance:** conexión autenticada, mensajes msgpack, reconexión con backoff.
+**Crate:** `sw-vault` y `sw-bitwarden-api`.  
+**Diseño técnico:**
+- `DoFullSync(client, config, vault) -> Result<(), VaultError>`:
+  - `GET /sync` vía `AuthenticatedClient`.
+  - Deserialización en `SyncData`.
+  - Persistencia en disco en `~/.cache/silverwarden/vault.json` con permisos `0600` (escritura atómica tempfile + rename).
+  - Carga de los `EncString` en memoria (sin descifrar masivamente) en `VaultStore` (`HashMap<Uuid, Cipher>`).
+- Métodos `load_from_disk()` y `save_to_disk()`.
 
 **Criterios de aceptación:**
-- Recibe notificación de sync tras cambio en otro cliente.
-- Reconexión con backoff ante caída.
-- Mensajes malformados no tumban el daemon.
+- Sync completo contra mock server.
+- Verificación de archivo `~/.cache/silverwarden/vault.json` con permisos 0600.
+- Carga íntegra de ciphers en memoria.
 
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
-
-**Depende de:** SW-030 · **Estado:** Pendiente
+**Depende de:** SW-030, SW-031, SW-033 · **Estado:** Pendiente
 
 ---
 
 ### [SW-036] CRUD de ciphers
 
-**Historia:** Como usuario, quiero listar, buscar, crear, editar y borrar ciphers, para gestionar mi vault desde la CLI.
+**Historia:** Como usuario, quiero consultar, filtrar y gestionar ciphers de mi bóveda, sincronizando modificaciones con el servidor.
 
-**Alcance:** get/list por filtros (paridad `GetLoginByFilter`), add/update/delete con re-cifrado.
+**Crate:** `sw-bitwarden-api` y `sw-vault`.  
+**Diseño técnico:**
+- Operaciones REST vía `fetch_with_auth`:
+  - `get_cipher(uuid)`
+  - `post_cipher(cipher)`
+  - `put_cipher(uuid, cipher)`
+  - `delete_cipher(uuid)`
+- Filtros locales en `VaultStore`:
+  - `get_logins_by_filter(name, username, uri)`: itera sobre los ciphers en memoria, descifrando campos bajo demanda para evaluar coincidencias.
 
 **Criterios de aceptación:**
-- Roundtrip create→sync→read real.
-- Filtros por URI y por tipo funcionan.
-- Update y delete se reflejan en el servidor.
-
-**Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
+- Mock server validando ciclo CRUD completo (GET, POST, PUT, DELETE).
+- Pruebas unitarias de filtros locales con descifrado bajo demanda.
 
 **Depende de:** SW-032 · **Estado:** Pendiente
+
+---
+
+### [SW-035] Websocket de notificaciones
+
+**Historia:** Como usuario, quiero recibir notificaciones push en tiempo real, para que mi bóveda se actualice inmediatamente cuando ocurran cambios en otros clientes.
+
+**Crate:** `sw-bitwarden-api`.  
+**Diseño técnico:**
+- `run_websocket_daemon(client, config, vault)`:
+  - Conexión a `wss://<notifications_url>/hub?access_token=<token>`.
+  - Handshake inicial: `{"protocol":"messagepack","version":1}` con delimitador de registro `0x1e`.
+  - Lectura asíncrona de tramas con `tokio-tungstenite`.
+  - Deserialización de payloads MessagePack con `rmp-serde`.
+  - Despacho de eventos: `SyncCiphers` $\rightarrow$ full sync, `SyncCipherUpdate` $\rightarrow$ fetch y actualización puntual de cipher.
+  - Mecanismo de reconexión con backoff exponencial ante pérdidas de conexión.
+
+**Criterios de aceptación:**
+- Mock server websocket emitiendo handshake y evento `SyncCipherUpdate`.
+- Actualización reactiva del vault en memoria.
+- Tolerancia a desconexiones y reintentos.
+
+**Depende de:** SW-030, SW-032 · **Estado:** Pendiente
+
+---
+
+### [SW-034] 2FA
+
+**Historia:** Como usuario con doble factor de autenticación configurado, quiero autenticarme mediante TOTP o correo electrónico.
+
+**Crate:** `sw-bitwarden-api`.  
+**Diseño técnico:**
+- Detección de requerimiento 2FA en respuesta de login (`TwoFactor`).
+- Extracción de métodos disponibles (TOTP, Email).
+- Soporte para TOTP (`twoFactorProvider = 0`) y Email (`twoFactorProvider = 1`):
+  - Solicitud de código y re-envío a `POST /connect/token` con `twoFactorToken` y `twoFactorProvider`.
+- FIDO2 (`twoFactorProvider = 4`): stub con `todo!()` y mensaje informativo para versión posterior.
+
+**Criterios de aceptación:**
+- Mock server simulando desafío 2FA TOTP con código válido e inválido.
+- Manejo claro de errores en códigos expirados/incorrectos.
+
+**Depende de:** SW-033 · **Estado:** Pendiente
 
 ---
 
