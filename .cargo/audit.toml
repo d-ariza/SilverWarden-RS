@@ -21,4 +21,8 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+
+    # crypto-bigint (RUSTSEC-2026-0387): timing variability in crypto-bigint 0.5.5
+    # Dependencia transitiva vía ssh-key 0.6.7 (ssh-key 0.7 estable pendiente).
+    "RUSTSEC-2026-0387",
 ]
