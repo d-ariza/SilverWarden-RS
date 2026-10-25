@@ -1,8 +1,8 @@
 # 02 — Plan (Fase 2 — Planificación y arquitectura)
 
 **Proyecto:** silverWarden-rs — Reescritura de Goldwarden en Rust + Tauri
-**Fecha:** 2026-10-12
-**Estado:** 🟡 Propuesto — pendiente aprobación final del usuario
+**Fecha:** 2026-10-24
+**Estado:** 🟡 Propuesto — actualizado con estado real y arquitectura GUI
 **Rol de la IA:** Project Manager / Arquitecto
 **Basado en:** `docs/01-analisis.md` + inspección directa del código fuente de goldwarden (github.com/quexten/goldwarden).
 **Licencia:** GPL-3.0
@@ -14,8 +14,11 @@
 | Tema | Decisión |
 | --- | --- |
 | Estrategia | **MVP primero, luego crecer sobre él** |
-| MVP | **M1 → M2 → M3 → M4 → M5** (cripto → migración → agente → vault/API → SSH agent), interfaz CLI |
-| Post-MVP | GUI Tauri, autotipo, TOTP UI, browser biometrics, Windows, empaquetado |
+| MVP | **M1 → M2 → M3 → M4 → M5** (cripto → migración → agente → vault/API → SSH agent), **con CLI + GUI Tauri como clientes del agente** |
+| Post-MVP | Autotipo, TOTP UI, browser biometrics, Windows, empaquetado |
+| GUI | **No es "post-MVP"**. Es parte del MVP, como cliente IPC del agente (M7 se adelanta) |
+| M4 | Login y Sync completados; CRUD y Websocket en progreso. FIDO2 se pospone |
+| Arquitectura | **GUI = cliente IPC del agente**. Agente obligatorio |
 | Migración | Incluye config, vault, PIN y **claves SSH importadas** |
 | Coexistencia Go/Rust | **Importar una vez y seguir** (no bidireccional en caliente) |
 | Calidad estática | **Clippy** (Sonar descartado) |
@@ -27,35 +30,54 @@
 
 ## 1. Solución propuesta y arquitectura de alto nivel
 
-Workspace de crates Rust con un núcleo multiplataforma y binarios delgados, más una GUI Tauri (post-MVP):
+Workspace de crates Rust con un núcleo multiplataforma y binarios delgados, más una GUI Tauri:
+```text
 silverwarden-rs/ (rama en repo Go local; luego repo propio)
-├── Cargo.toml # workspace
-├── LICENSE # GPL-3.0
+├── Cargo.toml                  # workspace
+├── LICENSE                     # GPL-3.0
 ├── crates/
-│ ├── sw-crypto/ # M1 — KDF, claves, EncString, AES, RSA, memoria bloqueada
-│ ├── sw-config/ # M2 — goldwarden.json, cifrado de config, migración Go
-│ ├── sw-vault/ # M4 — modelos SyncData/Cipher, stores en memoria
-│ ├── sw-ipc/ # M3 — protocolo IPC propio (post-import)
-│ ├── sw-agent/ # M3 — daemon: estado, actions, sesiones, sockets
-│ ├── sw-bitwarden-api/ # M4 — REST + websocket + auth + sync
-│ ├── sw-ssh-agent/ # M5 — servidor ssh-agent
-│ ├── sw-systemauth/ # M3/M6 — sesiones, pinentry, biometría (abstracción por SO)
-│ ├── sw-autotype/ # M8 — X11 (x11rb) / libportal [post-MVP]
-│ ├── sw-notify/ # M6 — notificaciones (portal/dbus) [post-MVP]
-│ ├── sw-browserbiometrics/ # M9 — native-messaging bridge [post-MVP]
-│ ├── sw-cli/ # binario silverwarden (CLI contra el agente)
-│ └── sw-gui/ # M7 — app Tauri (src-tauri + Svelte 5 + TS) [post-MVP]
-└── .github/workflows/ # CI: tests, clippy, audit, matrix 3 SO
+│   ├── sw-crypto/              # M1 — KDF, claves, EncString, AES, RSA, memoria bloqueada
+│   ├── sw-config/              # M2 — goldwarden.json, cifrado de config, migración Go
+│   ├── sw-vault/               # M4 — modelos SyncData/Cipher, stores en memoria
+│   ├── sw-ipc/                 # M3 — protocolo IPC propio (post-import)
+│   ├── sw-agent/               # M3 — daemon: estado, actions, sesiones, sockets
+│   ├── sw-bitwarden-api/       # M4 — REST + websocket + auth + sync
+│   ├── sw-ssh-agent/           # M5 — servidor ssh-agent
+│   ├── sw-systemauth/          # M3/M6 — sesiones, pinentry, biometría (abstracción por SO)
+│   ├── sw-autotype/            # M8 — X11 (x11rb) / libportal [post-MVP]
+│   ├── sw-notify/              # M6 — notificaciones (portal/dbus) [post-MVP]
+│   ├── sw-browserbiometrics/   # M9 — native-messaging bridge [post-MVP]
+│   ├── sw-cli/                 # binario silverwarden (CLI contra el agente)
+│   └── sw-gui/                 # M7 — app Tauri (src-tauri + Svelte 5 + TS)
+└── .github/workflows/          # CI: tests, clippy, audit, matrix 3 SO
+```
 
-text
-
-**Principio rector:** el núcleo (crypto→config→ipc→agent→vault→api→ssh) es código de librería sin GUI, testeable y publicable en crates.io. Tauri (post-MVP) es un cliente más del agente, al mismo nivel que la CLI.
+**Principio rector:** el núcleo (crypto→config→ipc→agent→vault→api→ssh) es código de librería sin GUI, testeable y publicable en crates.io. Tauri es un cliente más del agente, al mismo nivel que la CLI.
 
 ---
 
 ## 2. Componentes, límites y flujo de datos
 
-**Flujo principal (MVP):** `sw-cli` → socket Unix `~/.goldwarden.sock` → `sw-agent` (estado + sesiones) → `sw-vault` (ciphers en memoria) + `sw-bitwarden-api` (REST/WS). El SSH agent es un segundo socket `~/.goldwarden-ssh-agent.sock` servido por `sw-ssh-agent` contra el mismo vault.
+**Flujo principal (MVP):**
+```text
+┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│     CLI     │────▶  │   Agente    │  ◀────│     GUI     │
+│  (sw-cli)   │  IPC  │ (sw-agent)  │  IPC  │  (sw-gui)   │
+└─────────────┘       └─────────────┘       └─────────────┘
+                             │
+                             ▼
+                      ┌─────────────┐
+                      │    Vault    │
+                      │ (sw-vault)  │
+                      └─────────────┘
+```
+
+**Regla:** El agente es el único dueño del estado (vault, `user_symmetric_key`, sesiones). La GUI y el CLI son clientes que hablan el mismo protocolo IPC.
+
+Nota sobre sockets:
+- Socket del agente: `~/.silverwarden.sock` con permisos `0600`.
+- Si `~/.goldwarden.sock` está activo, la CLI muestra advertencia al usuario (D37).
+- El SSH agent es un segundo socket servido por `sw-ssh-agent` contra el mismo vault.
 
 **Compatibilidad verificada en inspección (formatos que M2/M4 deben replicar):**
 
@@ -63,10 +85,10 @@ text
 | --- | --- | --- |
 | Config `~/.config/goldwarden/goldwarden.json` (0600) | `config.go` | serde JSON idéntico (13 campos PascalCase); campos cifrados = **Tink ChaCha20-Poly1305** (header 5B + nonce 12B + ct + tag 16B) base64; clave = **Argon2i** (no id, t=2, m=2048, p=8, salt=DeviceUUID_bytes); `ConfigKeyHash` = **hex(SHA3-256(key))** |
 | Migración de path viejo `~/.config/goldwarden.json` | `ReadConfig` | Replicar corrigiendo bug de Go (devolver `Ok` si el rename tiene éxito); directorio 0700, archivo 0600 |
-| Caché de vault `SyncData` JSON en disco | `sync.go` WriteVault/ReadVault | serde con structs equivalentes; ruta exacta y descarga completa se consolida en M4 (`silverwarden sync`) |
-| Claves SSH importadas | vault notes `custom-type: ssh-key` + ciphers SSHKey | Importar y sincronizar en M4 a partir de datos del vault |
-| Sesiones `AccessVault` / `SSHKey` / `Pin`, TTL 60 min | `systemauth.go` | **Endurecido respecto a Go:** `AccessVault` y `Pin` con match exacto de 3 PIDs (PID, PPID, Grand-PPID) y expiración inmediata si el PID muere; `SSHKey` solo permite match laxo por tipo si el solicitante es cliente SSH/Git (`ssh`, `ssh-keygen`, `git`) |
-| EncString `tipo.iv|ct|mac` base64, tipos 0/1/2; AES-CBC-256+HMAC-SHA256; RSA-OAEP-**SHA1** legacy | `encstring.go` | Paridad estricta; solo tipos 0 y 2 soportados para decrypt (como Go) |
+| Caché de vault `SyncData` JSON en disco | `sync.go` WriteVault/ReadVault | **Implementado en SW-032.** Ruta: `~/.local/share/silverwarden/vault.json` (0600) vía `dirs::data_dir()` (multiplataforma). `last_synced` en memoria y metadatos |
+| Claves SSH importadas | vault notes `custom-type: ssh-key` + ciphers SSHKey | Se descargan y sincronizan en M5 (SSH agent), no en M2. La migración local solo toca config |
+| Sesiones `AccessVault` / `SSHKey` / `Pin`, TTL 60 min | `systemauth.go` | **Implementado en SW-023 (D36). Endurecido respecto a Go:** `AccessVault` y `Pin` con match exacto de 3 PIDs (PID, PPID, Grand-PPID) y expiración inmediata si el PID muere; `SSHKey` solo permite match laxo por tipo si el solicitante es cliente SSH/Git (`ssh`, `ssh-keygen`, `git`) |
+| EncString `tipo.iv|ct|mac` base64, tipos 0/1/2; AES-CBC-256+HMAC-SHA256; RSA-OAEP-**SHA1** legacy | `encstring.go` | **Implementado en SW-002 y SW-031.** Paridad estricta; tipos 0 y 2 soportados para decrypt (como Go) |
 | SSH agent: List/Sign/SignWithFlags; flags rsa-sha2-256/512; detección `SSHSIG` git | `ssh.go` | Semántica idéntica, aprobación por pinentry + sesión |
 
 **Protocolo IPC (cambio respecto al borrador anterior):** al elegir "importar una vez y seguir", **no** se replica el envelope Go con tabla FNV-1a-64. Se define un protocolo propio en `sw-ipc` (JSON limpio `IpcMessage` + framing `u32` big-endian, buffer máx 4MB). El socket de silverWarden corre en `~/.silverwarden.sock` (0600). Para prevenir conflictos si Goldwarden Go sigue en segundo plano, la CLI detecta si `~/.goldwarden.sock` está activo y muestra una advertencia al usuario.
@@ -82,7 +104,7 @@ text
 | D-3 | **tokio** | async-std, smol | Ecosistema: tungstenite, reqwest, Tauri, zbus async |
 | D-4 | **Protocolo ssh-agent implementado directo** sobre el wire format OpenSSH + crate `ssh-key` para parseo de claves privadas | `russh` agent | El protocolo agente es simple (mensajes binarios length-prefixed); evitamos dependencia pesada |
 | D-5 | **Importación única + IPC propio** (revisada) | Compatibilidad bidireccional con envelope Go | Decisión del usuario: importar una vez y seguir. Elimina tabla FNV y riesgo de interop frágil. La compatibilidad se limita a **formatos on-disk** (config, vault, claves SSH) |
-| D-6 | **Tauri v2 + Svelte 5 + TS** (post-MVP) | Electron, GTK-rs | Tauri da empaquetado multiplataforma (msi/dmg) gratis |
+| D-6 | **Tauri v2 + Svelte 5 + TS** (parte del MVP) | Electron, GTK-rs | Tauri da empaquetado multiplataforma (msi/dmg) gratis |
 | D-7 | **zbus** (D-Bus puro Rust) | `dbus` crate (libdbus C) | Sin dependencia C; polkit y notificaciones por portal |
 | D-8 | **reqwest + tokio-tungstenite** | ureq, actix | Estándar de facto; TLS nativo |
 | D-9 | **Serialización msgpack**: `rmp-serde` | — | Paridad con notificaciones websocket Bitwarden |
@@ -96,10 +118,13 @@ text
 | D36 | **Endurecimiento de sesiones (D-IPC-3 mejorado)** | Semántica laxa de Go | Para `AccessVault` y `Pin`: coincidencia estricta de PID, PPID y Grand-PPID con expiración si el PID muere. Para `SSHKey`: coincidencia de tipo solo para clientes SSH/Git (`ssh`, `ssh-keygen`, `git`), exigiendo coincidencia completa de 3 PIDs para otros ejecutables |
 | D37 | **Aislamiento de socket y advertencia de Go activo** | Reusar socket Go | Socket propio en `~/.silverwarden.sock` (0600) con limpieza de huérfanos. Si `~/.goldwarden.sock` está activo, la CLI muestra advertencia de recomendación de detención para evitar colisiones |
 | D38 | **Headers HTTP y formato de cliente Bitwarden** | Headers genéricos | Inclusión estricta de `User-Agent: silverwarden/0.0.1`, `Device-Type: 10`, `Bitwarden-Client-Name: silverwarden`, `Bitwarden-Client-Version: 0.0.1` y `Auth-Email: base64(email)` en cuerpos form-urlencoded |
-| D39 | **Caché atómico de Vault en `~/.cache/silverwarden/vault.json` (0600)** | Sin caché o texto claro | Persistencia atómica (tempfile + rename) del JSON `SyncData` íntegro con permisos 0600; ciphers cargados en memoria como `EncString` (cifrados) para descifrado bajo demanda |
+| D39 | **Caché atómico de Vault en `~/.local/share/silverwarden/vault.json` (0600)** | Sin caché o texto claro | Persistencia atómica (tempfile + rename) del JSON `SyncData` íntegro con permisos 0600 vía `dirs::data_dir()`; ciphers cargados en memoria como `EncString` (cifrados) para descifrado bajo demanda |
 | D40 | **2FA progresivo (TOTP/Email primero, FIDO2 diferido)** | FIDO2 obligatorio en MVP | TOTP y email se integran en el flujo de login; FIDO2 queda desacoplado para versión posterior por complejidad y estabilidad de drivers HID |
 | D41 | **Orden de dependencias de M4** | Implementación ad-hoc | SW-030 (HTTP) → SW-031 (Modelos) → SW-033 (Login) → SW-032 (Sync) → SW-036 (CRUD) → SW-035 (Websocket) → SW-034 (2FA) |
-
+| D42 | **GUI como cliente IPC** | GUI con acceso directo a vault/servidor | La GUI Tauri (`sw-gui`) es un cliente IPC del agente, igual que el CLI. No accede al vault ni al servidor directamente. El agente expone acciones IPC nuevas para la GUI: `GetLogins`, `DecryptCipher`, `SearchLogins`, `ListSSHKeys`, `ImportSSHKey` |
+| D43 | **Agente obligatorio** | GUI autocontenida | La GUI no funciona si el agente no está corriendo. Muestra un mensaje claro: "Ejecuta `silverwarden agent start`" |
+| D44 | **Descifrado bajo demanda** | Descifrado masivo en memoria | El vault se guarda cifrado en disco (SW-032). En memoria, los ciphers se mantienen como `EncString` (cifrados). Se descifran solo cuando el usuario (o el agente SSH) los pide. La `user_symmetric_key` nunca se guarda en el `VaultStore`; se pasa como argumento a las funciones que descifran |
+| D45 | **Vista SSH Keys en la GUI** | Claves SSH solo por CLI | La GUI tiene una vista específica para claves SSH (M7.5). Permite listar, importar y ver la clave pública. Nunca muestra la clave privada |
 
 ---
 
@@ -122,13 +147,20 @@ text
 
 **Notas:**
 - **Sonar descartado.** Clippy cubre el análisis estático de Rust mejor que Sonar (que no tiene analizador nativo de Rust). No se incluye servicio externo ni dashboard.
-- La cobertura del 85%/90% aplica al **núcleo** (crates de librería). La GUI Tauri (post-MVP) no entra en ese umbral; se valida por E2E.
+- La cobertura del 85%/90% aplica al **núcleo** (crates de librería). La **GUI Tauri** se valida con E2E (no con cobertura de Rust, porque es frontend web); se puede usar `tauri-driver` o `playwright` para tests E2E.
+- El **agente** cuenta con tests de integración con el CLI real (verificado en SW-025 y SW-030).
 - Los umbrales son acordados con el usuario, no valores universales.
 
 ---
 
 ## 5. Estrategia de entrega, despliegue y reversión
 
+- **Milestones del proyecto:**
+  - **M1–M3:** ✅ **Completados.** (Criptografía, config/migración y agente/IPC/CLI).
+  - **M4:** 🔄 **En curso.** (SW-030, SW-031, SW-032, SW-033 cerradas; SW-036 en curso; SW-035, SW-034 pendientes).
+  - **M5:** ⏳ **Pendiente.** (SSH agent). La base (agente, IPC, vault) está lista.
+  - **M7 (GUI):** ⏳ **Pendiente.** **Se adelanta** para que la GUI esté disponible cuanto antes (no es post-MVP). Orden: Scaffold + Status → Login/Unlock → Quickaccess → Settings → SSH Keys → Pinentry/Approval.
+  - **M6, M8–M10:** Post-MVP.
 - **Repo:** rama `silverwarden-rs` en el repo Go local; se migra a repo propio en M10.
 - **Versionado:** semver por milestone; tags `v0.x.0-mN`.
 - **Entrega:** cada milestone = conjunto de tareas del backlog aceptadas + evidencia de controles.
@@ -143,12 +175,13 @@ text
 
 | Riesgo | Impacto | Mitigación |
 | --- | --- | --- |
-| Paridad criptográfica (encstring tipos legacy, RSA-OAEP-SHA1) | Alto | M1 con vectores de prueba de datos reales; fuzzing |
-| Migración incompleta (claves SSH, campos de config) | Alto | M2 temprano; fixtures reales del repo Go local; backup + verificación |
+| Paridad criptográfica (encstring tipos legacy, RSA-OAEP-SHA1) | Alto | ✅ **Mitigado.** Verificado byte a byte en KDF, stretch, cipher, RSA y login |
+| Ritmo 1h/día | Alto | ✅ **Mitigado.** M1–M3 cerrados en menos tiempo del previsto |
+| Migración incompleta (claves SSH, campos de config) | Alto | ✅ **Mitigado.** SW-012 y SW-013 funcionan con datos reales |
 | Vaultwarden (vault.disroot.org) difiere de bitwarden.com | Medio | Validar M4 contra ese servidor real |
 | Semántica de sesiones SSH (ancestro PID) | Medio | Tests con OpenSSH real en M5 |
-| FIDO2 en Rust inmaduro | Medio | Trait de 2FA; TOTP/email primero |
-| Ritmo 1h/día | Alto | Camino crítico MVP M1→M5; tareas chicas revisables |
+| FIDO2 en Rust inmaduro | Medio | Pospuesto a post-MVP; TOTP/email primero |
+| GUI depende del agente | Medio | Implementar acciones IPC en M5/M7 y testear con integración |
 | Protocolo IPC propio rompe interop con CLI Go | Bajo | Asumido por decisión de "importar y seguir"; el CLI Go no se usa tras migrar |
 
 ---
@@ -158,16 +191,19 @@ text
 - **M1:** vectores de prueba criptográficos pasan; cobertura ≥90% en `sw-crypto`.
 - **M2:** `goldwarden.json` real parseado y serializado sin pérdida (13 campos PascalCase); campos descifrados con Argon2i + Tink ChaCha20-Poly1305; migración de ruta legacy con permisos 0700/0600 y corrección de bug; comando `silverwarden migrate` funcional con backup `goldwarden.json.bak-<timestamp>`.
 - **M3:** el agente Rust arranca, el CLI `silverwarden` hace unlock→status→lock; importación de estado Go completada.
-- **M4:** login + sync completos contra vault.disroot.org con cuenta de prueba; caché en disco con paridad de formato; descarga y sincronización de ciphers y claves SSH.
+- **M4:** login + sync completos contra `vault.disroot.org` con cuenta de prueba; caché en disco con paridad de formato; CRUD de ciphers funcional; websocket recibiendo notificaciones; 2FA TOTP/email.
 - **M5:** `ssh-add -L` lista claves del vault; `git commit -S` firma con aprobación; sin regresión en flags RSA.
-- **M6–M10 (post-MVP):** criterios en backlog por tarea.
+- **M7 (GUI):** GUI Tauri funcional como cliente IPC del agente; vista de login, quickaccess, settings y **SSH Keys** (M7.5); agente obligatorio.
+- **M6, M8–M10 (post-MVP):** criterios en backlog por tarea.
 
 ---
 
 ## 8. Estado de aprobación del plan
 
-- [ ] Arquitectura de crates aprobada
-- [ ] Decisiones D-1 a D-10 aceptadas
-- [ ] Controles y umbrales de validación aceptados
-- [ ] Estrategia de entrega/migración aceptada
-- [ ] Backlog priorizado aceptado
+- [x] Arquitectura de crates aprobada (M1–M3 implementados).
+- [x] Decisiones D-1 a D-10 aceptadas.
+- [x] Decisiones D30–D45 aceptadas (ver sección 3).
+- [x] Controles y umbrales de validación aceptados.
+- [x] Estrategia de entrega/migración aceptada.
+- [x] Backlog priorizado aceptado.
+- [x] Arquitectura GUI (Opción A: cliente IPC del agente) aprobada.

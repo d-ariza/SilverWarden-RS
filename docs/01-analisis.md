@@ -1,7 +1,7 @@
 # 01 — Análisis (Fase 1 — Conceptualización)
 
 **Proyecto:** silverWarden-rs — Reescritura de Goldwarden en Rust + Tauri
-**Fecha:** 2026-10-12 (actualizado con decisiones del usuario)
+**Fecha:** 2026-10-24 (actualizado con arquitectura GUI y estado real)
 **Estado:** 🟡 Borrador — decisiones de alcance registradas, pendiente aprobación final del usuario
 **Rol de la IA:** Analista
 
@@ -51,20 +51,18 @@ Aplicación Rust+Tauri con **paridad 1:1** funcional respecto al Goldwarden actu
 | Repositorio | Inicialmente **rama** en el fork actual; luego migración a **repo nuevo** |
 | Ritmo | **Muy urgente — ~1 hora de trabajo por día.** Ver §4.3 |
 
-### 4.1 Propuesta de fases de la reescritura 1:1 `[SUPUESTO — a refinar en Fase 2]`
+### 4.1 Estado real de las fases (actualizado 2026-10-24)
 
-Orden propuesto según dependencias del grafo (cripto → IPC → features → GUI → bridges):
+**Estado real a fecha 2026-10-24:**
 
-1. **M1 — Núcleo criptográfico:** KDF (argon2/pbkdf2), jerarquía de claves, EncString, AES-CBC-256+HMAC, RSA, HKDF, memoria bloqueada y wipe. *(Todo depende de esto.)*
-2. **M2 — Config + migración:** lectura/escritura de config y caché de vault compatibles con el formato Go; herramienta/comando de migración.
-3. **M3 — Agente + IPC:** daemon con socket Unix, protocolo de mensajes, sesiones autenticadas, calling context (peercred), CLI mínima.
-4. **M4 — Vault + API Bitwarden:** login (contraseña/API key/device), 2FA (TOTP, FIDO2, email), sync REST + websocket, CRUD de ciphers.
-5. **M5 — SSH agent:** socket ssh-agent, listar/firmar, importar/crear claves. *(Obligatorio por decisión del usuario.)*
-6. **M6 — Seguridad de sesión:** PIN + pincache, biometría (polkit), bloqueo por inactividad, notifications.
-7. **M7 — GUI Tauri:** quickaccess, login, settings, aprobaciones pinentry.
-8. **M8 — Autotipo + TOTP:** X11/libportal, totp.
-9. **M9 — Browser biometrics:** puente native-messaging (Chrome).
-10. **M10 — Portabilidad:** capa de abstracción de plataforma verificada en macOS; Windows mantiene compilación viable desde el inicio mediante gates condicionales.
+- **M1 — Núcleo criptográfico:** ✅ **Completado.** KDF, jerarquía de claves, EncString, AES-CBC-256+HMAC, RSA, HKDF, memoria bloqueada, fuzzing. Paridad Go↔Rust verificada byte a byte.
+- **M2 — Config + migración:** ✅ **Completado.** Config cifrado (Argon2i + Tink ChaCha20-Poly1305), migración de `goldwarden.json`, backup automático.
+- **M3 — Agente + IPC:** ✅ **Completado.** Protocolo IPC propio, socket Unix (`~/.silverwarden.sock`), CallingContext con `SO_PEERCRED` y anclaje Git, session store endurecido, actions registry, CLI con clap.
+- **M4 — Vault + API Bitwarden:** 🔄 **En curso.** Login (SW-033) ✅, Sync + caché (SW-032) ✅, CRUD de ciphers (SW-036) en curso, Websocket (SW-035) pendiente, 2FA TOTP/email (SW-034) pendiente. FIDO2 se pospone a post-MVP.
+- **M5 — SSH agent:** ⏳ **Pendiente.** La base (agente + IPC + vault) ya está lista.
+- **M6 — Seguridad de sesión:** ⏳ **Post-MVP.**
+- **M7 — GUI Tauri:** ⏳ **Pendiente.** Ver sección 4.4 (nueva).
+- **M8–M10 — Post-MVP.**
 
 ### 4.2 Nota sobre browser biometrics `[HECHO técnico]`
 
@@ -75,6 +73,51 @@ No existe vía "directa contra el servidor": en el ecosistema Bitwarden la clave
 - Disponibilidad: **~1 hora/día**, urgencia alta.
 - Estimación realista: un 1:1 completo (1427 nodos) a 1h/día implica **varios meses** (orden de 4–8 meses según complejidad de M4–M9).
 - Consecuencia: en Fase 2 se definirá un **camino crítico MVP** que entregue valor usable lo antes posible (cripto → migración → agente → vault → **SSH agent**), con las fases M6–M9 ordenadas para que el usuario tenga un sistema funcional cuanto antes. El compromiso 1:1 se mantiene; lo que se ajusta es el **orden de entrega**.
+
+### 4.4 Arquitectura de la GUI
+
+**Decisión confirmada (2026-10-24):** La GUI Tauri es un **cliente IPC del agente**, exactamente igual que el CLI.
+
+```text
+┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│     CLI     │────▶  │   Agente    │  ◀────│     GUI     │
+│  (sw-cli)   │  IPC  │ (sw-agent)  │  IPC  │  (sw-gui)   │
+└─────────────┘       └─────────────┘       └─────────────┘
+                             │
+                             ▼
+                      ┌─────────────┐
+                      │    Vault    │
+                      │ (sw-vault)  │
+                      └─────────────┘
+```
+
+**Reglas de la arquitectura:**
+
+1. **El agente es obligatorio.** Si no está corriendo, la GUI muestra un mensaje claro: "El agente no está disponible. Ejecuta `silverwarden agent start`". La GUI **no** accede directamente al vault ni al servidor.
+2. **El agente es el único dueño del estado.** La `user_symmetric_key` vive en la memoria del agente. La GUI nunca la recibe. Cuando la GUI necesita datos descifrados, se los pide al agente (`DecryptCipher`, `SearchLogins`, etc.).
+3. **La GUI no descifra.** El agente descifra bajo demanda y devuelve `DecryptedCipher` a la GUI.
+4. **El CLI y la GUI comparten el mismo protocolo IPC.** Cualquier acción nueva que necesite la GUI debe ser una acción IPC en el agente (registry).
+
+**Acciones IPC nuevas que el agente debe exponer para la GUI (a implementar en M7):**
+
+- `GetLogins`: devuelve `Vec<Cipher>` (cifrados) o `Vec<DecryptedCipher>` (descifrados bajo demanda).
+- `DecryptCipher`: recibe `uuid`, devuelve `DecryptedCipher`.
+- `SearchLogins`: recibe filtro (nombre/username), devuelve `Vec<DecryptedCipher>`.
+- `ListSSHKeys`: devuelve `Vec<SSHKeyPublic>` (nombre + clave pública, nunca la privada).
+- `ImportSSHKey`: recibe clave privada + nombre, la cifra y la sube al vault.
+
+### 4.5 Vistas de la GUI (M7)
+
+La GUI Tauri tendrá las siguientes vistas (priorizadas):
+
+1. **M7.1 — Scaffold + Status:** ventana básica que conecta al socket y muestra si el agente está corriendo, si el vault está bloqueado y el estado de sync.
+2. **M7.2 — Login/Unlock:** formulario para desbloquear el vault con PIN o biometría.
+3. **M7.3 — Quickaccess (Lista de logins):** lista de logins (nombre + username), con búsqueda. Al hacer click, muestra el password y permite copiar.
+4. **M7.4 — Settings:** URLs del servidor, PIN, estado de sync, botón de "Lock".
+5. **M7.5 — SSH Keys (requisito del usuario):** lista de claves SSH en el vault (nombre + fingerprint). Permite importar, renombrar y ver la clave pública. **Nunca muestra la clave privada.**
+6. **M7.6 — Diálogos de pinentry/approval:** ventanas modales que el agente invoca cuando necesita aprobación (por ejemplo, para firmar un commit con SSH).
+
+**Nota sobre M7.5 (SSH Keys):** Esta vista es un **requisito explícito del usuario**. Las claves privadas viven en el vault cifrado, se descifran en el agente solo cuando se necesitan para firmar, y la GUI nunca las recibe en claro.
 
 ## 5. Stack y arquitectura existente conocidos `[HECHO]`
 
@@ -120,6 +163,17 @@ No existe vía "directa contra el servidor": en el ecosistema Bitwarden la clave
 
 ## 8. Riesgos y supuestos
 
+**Riesgos mitigados:**
+- **Paridad criptográfica:** mitigado. Verificado byte a byte en KDF, stretch, cipher, RSA y login.
+- **Ritmo 1h/día:** mitigado. M1–M3 cerrados en menos tiempo del previsto.
+- **Migración Go→Rust:** mitigado. SW-012/013 funcionan con datos reales.
+
+**Riesgos activos:**
+- **Contrato native-messaging (M9):** sin cambios. Sigue siendo un riesgo medio.
+- **SSH agent (M5):** sin cambios. La base está lista, pero la semántica de firma aún no se ha probado con OpenSSH real.
+- **GUI depende del agente:** nuevo riesgo. Si el agente no expone las acciones IPC necesarias, la GUI no puede funcionar. Se mitiga implementando las acciones en M5/M7.
+- **2FA FIDO2:** pospuesto a post-MVP. TOTP y email son prioritarios.
+
 | Tipo | Descripción | Impacto | Mitigación propuesta |
 | --- | --- | --- | --- |
 | Riesgo | **Ritmo 1h/día vs. urgencia alta** — el 1:1 completo no cabe en corto plazo | Alto | Camino crítico MVP en Fase 2; entregar valor usable desde M5 |
@@ -155,6 +209,9 @@ No existe vía "directa contra el servidor": en el ecosistema Bitwarden la clave
 - [ ] DoD-9: Suite de pruebas con evidencia (se define en Fase 2).
 - [ ] DoD-10: Windows compila (ci check) aunque no sea target primario. `[CONFIRMADO]`
 - [ ] DoD-11: Empaquetado publicado: crate en crates.io, Flatpak, .msi y .dmg. `[CONFIRMADO]`
+- [ ] DoD-12: **La GUI Tauri funciona como cliente IPC del agente.** (M7)
+- [ ] DoD-13: **Vista de SSH Keys funcional en la GUI.** (M7.5)
+- [ ] DoD-14: **El agente expone las acciones IPC necesarias para la GUI.** (M5/M7)
 
 ---
 
