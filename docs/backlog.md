@@ -711,6 +711,17 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 - [SW-093] Flatpak
 - [SW-094] Migración a repo propio silverWarden-rs
 - [SW-095] Release process
+- **[SW-096] Documento de lecciones aprendidas y patrones de seguridad** (P2)
+  - **Objetivo:** Crear `docs/lecciones-aprendidas.md` con los patrones de seguridad, diseño y metodología de trabajo.
+  - **Criterios de cierre:** Documento creado, revisado y commiteado.
+  - **Depende de:** M1–M4 (para tener contexto).
+  - **Estado:** Hecho (2026-10-24) — ver `docs/lecciones-aprendidas.md`.
+
+- **[SW-097] Checklist de seguridad para futuros proyectos** (P2)
+  - **Objetivo:** Añadir el checklist de seguridad al `README.md` o a un documento separado.
+  - **Criterios de cierre:** Checklist visible y referenciado.
+  - **Depende de:** SW-096.
+  - **Estado:** Hecho (2026-10-24) — incluido en `docs/lecciones-aprendidas.md`.
 
 ---
 

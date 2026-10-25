@@ -168,6 +168,7 @@ Nota sobre sockets:
 - **Migración y reversión:** `silverwarden migrate` hace **backup automático** (`goldwarden.json.bak-<timestamp>`) antes de tocar nada, importa la configuración local a la nueva ruta y verifica el desbloqueo con el PIN. Dado que las claves SSH y ciphers del vault no residen en texto claro en disco (o no deben presumirse locales), la migración local concluye guiando al usuario a ejecutar `silverwarden sync` (M4) para descargar y descifrar el vault completo. Rollback: detener silverWarden-rs, restaurar backup, arrancar Goldwarden Go.
 - **Roll-forward:** si la migración falla a mitad, no se destruye nada sin backup verificado.
 - **No hay coexistencia en caliente:** una vez migrado, el agente Go no se usa. El importador es de un solo sentido.
+- **Lecciones aprendidas:** En M10 se documentarán las lecciones aprendidas y los patrones de seguridad aplicados (ver `docs/lecciones-aprendidas.md`). Este documento servirá como base para la v2 (si se hace) y para futuros proyectos.
 
 ---
 
