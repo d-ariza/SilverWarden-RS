@@ -541,7 +541,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Mock server validando ciclo CRUD completo (GET, POST, PUT, DELETE).
 - Pruebas unitarias de filtros locales con descifrado bajo demanda.
 
-**Depende de:** SW-032 · **Estado:** Pendiente
+**Depende de:** SW-032 · **Estado:** Hecho (2026-10-24)
 
 ---
 

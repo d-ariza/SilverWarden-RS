@@ -10,6 +10,9 @@ use zeroize::Zeroize;
 pub use sw_config::LoginToken;
 pub use sw_crypto::{KdfConfig, KdfType};
 
+pub mod ciphers;
+pub use ciphers::{delete_cipher, get_cipher, post_cipher, put_cipher};
+
 pub const BITWARDEN_USER_AGENT: &str = "silverwarden/0.0.1";
 pub const BITWARDEN_DEVICE_TYPE: &str = "10";
 pub const BITWARDEN_CLIENT_NAME: &str = "silverwarden";
@@ -521,6 +524,33 @@ impl AuthenticatedClient {
         vault_store.set_last_synced(now).await;
 
         Ok(sync_data)
+    }
+
+    /// Retrieves a single cipher by UUID from the Bitwarden API.
+    pub async fn get_cipher(&self, uuid: &uuid::Uuid) -> Result<sw_vault::Cipher, ApiError> {
+        ciphers::get_cipher(self, uuid).await
+    }
+
+    /// Creates a new cipher in the Bitwarden vault.
+    pub async fn post_cipher(
+        &self,
+        cipher: &sw_vault::Cipher,
+    ) -> Result<sw_vault::Cipher, ApiError> {
+        ciphers::post_cipher(self, cipher).await
+    }
+
+    /// Updates an existing cipher in the Bitwarden vault.
+    pub async fn put_cipher(
+        &self,
+        uuid: &uuid::Uuid,
+        cipher: &sw_vault::Cipher,
+    ) -> Result<sw_vault::Cipher, ApiError> {
+        ciphers::put_cipher(self, uuid, cipher).await
+    }
+
+    /// Deletes a cipher by UUID from the Bitwarden vault.
+    pub async fn delete_cipher(&self, uuid: &uuid::Uuid) -> Result<(), ApiError> {
+        ciphers::delete_cipher(self, uuid).await
     }
 }
 
@@ -1715,5 +1745,244 @@ mod tests {
         assert_eq!(s2.profile.email.as_deref(), Some("standalone@example.com"));
         assert!(vault_paths.vault_file().exists());
         assert!(vault_store.last_synced().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_cipher_mock() {
+        let server = MockServer::start().await;
+        let test_id = uuid::Uuid::new_v4();
+
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .and(header("Authorization", "Bearer cipher_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": test_id.to_string(),
+                "type": 1,
+                "name": valid_enc,
+                "login": {
+                    "username": valid_enc,
+                    "password": valid_enc
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let token = LoginToken {
+            access_token: "cipher_token".to_string(),
+            ..LoginToken::default()
+        };
+        let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
+
+        let cipher = get_cipher(&client, &test_id)
+            .await
+            .expect("get_cipher should succeed");
+        assert_eq!(cipher.id, Some(test_id));
+        assert_eq!(cipher.r#type, sw_vault::CipherType::Login);
+        assert!(cipher.login.is_some());
+
+        // Also test method on client
+        let cipher_method = client
+            .get_cipher(&test_id)
+            .await
+            .expect("client.get_cipher should succeed");
+        assert_eq!(cipher_method.id, Some(test_id));
+    }
+
+    #[tokio::test]
+    async fn test_post_cipher_mock() {
+        let server = MockServer::start().await;
+        let created_id = uuid::Uuid::new_v4();
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+
+        Mock::given(method("POST"))
+            .and(path("/ciphers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": created_id.to_string(),
+                "type": 1,
+                "name": valid_enc
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        let to_create = sw_vault::Cipher {
+            r#type: sw_vault::CipherType::Login,
+            ..Default::default()
+        };
+
+        let result = post_cipher(&client, &to_create)
+            .await
+            .expect("post_cipher should succeed");
+        assert_eq!(result.id, Some(created_id));
+
+        // Also test method on client
+        let result_method = client
+            .post_cipher(&to_create)
+            .await
+            .expect("client.post_cipher should succeed");
+        assert_eq!(result_method.id, Some(created_id));
+    }
+
+    #[tokio::test]
+    async fn test_put_cipher_mock() {
+        let server = MockServer::start().await;
+        let test_id = uuid::Uuid::new_v4();
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": test_id.to_string(),
+                "type": 2,
+                "name": valid_enc
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        let to_update = sw_vault::Cipher {
+            id: Some(test_id),
+            r#type: sw_vault::CipherType::Note,
+            ..Default::default()
+        };
+
+        let result = put_cipher(&client, &test_id, &to_update)
+            .await
+            .expect("put_cipher should succeed");
+        assert_eq!(result.id, Some(test_id));
+        assert_eq!(result.r#type, sw_vault::CipherType::Note);
+
+        // Also test method on client
+        let result_method = client
+            .put_cipher(&test_id, &to_update)
+            .await
+            .expect("client.put_cipher should succeed");
+        assert_eq!(result_method.id, Some(test_id));
+    }
+
+    #[tokio::test]
+    async fn test_delete_cipher_mock() {
+        let server = MockServer::start().await;
+        let test_id = uuid::Uuid::new_v4();
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        delete_cipher(&client, &test_id)
+            .await
+            .expect("delete_cipher should succeed");
+
+        // Also test method on client
+        client
+            .delete_cipher(&test_id)
+            .await
+            .expect("client.delete_cipher should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_cipher_404_error() {
+        let server = MockServer::start().await;
+        let test_id = uuid::Uuid::new_v4();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Cipher not found"))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+        let err = get_cipher(&client, &test_id).await.unwrap_err();
+        match err {
+            ApiError::Status { status, message } => {
+                assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+                assert_eq!(message, "Cipher not found");
+            }
+            other => panic!("Expected ApiError::Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cipher_api_fallback_mock() {
+        let server = MockServer::start().await;
+        let test_id = uuid::Uuid::new_v4();
+
+        // 404 on /ciphers/... but 200 on /api/ciphers/...
+        Mock::given(method("GET"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let cipher_payload = serde_json::json!({
+            "id": test_id.to_string(),
+            "type": 1,
+            "name": "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ=="
+        });
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&cipher_payload))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/ciphers"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/ciphers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&cipher_payload))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&cipher_payload))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/ciphers/{test_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let cipher = get_cipher(&client, &test_id).await.unwrap();
+        assert_eq!(cipher.id, Some(test_id));
+
+        let created = post_cipher(&client, &cipher).await.unwrap();
+        assert_eq!(created.id, Some(test_id));
+
+        let updated = put_cipher(&client, &test_id, &cipher).await.unwrap();
+        assert_eq!(updated.id, Some(test_id));
+
+        delete_cipher(&client, &test_id).await.unwrap();
     }
 }

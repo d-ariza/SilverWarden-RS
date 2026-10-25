@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use sw_crypto::EncString;
+pub use sw_crypto::{
+    decrypt_with, encrypt_with, encrypt_with_to_string, EncString, EncStringType, SymmetricKey,
+};
 use thiserror::Error;
-use uuid::Uuid;
+pub use uuid::Uuid;
 
 /// Bitwarden cipher types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -406,6 +408,27 @@ pub struct SyncData {
     pub ciphers: Vec<Cipher>,
 }
 
+/// Decrypted representation of a Bitwarden cipher with plaintext secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecryptedCipher {
+    pub id: Uuid,
+    pub name: String,
+    pub cipher_type: CipherType,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub uri: Option<String>,
+    pub notes: Option<String>,
+    pub totp: Option<String>,
+    pub favorite: bool,
+}
+
+impl Cipher {
+    /// Decrypts sensitive fields of this cipher using the provided symmetric key.
+    pub fn decrypt(&self, key: &SymmetricKey) -> Result<DecryptedCipher, VaultError> {
+        VaultStore::decrypt_cipher(self, key)
+    }
+}
+
 /// Errors that can occur during vault caching, persistence, and synchronization.
 #[derive(Error, Debug)]
 pub enum VaultError {
@@ -420,6 +443,12 @@ pub enum VaultError {
 
     #[error("API error during sync: {0}")]
     Api(String),
+
+    #[error("Crypto error: {0}")]
+    Crypto(#[from] sw_crypto::CryptoError),
+
+    #[error("UTF-8 decoding error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 
     #[error("Vault error: {0}")]
     Other(String),
@@ -710,6 +739,328 @@ impl VaultStore {
         }
         *f_guard = sync_data.folders;
         *p_guard = Some(sync_data.profile);
+    }
+
+    /// Returns all un-deleted login ciphers in the vault.
+    pub async fn get_logins(&self) -> Vec<Cipher> {
+        self.ciphers
+            .read()
+            .await
+            .values()
+            .filter(|c| c.r#type == CipherType::Login && c.deleted_date.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Blocking variant of `get_logins`.
+    pub fn blocking_get_logins(&self) -> Vec<Cipher> {
+        self.ciphers
+            .blocking_read()
+            .values()
+            .filter(|c| c.r#type == CipherType::Login && c.deleted_date.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Returns all un-deleted note ciphers in the vault.
+    pub async fn get_notes(&self) -> Vec<Cipher> {
+        self.ciphers
+            .read()
+            .await
+            .values()
+            .filter(|c| c.r#type == CipherType::Note && c.deleted_date.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Blocking variant of `get_notes`.
+    pub fn blocking_get_notes(&self) -> Vec<Cipher> {
+        self.ciphers
+            .blocking_read()
+            .values()
+            .filter(|c| c.r#type == CipherType::Note && c.deleted_date.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Finds the first login cipher matching the given filters.
+    pub async fn get_login_by_filter(
+        &self,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        username: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        let logins = self.get_logins().await;
+        Self::filter_logins(logins, uuid, org_id, name, username, key)
+    }
+
+    /// Blocking variant of `get_login_by_filter`.
+    pub fn blocking_get_login_by_filter(
+        &self,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        username: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        let logins = self.blocking_get_logins();
+        Self::filter_logins(logins, uuid, org_id, name, username, key)
+    }
+
+    fn filter_logins(
+        logins: Vec<Cipher>,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        username: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        for cipher in logins {
+            if let Some(expected_id) = uuid {
+                if cipher.id.as_ref() != Some(expected_id) {
+                    continue;
+                }
+            }
+            if let Some(expected_org) = org_id {
+                if cipher.organization_id.as_ref() != Some(expected_org) {
+                    continue;
+                }
+            }
+            if let Some(expected_name) = name {
+                if cipher.name.is_null() {
+                    continue;
+                }
+                match sw_crypto::decrypt_with(&cipher.name, key) {
+                    Ok(bytes) => {
+                        if let Ok(dec_name) = String::from_utf8(bytes) {
+                            if dec_name != expected_name {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if let Some(expected_username) = username {
+                let login_match = match &cipher.login {
+                    Some(login) => match &login.username {
+                        Some(enc_un) if !enc_un.is_null() => {
+                            match sw_crypto::decrypt_with(enc_un, key) {
+                                Ok(bytes) => match String::from_utf8(bytes) {
+                                    Ok(dec_un) => dec_un == expected_username,
+                                    Err(_) => false,
+                                },
+                                Err(_) => false,
+                            }
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                };
+                if !login_match {
+                    continue;
+                }
+            }
+            return Some(cipher);
+        }
+        None
+    }
+
+    /// Finds the first note cipher matching the given filters.
+    pub async fn get_note_by_filter(
+        &self,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        let notes = self.get_notes().await;
+        Self::filter_notes(notes, uuid, org_id, name, key)
+    }
+
+    /// Blocking variant of `get_note_by_filter`.
+    pub fn blocking_get_note_by_filter(
+        &self,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        let notes = self.blocking_get_notes();
+        Self::filter_notes(notes, uuid, org_id, name, key)
+    }
+
+    fn filter_notes(
+        notes: Vec<Cipher>,
+        uuid: Option<&Uuid>,
+        org_id: Option<&Uuid>,
+        name: Option<&str>,
+        key: &SymmetricKey,
+    ) -> Option<Cipher> {
+        for cipher in notes {
+            if let Some(expected_id) = uuid {
+                if cipher.id.as_ref() != Some(expected_id) {
+                    continue;
+                }
+            }
+            if let Some(expected_org) = org_id {
+                if cipher.organization_id.as_ref() != Some(expected_org) {
+                    continue;
+                }
+            }
+            if let Some(expected_name) = name {
+                if cipher.name.is_null() {
+                    continue;
+                }
+                match sw_crypto::decrypt_with(&cipher.name, key) {
+                    Ok(bytes) => {
+                        if let Ok(dec_name) = String::from_utf8(bytes) {
+                            if dec_name != expected_name {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            return Some(cipher);
+        }
+        None
+    }
+
+    /// Decrypts sensitive fields of a cipher on demand using the provided symmetric key.
+    ///
+    /// Synchronous method as decryption is CPU-bound.
+    pub fn decrypt_cipher(
+        cipher: &Cipher,
+        key: &SymmetricKey,
+    ) -> Result<DecryptedCipher, VaultError> {
+        if cipher.name.is_null() {
+            return Err(VaultError::Other(
+                "Cipher name is missing or empty".to_string(),
+            ));
+        }
+        let name_bytes = sw_crypto::decrypt_with(&cipher.name, key)?;
+        let name = String::from_utf8(name_bytes)?;
+
+        let mut username = None;
+        let mut password = None;
+        let mut uri = None;
+        let mut totp = None;
+
+        if let Some(ref login) = cipher.login {
+            if let Some(ref enc_un) = login.username {
+                if !enc_un.is_null() {
+                    let bytes = sw_crypto::decrypt_with(enc_un, key)?;
+                    username = Some(String::from_utf8(bytes)?);
+                }
+            }
+            if let Some(ref enc_pw) = login.password {
+                if !enc_pw.is_null() {
+                    let bytes = sw_crypto::decrypt_with(enc_pw, key)?;
+                    password = Some(String::from_utf8(bytes)?);
+                }
+            }
+            if let Some(ref enc_uri) = login.uri {
+                if !enc_uri.is_null() {
+                    let bytes = sw_crypto::decrypt_with(enc_uri, key)?;
+                    uri = Some(String::from_utf8(bytes)?);
+                } else {
+                    uri = login.uris.first().and_then(|u| u.uri.clone());
+                }
+            } else {
+                uri = login.uris.first().and_then(|u| u.uri.clone());
+            }
+            if let Some(ref enc_totp) = login.totp {
+                if !enc_totp.is_null() {
+                    let bytes = sw_crypto::decrypt_with(enc_totp, key)?;
+                    totp = Some(String::from_utf8(bytes)?);
+                }
+            }
+        }
+
+        let mut notes = None;
+        if let Some(ref enc_notes) = cipher.notes {
+            if !enc_notes.is_null() {
+                let bytes = sw_crypto::decrypt_with(enc_notes, key)?;
+                notes = Some(String::from_utf8(bytes)?);
+            }
+        }
+
+        Ok(DecryptedCipher {
+            id: cipher.id.unwrap_or_default(),
+            name,
+            cipher_type: cipher.r#type,
+            username,
+            password,
+            uri,
+            notes,
+            totp,
+            favorite: cipher.favorite,
+        })
+    }
+
+    /// Searches active logins and notes whose decrypted name or username matches `filter`.
+    pub async fn search(&self, filter: &str, key: &SymmetricKey) -> Vec<DecryptedCipher> {
+        let ciphers = self.ciphers.read().await;
+        let active_ciphers: Vec<Cipher> = ciphers
+            .values()
+            .filter(|c| {
+                c.deleted_date.is_none()
+                    && (c.r#type == CipherType::Login || c.r#type == CipherType::Note)
+            })
+            .cloned()
+            .collect();
+        drop(ciphers);
+
+        Self::filter_search(active_ciphers, filter, key)
+    }
+
+    /// Blocking variant of `search`.
+    pub fn blocking_search(&self, filter: &str, key: &SymmetricKey) -> Vec<DecryptedCipher> {
+        let ciphers = self.ciphers.blocking_read();
+        let active_ciphers: Vec<Cipher> = ciphers
+            .values()
+            .filter(|c| {
+                c.deleted_date.is_none()
+                    && (c.r#type == CipherType::Login || c.r#type == CipherType::Note)
+            })
+            .cloned()
+            .collect();
+        drop(ciphers);
+
+        Self::filter_search(active_ciphers, filter, key)
+    }
+
+    fn filter_search(
+        ciphers: Vec<Cipher>,
+        filter: &str,
+        key: &SymmetricKey,
+    ) -> Vec<DecryptedCipher> {
+        let filter_lower = filter.to_lowercase();
+        let mut results = Vec::new();
+
+        for cipher in ciphers {
+            if let Ok(dec) = Self::decrypt_cipher(&cipher, key) {
+                let name_matches =
+                    dec.name.contains(filter) || dec.name.to_lowercase().contains(&filter_lower);
+                let username_matches = dec.username.as_deref().is_some_and(|u| {
+                    u.contains(filter) || u.to_lowercase().contains(&filter_lower)
+                });
+
+                if name_matches || username_matches {
+                    results.push(dec);
+                }
+            }
+        }
+
+        results
     }
 }
 
@@ -1200,5 +1551,615 @@ mod tests {
         assert_eq!(SecureNoteType::from(10), SecureNoteType::Other(10));
         assert_eq!(i32::from(SecureNoteType::Generic), 0);
         assert_eq!(i32::from(SecureNoteType::Other(10)), 10);
+    }
+
+    // --- SW-036 Test Helpers and Tests ---
+
+    pub(crate) fn make_test_key() -> SymmetricKey {
+        SymmetricKey::from_bytes(&[0x42u8; 64]).expect("Failed to create 64-byte symmetric key")
+    }
+
+    pub(crate) fn make_encrypted_cipher(
+        key: &SymmetricKey,
+        name: &str,
+        username: &str,
+        password: &str,
+    ) -> Cipher {
+        let enc_name = encrypt_with(name.as_bytes(), EncStringType::AesCbc256HmacSha256B64, key)
+            .expect("encrypt name");
+        let enc_user = encrypt_with(
+            username.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            key,
+        )
+        .expect("encrypt username");
+        let enc_pass = encrypt_with(
+            password.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            key,
+        )
+        .expect("encrypt password");
+
+        Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Login,
+            name: enc_name,
+            login: Some(LoginCipher {
+                username: Some(enc_user),
+                password: Some(enc_pass),
+                ..Default::default()
+            }),
+            deleted_date: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vault_store_get_logins() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        // 3 logins
+        let l1 = make_encrypted_cipher(&key, "Site 1", "user1", "pass1");
+        let l2 = make_encrypted_cipher(&key, "Site 2", "user2", "pass2");
+        let l3 = make_encrypted_cipher(&key, "Site 3", "user3", "pass3");
+
+        // 1 note
+        let mut note = make_encrypted_cipher(&key, "My Note", "user", "pass");
+        note.r#type = CipherType::Note;
+        note.login = None;
+
+        // 1 deleted cipher
+        let mut deleted = make_encrypted_cipher(&key, "Deleted Site", "user", "pass");
+        deleted.deleted_date = Some("2026-10-24T00:00:00Z".to_string());
+
+        store.insert(l1).await;
+        store.insert(l2).await;
+        store.insert(l3).await;
+        store.insert(note).await;
+        store.insert(deleted).await;
+
+        let logins = store.get_logins().await;
+        assert_eq!(logins.len(), 3);
+        for login in &logins {
+            assert_eq!(login.r#type, CipherType::Login);
+            assert!(login.deleted_date.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vault_store_get_notes() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        // 3 notes
+        let mut n1 = make_encrypted_cipher(&key, "Note 1", "u", "p");
+        n1.r#type = CipherType::Note;
+        n1.login = None;
+
+        let mut n2 = make_encrypted_cipher(&key, "Note 2", "u", "p");
+        n2.r#type = CipherType::Note;
+        n2.login = None;
+
+        let mut n3 = make_encrypted_cipher(&key, "Note 3", "u", "p");
+        n3.r#type = CipherType::Note;
+        n3.login = None;
+
+        // 1 login
+        let l1 = make_encrypted_cipher(&key, "Site 1", "user1", "pass1");
+
+        // 1 deleted note
+        let mut deleted_note = make_encrypted_cipher(&key, "Deleted Note", "u", "p");
+        deleted_note.r#type = CipherType::Note;
+        deleted_note.deleted_date = Some("2026-10-24T00:00:00Z".to_string());
+
+        store.insert(n1).await;
+        store.insert(n2).await;
+        store.insert(n3).await;
+        store.insert(l1).await;
+        store.insert(deleted_note).await;
+
+        let notes = store.get_notes().await;
+        assert_eq!(notes.len(), 3);
+        for note in &notes {
+            assert_eq!(note.r#type, CipherType::Note);
+            assert!(note.deleted_date.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_login_by_filter_name() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        let l1 = make_encrypted_cipher(&key, "GitHub", "octocat", "pass1");
+        let l2 = make_encrypted_cipher(&key, "GitLab", "gitlab_user", "pass2");
+        let l1_id = l1.id;
+
+        store.insert(l1).await;
+        store.insert(l2).await;
+
+        // Matching name
+        let found = store
+            .get_login_by_filter(None, None, Some("GitHub"), None, &key)
+            .await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, l1_id);
+
+        // Non-matching name
+        let not_found = store
+            .get_login_by_filter(None, None, Some("Bitbucket"), None, &key)
+            .await;
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_login_by_filter_username() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        let l1 = make_encrypted_cipher(&key, "Service A", "alice@example.com", "pass1");
+        let l2 = make_encrypted_cipher(&key, "Service B", "bob@example.com", "pass2");
+        let l2_id = l2.id;
+
+        store.insert(l1).await;
+        store.insert(l2).await;
+
+        // Matching username
+        let found = store
+            .get_login_by_filter(None, None, None, Some("bob@example.com"), &key)
+            .await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, l2_id);
+
+        // Filter by uuid and username matching
+        let found_with_id = store
+            .get_login_by_filter(l2_id.as_ref(), None, None, Some("bob@example.com"), &key)
+            .await;
+        assert!(found_with_id.is_some());
+
+        // Non-matching username
+        let not_found = store
+            .get_login_by_filter(None, None, None, Some("charlie@example.com"), &key)
+            .await;
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_note_by_filter() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        let mut n1 = make_encrypted_cipher(&key, "Meeting Notes", "u", "p");
+        n1.r#type = CipherType::Note;
+        n1.login = None;
+        let org_uuid = Uuid::new_v4();
+        n1.organization_id = Some(org_uuid);
+        let n1_id = n1.id;
+
+        store.insert(n1).await;
+
+        // Filter by name and org
+        let found = store
+            .get_note_by_filter(None, Some(&org_uuid), Some("Meeting Notes"), &key)
+            .await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, n1_id);
+
+        // Non-matching
+        let not_found = store
+            .get_note_by_filter(None, None, Some("Other Note"), &key)
+            .await;
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_decrypt_cipher_full() {
+        let key = make_test_key();
+        let cipher_id = Uuid::new_v4();
+
+        let enc_name =
+            encrypt_with(b"Bank Login", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_user =
+            encrypt_with(b"bankuser", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_pass =
+            encrypt_with(b"P@ssword123!", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_uri = encrypt_with(
+            b"https://bank.example.com",
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_notes =
+            encrypt_with(b"PIN: 9876", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_totp = encrypt_with(
+            b"JBSWY3DPEHPK3PXP",
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+
+        let cipher = Cipher {
+            id: Some(cipher_id),
+            r#type: CipherType::Login,
+            name: enc_name,
+            favorite: true,
+            notes: Some(enc_notes),
+            login: Some(LoginCipher {
+                username: Some(enc_user),
+                password: Some(enc_pass),
+                uri: Some(enc_uri),
+                totp: Some(enc_totp),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Decrypt using VaultStore::decrypt_cipher
+        let dec = VaultStore::decrypt_cipher(&cipher, &key).expect("Decryption must succeed");
+
+        assert_eq!(dec.id, cipher_id);
+        assert_eq!(dec.name, "Bank Login");
+        assert_eq!(dec.cipher_type, CipherType::Login);
+        assert_eq!(dec.username.as_deref(), Some("bankuser"));
+        assert_eq!(dec.password.as_deref(), Some("P@ssword123!"));
+        assert_eq!(dec.uri.as_deref(), Some("https://bank.example.com"));
+        assert_eq!(dec.notes.as_deref(), Some("PIN: 9876"));
+        assert_eq!(dec.totp.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        assert!(dec.favorite);
+
+        // Also test cipher.decrypt(&key) convenience method
+        let dec2 = cipher
+            .decrypt(&key)
+            .expect("Convenience decrypt must succeed");
+        assert_eq!(dec, dec2);
+    }
+
+    #[test]
+    fn test_decrypt_cipher_with_null_fields() {
+        let key = make_test_key();
+        let cipher_id = Uuid::new_v4();
+
+        let enc_name =
+            encrypt_with(b"Empty Note", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+
+        let cipher = Cipher {
+            id: Some(cipher_id),
+            r#type: CipherType::Note,
+            name: enc_name,
+            favorite: false,
+            notes: None,
+            login: None,
+            ..Default::default()
+        };
+
+        let dec = VaultStore::decrypt_cipher(&cipher, &key).expect("Decryption must succeed");
+
+        assert_eq!(dec.id, cipher_id);
+        assert_eq!(dec.name, "Empty Note");
+        assert_eq!(dec.cipher_type, CipherType::Note);
+        assert_eq!(dec.username, None);
+        assert_eq!(dec.password, None);
+        assert_eq!(dec.uri, None);
+        assert_eq!(dec.notes, None);
+        assert_eq!(dec.totp, None);
+        assert!(!dec.favorite);
+    }
+
+    #[test]
+    fn test_decrypt_cipher_error_on_null_name() {
+        let key = make_test_key();
+        let cipher = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Note,
+            name: EncString::default(),
+            ..Default::default()
+        };
+
+        let res = VaultStore::decrypt_cipher(&cipher, &key);
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_search_matches_name_and_username() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        let l1 = make_encrypted_cipher(&key, "GitHub Production", "devops_lead", "pass1");
+        let l2 = make_encrypted_cipher(&key, "AWS Console", "github-sync-bot", "pass2");
+        let mut note = make_encrypted_cipher(&key, "Secret Database Notes", "none", "none");
+        note.r#type = CipherType::Note;
+        note.login = None;
+
+        let mut deleted = make_encrypted_cipher(&key, "GitHub Staging", "staging_user", "pass");
+        deleted.deleted_date = Some("2026-10-24T00:00:00Z".to_string());
+
+        store.insert(l1).await;
+        store.insert(l2).await;
+        store.insert(note).await;
+        store.insert(deleted).await;
+
+        // Search matching name ("GitHub") -> should match l1 by name and l2 by username ("github-sync-bot"), ignoring deleted
+        let results = store.search("GitHub", &key).await;
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"GitHub Production"));
+        assert!(names.contains(&"AWS Console"));
+
+        // Search matching username ("devops") -> should match l1
+        let devops_results = store.search("devops", &key).await;
+        assert_eq!(devops_results.len(), 1);
+        assert_eq!(devops_results[0].name, "GitHub Production");
+
+        // Search matching note by name ("Database")
+        let db_results = store.search("Database", &key).await;
+        assert_eq!(db_results.len(), 1);
+        assert_eq!(db_results[0].name, "Secret Database Notes");
+
+        // Search non-existent
+        let empty_results = store.search("NoSuchEntry12345", &key).await;
+        assert!(empty_results.is_empty());
+    }
+
+    #[test]
+    fn test_vault_store_blocking_filtering_and_search() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+
+        let l1 = make_encrypted_cipher(&key, "GitHub", "octocat", "pass1");
+        let mut n1 = make_encrypted_cipher(&key, "Meeting Notes", "u", "p");
+        n1.r#type = CipherType::Note;
+        n1.login = None;
+        let n1_id = n1.id;
+        let l1_id = l1.id;
+
+        store.blocking_insert(l1);
+        store.blocking_insert(n1);
+
+        assert_eq!(store.blocking_get_logins().len(), 1);
+        assert_eq!(store.blocking_get_notes().len(), 1);
+
+        let found_login =
+            store.blocking_get_login_by_filter(None, None, Some("GitHub"), None, &key);
+        assert_eq!(found_login.unwrap().id, l1_id);
+
+        let found_note = store.blocking_get_note_by_filter(n1_id.as_ref(), None, None, &key);
+        assert_eq!(found_note.unwrap().id, n1_id);
+
+        let search_res = store.blocking_search("Git", &key);
+        assert_eq!(search_res.len(), 1);
+        assert_eq!(search_res[0].name, "GitHub");
+    }
+
+    #[test]
+    fn test_vault_errors_display() {
+        let err_api = VaultError::Api("sync timeout".into());
+        assert!(format!("{err_api}").contains("sync timeout"));
+
+        let err_other = VaultError::Other("custom error".into());
+        assert!(format!("{err_other}").contains("custom error"));
+
+        let err_crypto = VaultError::Crypto(sw_crypto::CryptoError::InvalidKeyLength(
+            "32 bytes expected".into(),
+        ));
+        assert!(format!("{err_crypto}").contains("32 bytes expected"));
+
+        let utf8_err = String::from_utf8(vec![0xFF]).unwrap_err();
+        let err_utf8 = VaultError::Utf8(utf8_err);
+        assert!(format!("{err_utf8}").contains("UTF-8"));
+    }
+
+    #[test]
+    fn test_vault_paths_default_paths() {
+        let paths = VaultPaths::default_paths();
+        if let Ok(p) = paths {
+            assert!(p.vault_file().ends_with("vault.json"));
+        }
+    }
+
+    #[test]
+    fn test_decrypt_cipher_uri_fallback_and_login_cases() {
+        let key = make_test_key();
+        let id = Uuid::new_v4();
+
+        // Case 1: login.uri is null EncString, but login.uris has a URI
+        let enc_name = encrypt_with(
+            b"Test URI Fallback",
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let cipher1 = Cipher {
+            id: Some(id),
+            r#type: CipherType::Login,
+            name: enc_name.clone(),
+            login: Some(LoginCipher {
+                uri: Some(EncString::default()),
+                uris: vec![URI {
+                    uri: Some("https://uris-fallback.example.com".into()),
+                    r#match: Some(URIMatch::Domain),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dec1 = VaultStore::decrypt_cipher(&cipher1, &key).unwrap();
+        assert_eq!(
+            dec1.uri.as_deref(),
+            Some("https://uris-fallback.example.com")
+        );
+
+        // Case 2: login.uri is None, and login.uris has a URI
+        let cipher2 = Cipher {
+            id: Some(id),
+            r#type: CipherType::Login,
+            name: enc_name.clone(),
+            login: Some(LoginCipher {
+                uri: None,
+                uris: vec![URI {
+                    uri: Some("https://uris-none.example.com".into()),
+                    r#match: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dec2 = VaultStore::decrypt_cipher(&cipher2, &key).unwrap();
+        assert_eq!(dec2.uri.as_deref(), Some("https://uris-none.example.com"));
+
+        // Case 3: login.uri is None, login.uris is empty
+        let cipher3 = Cipher {
+            id: Some(id),
+            r#type: CipherType::Login,
+            name: enc_name,
+            login: Some(LoginCipher {
+                uri: None,
+                uris: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dec3 = VaultStore::decrypt_cipher(&cipher3, &key).unwrap();
+        assert_eq!(dec3.uri, None);
+    }
+
+    #[tokio::test]
+    async fn test_filter_edge_cases() {
+        let store = VaultStore::new();
+        let key = make_test_key();
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+
+        let mut l1 = make_encrypted_cipher(&key, "Alpha", "user_alpha", "pass");
+        l1.organization_id = Some(org_a);
+
+        let mut l2 = make_encrypted_cipher(&key, "Beta", "user_beta", "pass");
+        l2.organization_id = Some(org_b);
+
+        // Cipher with no login
+        let mut l_no_login = make_encrypted_cipher(&key, "NoLogin", "none", "pass");
+        l_no_login.login = None;
+
+        // Cipher with null username
+        let mut l_null_un = make_encrypted_cipher(&key, "NullUser", "none", "pass");
+        l_null_un.login = Some(LoginCipher {
+            username: Some(EncString::default()),
+            ..Default::default()
+        });
+
+        // Cipher with null name
+        let l_null_name = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Login,
+            name: EncString::default(),
+            ..Default::default()
+        };
+
+        store.insert(l1.clone()).await;
+        store.insert(l2.clone()).await;
+        store.insert(l_no_login).await;
+        store.insert(l_null_un).await;
+        store.insert(l_null_name).await;
+
+        // Match with org_id
+        let found_org = store
+            .get_login_by_filter(None, Some(&org_a), None, None, &key)
+            .await;
+        assert_eq!(found_org.unwrap().id, l1.id);
+
+        // Org mismatch
+        let nonexistent_org = Uuid::new_v4();
+        let not_found_org = store
+            .get_login_by_filter(None, Some(&nonexistent_org), None, None, &key)
+            .await;
+        assert!(not_found_org.is_none());
+
+        // Username filter on cipher without login
+        let not_found_user = store
+            .get_login_by_filter(None, None, Some("NoLogin"), Some("any"), &key)
+            .await;
+        assert!(not_found_user.is_none());
+
+        // Username filter on cipher with null username
+        let not_found_null_user = store
+            .get_login_by_filter(None, None, Some("NullUser"), Some("any"), &key)
+            .await;
+        assert!(not_found_null_user.is_none());
+
+        // Note filter edge cases
+        let mut note = make_encrypted_cipher(&key, "Special Note", "u", "p");
+        note.r#type = CipherType::Note;
+        note.login = None;
+        note.organization_id = Some(org_a);
+        let note_id = note.id.unwrap();
+        store.insert(note).await;
+
+        // Note filter with uuid
+        let found_note_id = store
+            .get_note_by_filter(Some(&note_id), None, None, &key)
+            .await;
+        assert!(found_note_id.is_some());
+
+        // Note filter with mismatched uuid
+        let wrong_id = Uuid::new_v4();
+        let not_found_note_id = store
+            .get_note_by_filter(Some(&wrong_id), None, None, &key)
+            .await;
+        assert!(not_found_note_id.is_none());
+
+        // Note filter with mismatched org
+        let not_found_note_org = store
+            .get_note_by_filter(None, Some(&org_b), None, &key)
+            .await;
+        assert!(not_found_note_org.is_none());
+    }
+
+    #[test]
+    fn test_all_enum_conversions() {
+        // CipherType
+        for (i, ct) in [
+            (1, CipherType::Login),
+            (2, CipherType::Note),
+            (3, CipherType::Card),
+            (4, CipherType::Identity),
+            (5, CipherType::SshKey),
+        ] {
+            assert_eq!(CipherType::try_from(i).unwrap(), ct);
+            assert_eq!(i32::from(ct), i);
+        }
+        assert!(CipherType::try_from(0).is_err());
+        assert!(CipherType::try_from(6).is_err());
+
+        // FieldType
+        for (i, ft) in [
+            (0, FieldType::Text),
+            (1, FieldType::Hidden),
+            (2, FieldType::Boolean),
+            (3, FieldType::Linked),
+            (99, FieldType::Other(99)),
+        ] {
+            assert_eq!(FieldType::from(i), ft);
+            assert_eq!(i32::from(ft), i);
+        }
+
+        // URIMatch
+        for (i, um) in [
+            (0, URIMatch::Domain),
+            (1, URIMatch::Host),
+            (2, URIMatch::StartsWith),
+            (3, URIMatch::Exact),
+            (4, URIMatch::RegularExpression),
+            (5, URIMatch::Never),
+            (99, URIMatch::Other(99)),
+        ] {
+            assert_eq!(URIMatch::from(i), um);
+            assert_eq!(i32::from(um), i);
+        }
+
+        // SecureNoteType
+        assert_eq!(SecureNoteType::from(0), SecureNoteType::Generic);
+        assert_eq!(i32::from(SecureNoteType::Generic), 0);
+        assert_eq!(SecureNoteType::from(99), SecureNoteType::Other(99));
+        assert_eq!(i32::from(SecureNoteType::Other(99)), 99);
     }
 }

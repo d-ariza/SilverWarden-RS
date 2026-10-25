@@ -1239,6 +1239,74 @@ PASS
 
 **Estado:** ✅ SW-032 — Hecho (2026-10-24).
 
+---
+
+### 4.7 Evidencia de Ejecución: [SW-036] CRUD de ciphers y descifrado bajo demanda
+
+**Fecha:** 2026-10-24  
+**Crates afectados:** `sw-bitwarden-api` (CRUD REST) y `sw-vault` (operaciones locales y descifrado bajo demanda).
+
+#### Archivos modificados y creados:
+- `crates/sw-bitwarden-api/Cargo.toml`:
+  - Promoción de `uuid = { workspace = true }` a dependencia principal en `[dependencies]`.
+- `crates/sw-bitwarden-api/src/ciphers.rs` (nuevo):
+  - `get_cipher(client: &AuthenticatedClient, uuid: &Uuid) -> Result<Cipher, ApiError>`: GET a `/ciphers/{uuid}` vía `fetch_with_auth` con fallback a `/api/ciphers/{uuid}`.
+  - `post_cipher(client: &AuthenticatedClient, cipher: &Cipher) -> Result<Cipher, ApiError>`: POST a `/ciphers` con JSON serializado y fallback a `/api/ciphers`.
+  - `put_cipher(client: &AuthenticatedClient, uuid: &Uuid, cipher: &Cipher) -> Result<Cipher, ApiError>`: PUT a `/ciphers/{uuid}` con JSON y fallback a `/api/ciphers/{uuid}`.
+  - `delete_cipher(client: &AuthenticatedClient, uuid: &Uuid) -> Result<(), ApiError>`: DELETE a `/ciphers/{uuid}` con fallback a `/api/ciphers/{uuid}`.
+- `crates/sw-bitwarden-api/src/lib.rs`:
+  - Declaración `pub mod ciphers;` y re-exportación de funciones CRUD.
+  - Métodos asociados en `AuthenticatedClient`: `client.get_cipher(uuid)`, `client.post_cipher(cipher)`, `client.put_cipher(uuid, cipher)`, `client.delete_cipher(uuid)`.
+  - Batería de pruebas con `wiremock`:
+    - `test_get_cipher_mock`: mock devuelve `Cipher` de prueba, verificación de deserialización y campos.
+    - `test_post_cipher_mock`: mock recibe POST, devuelve `Cipher` con id generado.
+    - `test_put_cipher_mock`: mock recibe PUT, devuelve `Cipher` actualizado.
+    - `test_delete_cipher_mock`: mock recibe DELETE, devuelve 200.
+    - `test_cipher_404_error`: mock devuelve 404, verificación de `ApiError::Status`.
+    - `test_cipher_api_fallback_mock`: verificación de fallback transparente a prefijo `/api/ciphers`.
+- `crates/sw-vault/src/lib.rs`:
+  - Struct `DecryptedCipher` con campos requeridos: `id`, `name`, `cipher_type`, `username`, `password`, `uri`, `notes`, `totp`, `favorite`.
+  - Re-exportación de `sw_crypto` (`decrypt_with`, `encrypt_with`, `encrypt_with_to_string`, `EncString`, `EncStringType`, `SymmetricKey`) y `uuid::Uuid`.
+  - Ampliación de `VaultError` con variantes tipadas: `Crypto(#[from] sw_crypto::CryptoError)` y `Utf8(#[from] std::string::FromUtf8Error)`.
+  - Implementación en `VaultStore`:
+    - `get_logins(&self) -> Vec<Cipher>` (async) y `blocking_get_logins(&self) -> Vec<Cipher>`.
+    - `get_notes(&self) -> Vec<Cipher>` (async) y `blocking_get_notes(&self) -> Vec<Cipher>`.
+    - `get_login_by_filter(&self, uuid, org_id, name, username, key) -> Option<Cipher>` (async) y variante bloqueante.
+    - `get_note_by_filter(&self, uuid, org_id, name, key) -> Option<Cipher>` (async) y variante bloqueante.
+    - `decrypt_cipher(cipher: &Cipher, key: &SymmetricKey) -> Result<DecryptedCipher, VaultError>`: síncrono (CPU-bound) con descifrado obligatorio de `name` y condicional de `username`, `password`, `uri` (con fallback a `uris`), `notes`, `totp`.
+    - `search(&self, filter: &str, key: &SymmetricKey) -> Vec<DecryptedCipher>` (async) y variante bloqueante.
+    - Método de conveniencia `Cipher::decrypt(&self, key: &SymmetricKey) -> Result<DecryptedCipher, VaultError>`.
+  - Pruebas unitarias obligatorias completadas (26 pruebas en total en `sw-vault`):
+    - `test_vault_store_get_logins`: almacén con 3 logins, 1 nota, 1 cipher borrado; verifica que devuelve 3 activos.
+    - `test_vault_store_get_notes`: idem con notas activas y borradas.
+    - `test_get_login_by_filter_name`: descifrado bajo demanda y filtrado por nombre exacto.
+    - `test_get_login_by_filter_username`: descifrado bajo demanda y filtrado por username.
+    - `test_get_note_by_filter`: filtrado por nota, UUID y organización.
+    - `test_decrypt_cipher_full`: cifrado completo (name, username, password, uri, notes, totp), descifrado y validación integral de todos los campos.
+    - `test_decrypt_cipher_with_null_fields`: cipher sin login ni notes con `None` en campos opcionales.
+    - `test_decrypt_cipher_error_on_null_name`: rechazo controlado ante cipher con nombre nulo/vacío.
+    - `test_search_matches_name_and_username`: búsqueda insensible y por subcadena en name y username, ignorando ciphers eliminados.
+    - `test_vault_store_blocking_filtering_and_search`: validación de variantes bloqueantes sin contexto de runtime.
+    - `test_decrypt_cipher_uri_fallback_and_login_cases`: fallback de `login.uri` nulo a lista `login.uris`.
+    - `test_filter_edge_cases`: filtrado con organizaciones coincidentes y no coincidentes, ciphers sin login o con campos nulos.
+    - Helpers: `make_test_key() -> SymmetricKey` (64 bytes fijos) y `make_encrypted_cipher(...)`.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-vault` | `cargo test -p sw-vault` | 26 pasan, 0 fallan (0.01s) |
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 36 pasan, 0 fallan (23.39s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 239 pasan en total, 0 fallan |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-vault`** | `cargo llvm-cov -p sw-vault --summary-only` | **97.41% regiones / 97.98% líneas** (umbral: ≥85%) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api --summary-only` | **96.07% regiones / 97.62% líneas** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-036 — Hecho (2026-10-24).
+
+
 
 
 
