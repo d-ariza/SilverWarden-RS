@@ -102,7 +102,7 @@ Nota sobre sockets:
 | D-1 | **RustCrypto** (`aes`, `cbc`, `hmac`, `sha2`, `sha3`, `hkdf`, `argon2`, `rsa`, `chacha20poly1305`) | `ring`, `sodiumoxide` | Única opción con cobertura exacta: AES-CBC+PKCS7, RSA-OAEP-SHA1 (legacy Bitwarden), ChaCha20-Poly1305 (config), argon2 con parámetros exactos, SHA3-256 |
 | D-2 | **LockedBuffer propio** (trait `LockedBuffer`: `MemLockedBuffer` con mlock+MADV_DONTDUMP vía `rustix`, `MemoryBuffer` sin mlock) + `zeroize` | Crate `secrets`, `memsec` | Paridad con el flag `useMemguard` de Go; control total del wipe; testeable |
 | D-3 | **tokio** | async-std, smol | Ecosistema: tungstenite, reqwest, Tauri, zbus async |
-| D-4 | **Protocolo ssh-agent implementado directo** sobre el wire format OpenSSH + crate `ssh-key` para parseo de claves privadas | `russh` agent | El protocolo agente es simple (mensajes binarios length-prefixed); evitamos dependencia pesada |
+| D-4 | **russh para SSH Agent** (`russh::keys::agent::server`) con `ssh-key` para criptografía y parseo | Protocolo directo manual | Ecosistema probado y asíncrono; provee trait `Agent` con hooks estándar (`confirm_request`), gestión de conexiones y serialización OpenSSH, reduciendo bugs en el parser de wire format |
 | D-5 | **Importación única + IPC propio** (revisada) | Compatibilidad bidireccional con envelope Go | Decisión del usuario: importar una vez y seguir. Elimina tabla FNV y riesgo de interop frágil. La compatibilidad se limita a **formatos on-disk** (config, vault, claves SSH) |
 | D-6 | **Tauri v2 + Svelte 5 + TS** (parte del MVP) | Electron, GTK-rs | Tauri da empaquetado multiplataforma (msi/dmg) gratis |
 | D-7 | **zbus** (D-Bus puro Rust) | `dbus` crate (libdbus C) | Sin dependencia C; polkit y notificaciones por portal |
@@ -125,6 +125,7 @@ Nota sobre sockets:
 | D43 | **Agente obligatorio** | GUI autocontenida | La GUI no funciona si el agente no está corriendo. Muestra un mensaje claro: "Ejecuta `silverwarden agent start`" |
 | D44 | **Descifrado bajo demanda** | Descifrado masivo en memoria | El vault se guarda cifrado en disco (SW-032). En memoria, los ciphers se mantienen como `EncString` (cifrados). Se descifran solo cuando el usuario (o el agente SSH) los pide. La `user_symmetric_key` nunca se guarda en el `VaultStore`; se pasa como argumento a las funciones que descifran |
 | D45 | **Vista SSH Keys en la GUI** | Claves SSH solo por CLI | La GUI tiene una vista específica para claves SSH (M7.5). Permite listar, importar y ver la clave pública. Nunca muestra la clave privada |
+| D46 | **Gestor y ciclo de vida de claves SSH (M5)** | Manejo local en memoria | Las claves SSH se almacenan como Cipher tipo 2 (Secure Note) con campos personalizados (`ssh-key`, `public-key`, `private-key`). En reposo residen cifradas; el agente SSH solo descifra la clave privada en memoria bloqueada durante la firma (`sign_request`). Las operaciones `add_identity`/`remove_identity` y las acciones IPC de GUI (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`) sincronizan contra el servidor Bitwarden (`POST`/`DELETE /ciphers`). |
 
 ---
 
@@ -158,7 +159,7 @@ Nota sobre sockets:
 - **Milestones del proyecto:**
   - **M1–M3:** ✅ **Completados.** (Criptografía, config/migración y agente/IPC/CLI).
   - **M4:** ✅ **Completado.** (SW-030 a SW-036 cerradas y validadas; FIDO2 pospuesto).
-  - **M5:** ⏳ **Pendiente.** (SSH agent). La base (agente, IPC, vault) está lista.
+  - **M5:** ⏳ **En curso.** (SSH agent con `russh`: SW-040 a SW-046 en 4 fases ordenadas). Base de agente, IPC y vault lista.
   - **M7 (GUI):** ⏳ **Pendiente.** **Se adelanta** para que la GUI esté disponible cuanto antes (no es post-MVP). Orden: Scaffold + Status → Login/Unlock → Quickaccess → Settings → SSH Keys → Pinentry/Approval.
   - **M6, M8–M10:** Post-MVP.
 - **Repo:** rama `silverwarden-rs` en el repo Go local; se migra a repo propio en M10.
@@ -193,7 +194,7 @@ Nota sobre sockets:
 - **M2:** `goldwarden.json` real parseado y serializado sin pérdida (13 campos PascalCase); campos descifrados con Argon2i + Tink ChaCha20-Poly1305; migración de ruta legacy con permisos 0700/0600 y corrección de bug; comando `silverwarden migrate` funcional con backup `goldwarden.json.bak-<timestamp>`.
 - **M3:** el agente Rust arranca, el CLI `silverwarden` hace unlock→status→lock; importación de estado Go completada.
 - **M4:** login + sync completos contra `vault.disroot.org` con cuenta de prueba; caché en disco con paridad de formato; CRUD de ciphers funcional; websocket recibiendo notificaciones; 2FA TOTP/email.
-- **M5:** `ssh-add -L` lista claves del vault; `git commit -S` firma con aprobación; sin regresión en flags RSA.
+- **M5:** Servidor SSH Agent en `~/.silverwarden-ssh-agent.sock` (0600) con `russh`; `ssh-add -L` lista claves descifradas bajo demanda con fingerprints y comentarios idénticos a Go; `ssh -T git@github.com` y `git commit -S` firman con aprobación pinentry y sesiones (TTL 60 min); soporte completo de `ssh-add` (add/remove ciphers en servidor); acciones IPC para GUI (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`); suite completa de interop con OpenSSH real.
 - **M7 (GUI):** GUI Tauri funcional como cliente IPC del agente; vista de login, quickaccess, settings y **SSH Keys** (M7.5); agente obligatorio.
 - **M6, M8–M10 (post-MVP):** criterios en backlog por tarea.
 

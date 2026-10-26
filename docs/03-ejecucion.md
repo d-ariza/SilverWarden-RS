@@ -1421,6 +1421,31 @@ PASS
 
 **Estado:** ✅ SW-034 — Hecho (2026-10-25).
 
+---
+
+## 5. Milestone M5: Servidor SSH Agent (`sw-ssh-agent`)
+
+**Fecha de inicio:** 2026-10-26  
+**Alcance:** SW-040 a SW-046 (7 historias)  
+**Crates involucrados:** `sw-ssh-agent` (servidor russh, parsing de claves, sign), `sw-vault` (identidades y claves SSH cifradas), `sw-crypto` (memoria bloqueada LockedBuffer y operaciones criptográficas), `sw-systemauth` (contexto de procesos CallingContext, aprobaciones pinentry y sesiones SSH), `sw-agent` (acciones IPC de soporte para GUI), `sw-bitwarden-api` (CRUD de ciphers para add/remove remoto).
+
+### 5.1 Decisiones Arquitectónicas de M5
+
+- **russh para SSH Agent (D-4):** Se adopta el trait `Agent` de `russh::keys::agent::server`. Esto delega la decodificación del protocolo binario de agente OpenSSH y la gestión de conexiones asíncronas a una biblioteca probada, manteniendo hooks claros como `confirm_request`.
+- **Descifrado de claves bajo demanda (D44, D46):** En reposo, las claves SSH se almacenan cifradas en el vault (ciphers tipo 2 Secure Note con campos `ssh-key`, `public-key`, `private-key`). En memoria, `VaultAgentServer` mantiene solo las claves públicas (`AgentIdentity`). Al recibir una solicitud `sign_request`, busca la clave en el vault, descifra la clave privada en memoria bloqueada (`LockedBuffer`) con la `user_symmetric_key`, firma los datos y limpia de inmediato el buffer.
+- **Aprobación de firma y sesiones SSH (SW-043):** Toda firma requiere confirmación explícita mediante diálogo interactivo (`pinentry`) que muestra el contexto completo del árbol de procesos (`<user> on <grandparent>><parent>><process> is requesting git/ssh signage with key <name>`). Tras la aprobación, se crea una sesión SSH en `SystemAuth` con TTL de 60 minutos vinculada a los PIDs solicitantes, permitiendo que firmas subsecuentes procedan sin interrupciones.
+- **Sincronización remota en Add/Remove (SW-044):** `add_identity` y `remove_identity` no solo operan localmente, sino que crean/eliminan el Cipher correspondiente en el servidor Bitwarden (`POST /ciphers` y `DELETE /ciphers/{uuid}`), garantizando persistencia y sincronización entre dispositivos.
+- **Acciones IPC para GUI (SW-045, D42, D45):** El agente expone acciones IPC (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`) para que la interfaz gráfica Tauri (`sw-gui`) y la CLI puedan gestionar el ciclo de vida de claves SSH sin interactuar directamente con el socket del agente SSH ni exponer claves privadas.
+
+### 5.2 Plan de Desglose e Implementación M5 (4 Fases)
+
+| Fase | Historias | Enfoque | Criterio de validación |
+|---|---|---|---|
+| **Fase 1** | SW-040 + SW-041 | Servidor SSH Agent base + List de claves del vault | `ssh-add -L` responde contra `~/.silverwarden-ssh-agent.sock` y muestra identidades/fingerprints del vault. |
+| **Fase 2** | SW-042 + SW-043 | Sign / SignWithFlags + Aprobación por pinentry y sesiones SSH | `ssh -T git@github.com` y `git commit -S` firman con detección `SSHSIG`, contexto de proceso y TTL 60 min. |
+| **Fase 3** | SW-044 + SW-045 | Add/Remove OpenSSH + Acciones IPC para GUI | `ssh-add <key>` y `ssh-add -d` modifican vault local y remoto; acciones IPC para GUI (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`). |
+| **Fase 4** | SW-046 | Interoperabilidad completa y regresión | Suite E2E con OpenSSH real, paridad byte a byte con agente Go y documentación de casos límite. |
+
 
 
 

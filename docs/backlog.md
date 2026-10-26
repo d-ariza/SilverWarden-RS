@@ -590,18 +590,29 @@ Una historia pasa a `Hecho` solo cuando:
 
 ## M5 — SSH agent `sw-ssh-agent` (P0 — MVP — OBLIGATORIO)
 
-### [SW-040] Servidor ssh-agent
+**Orden de implementación:**
+1. **Fase 1:** SW-040 + SW-041 (servidor + list) — base mínima para `ssh-add -L`.
+2. **Fase 2:** SW-042 + SW-043 (sign + aprobación) — base para `ssh -T` y `git commit -S`.
+3. **Fase 3:** SW-044 + SW-045 (add/remove + acciones GUI) — gestor completo.
+4. **Fase 4:** SW-046 (interop) — validación final.
 
-**Historia:** Como usuario, quiero que silverWarden-rs exponga un ssh-agent, para usar mis claves del vault sin exportarlas a disco.
+---
 
-**Alcance:** socket `~/.goldwarden-ssh-agent.sock`, protocolo binario length-prefixed OpenSSH agent (REQUEST_IDENTITIES, SIGN_REQUEST, etc.).
+### [SW-040] Servidor SSH Agent (con russh)
 
-**Criterios de aceptación:**
-- `ssh-add -L` funciona contra el socket.
-- Protocolo cumple el wire format OpenSSH.
-- Mensajes malformados → error controlado.
+**Historia:** Como usuario, quiero que silverWarden exponga un servidor SSH Agent estándar usando `russh`, para conectar clientes SSH sin intermediarios.
 
-**Cierre:** criterio pasa con OpenSSH real; evidencia en `03-ejecucion.md`.
+**Implementación:**
+- `VaultAgentServer` que implementa el trait `Agent` de `russh::keys::agent::server`.
+- `confirm_request(msg: MessageType) -> bool`: hook que se llama para cada mensaje entrante. Aquí se decide si permitir `RequestIdentities`, `SignRequest`, `AddIdentity`, `RemoveIdentity`, etc.
+- `serve(listener, agent)` en socket Unix `~/.silverwarden-ssh-agent.sock` con permisos `0600`.
+- Limpieza automática de socket huérfano.
+
+**Criterios de aceptación / Tests:**
+- Conexión al socket Unix `~/.silverwarden-ssh-agent.sock`.
+- `ssh-add -L` responde (incluso si el vault está vacío).
+
+**Cierre:** pruebas de socket y `ssh-add -L`; evidencia en `03-ejecucion.md`.
 
 **Depende de:** SW-021, SW-032 · **Estado:** Pendiente
 
@@ -609,14 +620,16 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-041] List de claves del vault
 
-**Historia:** Como usuario, quiero ver mis claves SSH del vault listadas por el agente, para saber cuáles tengo disponibles.
+**Historia:** Como usuario, quiero ver mis claves SSH almacenadas en el vault listadas por el agente, para saber cuáles están disponibles para autenticación.
 
-**Alcance:** parseo de claves privadas OpenSSH del vault (notas con `custom-type: ssh-key` y ciphers SSHKey), comentario = nombre.
+**Implementación:**
+- `request_identities()`: descifra las claves SSH del vault (bajo demanda) y devuelve `Vec<AgentIdentity>`.
+- Cada `AgentIdentity` tiene `PublicKey` + `comment` (el nombre de la clave).
+- Si el vault está locked → devolver error o vacío (según paridad con Go).
 
-**Criterios de aceptación:**
-- Mismas claves visibles que con el agente Go en la misma cuenta.
-- Comentario = nombre de la clave.
-- Claves no parseables → error claro, no panic.
+**Criterios de aceptación / Tests:**
+- `ssh-add -L` lista las mismas claves que Go para la misma cuenta.
+- Comparar fingerprints (SHA256 y MD5) con Go.
 
 **Cierre:** comparación con agente Go verificada; evidencia en `03-ejecucion.md`.
 
@@ -626,14 +639,18 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-042] Sign + SignWithFlags
 
-**Historia:** Como usuario, quiero firmar con mis claves del vault (incluido git), para autenticarme en SSH y firmar commits sin exportar claves.
+**Historia:** Como usuario, quiero firmar solicitudes SSH y commits Git con mis claves del vault, manteniendo la clave privada protegida.
 
-**Alcance:** firma con flags rsa-sha2-256/512; detección de firma git (prefijo `SSHSIG`); default según clave.
+**Implementación:**
+- `sign_request(key, data, flags)`: busca la clave en el vault, descifra la privada bajo demanda en memoria bloqueada, firma.
+- Detectar prefijo `SSHSIG` (git) en `data`.
+- Algoritmos: `rsa-sha2-256`, `rsa-sha2-512`, default (`ssh-rsa` o ed25519 según tipo).
+- Aprobación con `pinentry` + sesión SSH (TTL 60 min).
 
-**Criterios de aceptación:**
+**Criterios de aceptación / Tests:**
 - `ssh -T git@github.com` funciona con clave del vault.
-- `git commit -S` firma correctamente.
-- Flags RSA sin regresión.
+- `git commit -S` firma commits y se verifica con `git log --show-signature`.
+- Flags RSA (`rsa-sha2-256`, `rsa-sha2-512`) operan sin regresión.
 
 **Cierre:** criterios pasan con OpenSSH/git reales; evidencia en `03-ejecucion.md`.
 
@@ -643,15 +660,18 @@ Una historia pasa a `Hecho` solo cuando:
 
 ### [SW-043] Aprobación y sesiones SSH
 
-**Historia:** Como usuario, quiero que la primera firma pida aprobación y las siguientes dentro de la sesión no, para no aprobar en cada operación.
+**Historia:** Como usuario, quiero que la primera firma solicite confirmación con contexto claro y que las siguientes dentro de la sesión no vuelvan a pedir confirmación repetitiva.
 
-**Alcance:** pinentry de aprobación con mensaje de contexto (paridad formato Go), sesión SSH 60 min, biometría/PIN fallback.
+**Implementación:**
+- `confirm()` (o `confirm_request()` en russh): pedir aprobación con `pinentry`.
+- Mensaje exacto con contexto: `"<user> on <grandparent>><parent>><process> is requesting git/ssh signage with key <name>"`.
+- Sesión SSH: `SystemAuth::GetSSHSession(ctx)` + `CreateSSHSession(ctx)` (ya implementado en M3, SW-023).
+- Segunda firma dentro de sesión activa → no pide aprobación.
 
-**Criterios de aceptación:**
-- Primera firma pide aprobación.
+**Criterios de aceptación / Tests:**
+- Primera firma pide aprobación interactiva.
 - Segunda firma dentro de la sesión no pide.
-- Mensaje de aprobación idéntico al de Go.
-- Sesión expira a los 60 min.
+- Mensaje de confirmación idéntico a Go.
 
 **Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
 
@@ -659,20 +679,65 @@ Una historia pasa a `Hecho` solo cuando:
 
 ---
 
-### [SW-044] Interop y regresión SSH
+### [SW-044] Add/Remove del protocolo SSH Agent (completo)
 
-**Historia:** Como responsable de calidad, quiero una suite que compare el comportamiento del agente Rust con el Go, para garantizar que no hay regresiones funcionales.
+**Historia:** Como usuario, quiero añadir y eliminar identidades mediante `ssh-add`, sincronizando los ciphers correspondientes con el servidor Bitwarden.
 
-**Alcance:** pruebas contra OpenSSH real (`ssh-add`, `ssh-keygen -Y sign`) + comparación con agente Go.
+**Implementación:**
+- `add_identity(key, constraints)`: recibe una clave privada, la cifra con la `user_symmetric_key`, crea un Cipher (nota segura con campos custom `ssh-key`, `public-key`, `private-key`) y lo sube al servidor (`POST /ciphers`).
+- `remove_identity(key)`: busca el cipher por fingerprint, ejecuta `DELETE /ciphers/{uuid}` al servidor.
+- `remove_all_identities()`: borra todas las claves SSH del vault (peligroso, pero implementado según especificación).
 
-**Criterios de aceptación:**
-- Evidencia en `docs/03-ejecucion.md`.
-- 0 diferencias funcionales en los casos probados.
+**Criterios de aceptación / Tests:**
+- `ssh-add ~/.ssh/test_key` → la clave aparece cifrada en el vault local y en el servidor.
+- `ssh-add -d` → la clave desaparece del vault y del servidor.
+- Sincronización entre dispositivos (validada con mock).
+
+**Cierre:** pruebas funcionales con `ssh-add` y mocks de API; evidencia en `03-ejecucion.md`.
+
+**Depende de:** SW-040, SW-036 · **Estado:** Pendiente
+
+---
+
+### [SW-045] ImportSSHKey y NewSSHKey (acciones IPC para GUI)
+
+**Historia:** Como usuario, quiero gestionar claves SSH desde la GUI o el CLI mediante acciones IPC dedicadas sin necesidad de manipular ficheros en disco.
+
+**Implementación:**
+- `ImportSSHKey`: acción IPC que recibe PEM privado + nombre, cifra y sube al servidor (`POST /ciphers`). Devuelve la clave pública.
+- `NewSSHKey`: genera par ed25519, cifra la privada, la sube al servidor y devuelve la clave pública.
+- `DeleteSSHKey`: borra por nombre o fingerprint (`DELETE /ciphers/{uuid}`).
+- `ListSSHKeys`: devuelve nombre + fingerprint + clave pública (nunca la privada).
+
+**Criterios de aceptación / Tests:**
+- Importar clave desde GUI (mock).
+- Crear nueva clave ed25519 desde GUI (mock).
+- Listar claves públicas y fingerprints.
+- Borrar clave.
+
+**Cierre:** tests unitarios y de integración para las 4 acciones IPC; evidencia en `03-ejecucion.md`.
+
+**Depende de:** SW-044, SW-021 · **Estado:** Pendiente
+
+---
+
+### [SW-046] Interop y regresión
+
+**Historia:** Como responsable de calidad, quiero una validación exhaustiva de extremo a extremo con OpenSSH real y comparación con el agente Go para asegurar paridad completa.
+
+**Implementación / Tests:**
+- Suite completa con OpenSSH real: `ssh-add`, `ssh-keygen -Y sign`, `ssh-keygen -Y verify`, `git commit -S`.
+- Comparación con agente Go.
 - Casos límite documentados.
 
-**Cierre:** criterios pasan; evidencia registrada.
+**Criterios de aceptación:**
+- Todas las operaciones OpenSSH reales operan con paridad respecto a Go.
+- Cero regresiones funcionales ni fugas de memoria/descriptores.
+- Evidencia registrada en `docs/03-ejecucion.md` y `docs/04-validacion.md`.
 
-**Depende de:** SW-043 · **Estado:** Pendiente
+**Cierre:** suite de interop completada y aprobada; evidencia registrada.
+
+**Depende de:** SW-040, SW-041, SW-042, SW-043, SW-044, SW-045 · **Estado:** Pendiente
 
 ---
 
