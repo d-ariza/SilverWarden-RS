@@ -36,11 +36,11 @@ Cada item de deuda se registra con:
 
 ## DT-3 — Add/Remove del protocolo SSH agent (SW-044)
 
-- **Descripción:** `handle_connection` rechaza `SSH2_AGENTC_ADD_IDENTITY` (17), `SSH2_AGENTC_ADD_ID_CONSTRAINED` (25), `SSH2_AGENTC_REMOVE_IDENTITY` (18), y `SSH2_AGENTC_REMOVE_ALL_IDENTITIES` (19) con `SSH_AGENT_FAILURE`.
-- **Impacto:** Medio (no se puede usar `ssh-add` para añadir/borrar claves).
+- **Descripción:** `handle_connection` soportaba solo List y Sign, rechazando `SSH2_AGENTC_ADD_IDENTITY` (17), `SSH2_AGENTC_ADD_ID_CONSTRAINED` (25), `SSH2_AGENTC_REMOVE_IDENTITY` (18), y `SSH2_AGENTC_REMOVE_ALL_IDENTITIES` (19).
+- **Impacto:** Medio (no se podía usar `ssh-add` para añadir/borrar claves).
 - **Motivo:** pendiente de SW-044.
-- **Retoma:** SW-044 (M5).
-- **Estado:** Abierta.
+- **Resolución:** Implementado en SW-044 con parsing OpenSSH KeypairData, aprobación pinentry, sincronización Bitwarden (`POST /ciphers` y `DELETE /ciphers/{uuid}`) y suite de tests con `ssh-add` real.
+- **Estado:** Cerrada (2026-10-26).
 
 ## DT-4 — Acciones IPC para la GUI (SW-045)
 
@@ -58,13 +58,12 @@ Cada item de deuda se registra con:
 - **Retoma:** M7 (post-M5).
 - **Estado:** Abierta.
 
-## DT-6 — Cobertura de `sw-ssh-agent` (87.48%)
+## DT-6 — Cobertura de `sw-ssh-agent`
 
-- **Descripción:** la cobertura de `sw-ssh-agent` está en 87.48% líneas. Hay código sin cubrir (manejo de errores de pinentry, casos borde de parseo).
-- **Impacto:** Bajo (los casos críticos están cubiertos).
-- **Motivo:** no se ha llegado al 90%+.
-- **Retoma:** cuando se implemente SW-044/045 (se añadirán tests).
-- **Estado:** Abierta.
+- **Descripción:** la cobertura de `sw-ssh-agent` estaba en 87.48% líneas.
+- **Impacto:** Bajo.
+- **Resolución:** Tras la implementación de SW-044 y su batería de 28 pruebas unitarias y de integración E2E, la cobertura alcanzó **89.92% líneas / 90.28% regiones** (superando el umbral mínimo del 85%).
+- **Estado:** Cerrada (2026-10-26).
 
 ## DT-7 — `tokio 1.53.2` con warning de `AsyncFd::new`
 

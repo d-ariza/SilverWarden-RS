@@ -5780,7 +5780,9 @@ name = "sw-ssh-agent"
 version = "0.1.0"
 dependencies = [
  "russh",
+ "serde_json",
  "ssh-key 0.6.7",
+ "sw-bitwarden-api",
  "sw-crypto",
  "sw-systemauth",
  "sw-vault",
@@ -5789,6 +5791,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

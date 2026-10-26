@@ -1549,6 +1549,65 @@ Se corrigió el mecanismo de bypass de aprobación en `DefaultApprovalProvider` 
 - Se reemplazó `test_default_approval_provider_env_bypass` por `test_default_approval_provider_no_bypass`, comprobando con un mock Assuan de `pinentry` que el proveedor solicita aprobación en producción y ejecuta el flujo de confirmación.
 - Cobertura actualizada tras el fix: **91.62% líneas / 91.71% regiones** (20 tests pasando).
 
+---
+
+### 5.5 Evidencia de Ejecución: [SW-044] Add/Remove del Protocolo SSH Agent
+
+**Fecha:** 2026-10-26  
+**Crates modificados / implementados:**
+- `crates/sw-vault`:
+  - `delete_cipher` y `blocking_delete_cipher`: eliminación de un Cipher del `VaultStore` en memoria adquiriendo lock de escritura (`write().await` y `blocking_write()`), devolviendo el `Option<Cipher>` eliminado.
+  - Tests unitarios: `test_vault_store_delete_cipher` y `test_vault_store_blocking_operations`.
+- `crates/sw-bitwarden-api`:
+  - Exportación de alias de conveniencia `pub type BitwardenApiClient = AuthenticatedClient;` para inyección de cliente API en subsistemas cliente.
+- `crates/sw-ssh-agent`:
+  - `VaultAgentServer::add_ssh_key`:
+    - Parseo de clave privada OpenSSH PEM con `russh::keys::PrivateKey::from_openssh`.
+    - Detección de duplicados en el vault comparando claves públicas contra identidades existentes (retorna `SshAgentError::InvalidMessage` si ya existe).
+    - Extracción de clave pública y cálculo de fingerprint SHA-256 (`HashAlg::Sha256`).
+    - Cifrado simétrico AES-256-CBC-HMAC-SHA256 (`EncStringType::AesCbc256HmacSha256B64`) de nombre, clave privada PEM, clave pública OpenSSH y fingerprint.
+    - Construcción de `Cipher` de tipo `CipherType::SshKey` (tipo 5).
+    - Sincronización con el servidor Bitwarden mediante `post_cipher(&cipher)` si hay un cliente API configurado (`api_client`), preservando los campos cifrados locales e insertando en `VaultStore`.
+  - Framing en `handle_connection`:
+    - `SSH2_AGENTC_ADD_IDENTITY` (17): parsea `KeypairData::decode(&mut slice)` y comentario OpenSSH, solicita aprobación al `ApprovalProvider` con mensaje interactivo `"<user> on <grandparent>><parent>><process> is adding key <comment>"`, añade la clave al vault mediante `add_ssh_key` y responde `SSH_AGENT_SUCCESS` (6) o `SSH_AGENT_FAILURE` (5).
+    - `SSH2_AGENTC_ADD_ID_CONSTRAINED` (25): parsea la clave y sus restricciones (`SSH_AGENT_CONSTRAIN_LIFETIME = 1` y `SSH_AGENT_CONSTRAIN_CONFIRM = 2`), solicita aprobación y registra la clave en el vault.
+    - `SSH2_AGENTC_REMOVE_IDENTITY` (18): parsea el key blob público, localiza el cipher correspondiente por wire blob o fingerprint SHA-256, solicita confirmación `"<user> on <grandparent>><parent>><process> is removing key <name>"`, borra del servidor (`delete_cipher`) y del `VaultStore`.
+    - `SSH2_AGENTC_REMOVE_ALL_IDENTITIES` (19): solicita aprobación `"<user> on <grandparent>><parent>><process> is removing all SSH keys"`, elimina todas las claves SSH del servidor y del vault.
+  - Actualización de `Agent::confirm_request`:
+    - `RequestKeys` -> true
+    - `AddKeys` -> true
+    - `Sign` -> true
+    - `RemoveKeys` -> true
+    - `RemoveAllKeys` -> true
+    - `Lock` / `Unlock` -> false
+
+#### Pruebas realizadas
+
+1. `test_vault_store_delete_cipher` (`sw-vault`): inserción de cipher en vault, borrado con `delete_cipher`, verificación de que ya no existe.
+2. `test_add_ssh_key_ed25519`: llamada directa a `add_ssh_key` con clave Ed25519 generada sintéticamente, validación de la `PublicKey` devuelta y verificación de persistencia en `VaultStore`.
+3. `test_ssh_add_duplicate`: intento de añadir la misma clave dos veces, verificando que la segunda llamada retorna error de duplicado.
+4. `test_add_requires_approval`: cliente SSH que envía `add_identity` contra agente con aprobación denegada (`MockApprovalProvider::new(false)`), verificando respuesta `SSH_AGENT_FAILURE` y registro del mensaje de aprobación.
+5. `test_ssh_add_command`: integración E2E con el binario real `/usr/bin/ssh-add <keyfile>` contra el socket Unix (permisos `0o600`), comprobando adición exitosa y listado con `/usr/bin/ssh-add -L`.
+6. `test_add_constrained_lifetime`: ejecución real de `ssh-add -t 60 <keyfile>`, validando procesamiento de `ADD_ID_CONSTRAINED` con lifetime de 60 segundos.
+7. `test_ssh_add_d_command`: ejecución real de `ssh-add -d <pubkeyfile>`, verificando eliminación selectiva de la identidad en el vault sin alterar otras claves.
+8. `test_ssh_add_remove_all`: ejecución real de `ssh-add -D`, verificando eliminación completa de todas las identidades del vault (`ssh-add -L` reporta exit 1 con `"The agent has no identities."`).
+9. `test_ssh_add_full_cycle`: ciclo de vida completo con comandos reales OpenSSH: `ssh-add` -> `ssh-add -L` (clave presente) -> `ssh-add -d` -> `ssh-add -L` (clave ausente).
+10. `test_ssh_add_syncs_to_server`: prueba con servidor simulado WireMock verificando que `ssh-add` ejecuta `POST /ciphers` (guardando el UUID retornado por el servidor en el vault) y `ssh-add -d` ejecuta `DELETE /ciphers/{uuid}` contra el endpoint remoto.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-ssh-agent` | `cargo test -p sw-ssh-agent` | 28 pasan, 0 fallan (0.34s) |
+| Pruebas `sw-vault` | `cargo test -p sw-vault` | 28 pasan, 0 fallan (0.01s) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui` | 290+ pasan, 0 fallan |
+| Linter | `cargo clippy -p sw-ssh-agent -p sw-vault --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-ssh-agent`** | `cargo llvm-cov -p sw-ssh-agent` | **89.92% líneas / 90.28% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-044 — Hecho (2026-10-26).
+
 
 
 

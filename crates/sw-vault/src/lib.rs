@@ -658,6 +658,16 @@ impl VaultStore {
         self.ciphers.write().await.remove(id)
     }
 
+    /// Removes a cipher by its UUID from the in-memory VaultStore (with write lock).
+    pub async fn delete_cipher(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.write().await.remove(id)
+    }
+
+    /// Synchronous variant of `delete_cipher`.
+    pub fn blocking_delete_cipher(&self, id: &Uuid) -> Option<Cipher> {
+        self.ciphers.blocking_write().remove(id)
+    }
+
     /// Returns a list of all ciphers currently in memory.
     pub async fn all(&self) -> Vec<Cipher> {
         self.ciphers.read().await.values().cloned().collect()
@@ -1507,6 +1517,25 @@ mod tests {
         assert_eq!(store.len().await, 0);
     }
 
+    #[tokio::test]
+    async fn test_vault_store_delete_cipher() {
+        let store = VaultStore::new();
+        let id = Uuid::new_v4();
+        let cipher = Cipher {
+            id: Some(id),
+            r#type: CipherType::SshKey,
+            ..Default::default()
+        };
+        store.insert(cipher).await;
+        assert_eq!(store.len().await, 1);
+        let removed = store.delete_cipher(&id).await;
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().id, Some(id));
+        assert!(store.get(&id).await.is_none());
+        assert!(store.is_empty().await);
+        assert!(store.delete_cipher(&id).await.is_none());
+    }
+
     #[test]
     fn test_vault_store_blocking_operations() {
         let store = VaultStore::new();
@@ -1520,10 +1549,11 @@ mod tests {
             r#type: CipherType::Note,
             ..Default::default()
         });
+
         assert_eq!(store.blocking_len(), 1);
         assert_eq!(store.blocking_get(&id1).unwrap().r#type, CipherType::Note);
         assert_eq!(store.blocking_all().len(), 1);
-        assert!(store.blocking_delete(&id1).is_some());
+        assert!(store.blocking_delete_cipher(&id1).is_some());
         assert_eq!(store.blocking_len(), 0);
 
         store.blocking_load_sync_data(SyncData {

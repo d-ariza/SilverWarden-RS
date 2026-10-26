@@ -12,6 +12,7 @@ pub use sw_crypto::{KdfConfig, KdfType};
 
 pub mod ciphers;
 pub use ciphers::{delete_cipher, get_cipher, post_cipher, put_cipher};
+pub type BitwardenApiClient = AuthenticatedClient;
 
 pub mod websocket;
 pub use websocket::{

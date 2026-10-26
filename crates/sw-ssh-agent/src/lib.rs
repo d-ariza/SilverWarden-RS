@@ -8,11 +8,13 @@ use tokio::sync::RwLock;
 
 use russh::keys::agent::server::{Agent, MessageType};
 pub use russh::keys::agent::AgentIdentity;
-use russh::keys::ssh_encoding::Encode;
-use russh::keys::PrivateKey;
+pub use russh::keys::ssh_encoding::{Decode, Encode};
+pub use russh::keys::{PrivateKey, PublicKey};
+use sw_bitwarden_api::BitwardenApiClient;
 use sw_crypto::SymmetricKey;
 use sw_systemauth::{CallingContext, SessionStore, SessionType};
-use sw_vault::VaultStore;
+use sw_vault::{VaultSshKey, VaultStore};
+use uuid::Uuid;
 
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENT_SUCCESS: u8 = 6;
@@ -278,6 +280,7 @@ pub struct VaultAgentServer {
     is_locked: Arc<AtomicBool>,
     session_store: Arc<RwLock<SessionStore>>,
     approval_provider: Arc<dyn ApprovalProvider>,
+    api_client: Option<Arc<BitwardenApiClient>>,
 }
 
 impl VaultAgentServer {
@@ -289,6 +292,7 @@ impl VaultAgentServer {
             is_locked: Arc::new(AtomicBool::new(true)),
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             approval_provider: Arc::new(DefaultApprovalProvider::new()),
+            api_client: None,
         }
     }
 
@@ -300,6 +304,7 @@ impl VaultAgentServer {
             is_locked: Arc::new(AtomicBool::new(false)),
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             approval_provider: Arc::new(DefaultApprovalProvider::new()),
+            api_client: None,
         }
     }
 
@@ -315,6 +320,12 @@ impl VaultAgentServer {
         self
     }
 
+    /// Sets an authenticated Bitwarden API client for remote synchronization.
+    pub fn with_api_client(mut self, client: Arc<BitwardenApiClient>) -> Self {
+        self.api_client = Some(client);
+        self
+    }
+
     /// Access to the underlying session store.
     pub fn session_store(&self) -> &Arc<RwLock<SessionStore>> {
         &self.session_store
@@ -323,6 +334,11 @@ impl VaultAgentServer {
     /// Access to the underlying approval provider.
     pub fn approval_provider(&self) -> &Arc<dyn ApprovalProvider> {
         &self.approval_provider
+    }
+
+    /// Access to the optional API client.
+    pub fn api_client(&self) -> Option<&Arc<BitwardenApiClient>> {
+        self.api_client.as_ref()
     }
 
     /// Unlocks the agent server with the provided user symmetric key.
@@ -386,6 +402,105 @@ impl VaultAgentServer {
         }
 
         Ok(identities)
+    }
+
+    /// Adds an SSH key to the vault (and optionally syncs to the Bitwarden server if configured).
+    pub async fn add_ssh_key(
+        &self,
+        private_key_pem: &str,
+        name: &str,
+        user_symmetric_key: &SymmetricKey,
+    ) -> Result<PublicKey, SshAgentError> {
+        let priv_key = PrivateKey::from_openssh(private_key_pem)
+            .map_err(|e| SshAgentError::KeyError(format!("Failed to parse private key: {e}")))?;
+
+        let pub_key = priv_key.public_key().clone();
+
+        // Check for duplicates
+        let existing_keys = self
+            .vault
+            .get_ssh_keys(user_symmetric_key)
+            .await
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        for vk in existing_keys {
+            if let Ok(pk) = PrivateKey::from_openssh(&vk.private_key) {
+                if pk.public_key() == &pub_key {
+                    return Err(SshAgentError::InvalidMessage(
+                        "SSH key already exists in vault".into(),
+                    ));
+                }
+            }
+        }
+
+        let fp = pub_key
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+        let pub_openssh = pub_key
+            .to_openssh()
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        let enc_name = sw_vault::encrypt_with(
+            name.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            user_symmetric_key,
+        )
+        .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        let enc_priv = sw_vault::encrypt_with(
+            private_key_pem.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            user_symmetric_key,
+        )
+        .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        let enc_pub = sw_vault::encrypt_with(
+            pub_openssh.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            user_symmetric_key,
+        )
+        .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        let enc_fp = sw_vault::encrypt_with(
+            fp.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            user_symmetric_key,
+        )
+        .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        let cipher = sw_vault::Cipher {
+            r#type: sw_vault::CipherType::SshKey,
+            id: Some(Uuid::new_v4()),
+            name: enc_name,
+            ssh_key: Some(sw_vault::SSHKeyCipher {
+                private_key: Some(enc_priv),
+                public_key: Some(enc_pub),
+                key_fingerprint: Some(enc_fp),
+            }),
+            ..Default::default()
+        };
+
+        let cipher_to_insert = if let Some(ref client) = self.api_client {
+            let created = client.post_cipher(&cipher).await.map_err(|e| {
+                SshAgentError::SigningError(format!("Failed to post cipher to server: {e}"))
+            })?;
+            sw_vault::Cipher {
+                id: created.id.or(cipher.id),
+                ssh_key: created.ssh_key.or(cipher.ssh_key),
+                name: if created.name.ct.is_empty() {
+                    cipher.name
+                } else {
+                    created.name
+                },
+                r#type: created.r#type,
+                ..created
+            }
+        } else {
+            cipher
+        };
+
+        self.vault.insert(cipher_to_insert).await;
+        Ok(pub_key)
     }
 
     /// Signs data with a vault SSH key matched by public key wire blob or fingerprint.
@@ -537,9 +652,11 @@ impl Agent for VaultAgentServer {
     async fn confirm_request(&self, msg: MessageType) -> bool {
         match msg {
             MessageType::RequestKeys => true,
-            MessageType::AddKeys => false,
+            MessageType::AddKeys => true,
             MessageType::Sign => true,
-            _ => false,
+            MessageType::RemoveKeys => true,
+            MessageType::RemoveAllKeys => true,
+            MessageType::Lock | MessageType::Unlock => false,
         }
     }
 }
@@ -778,12 +895,312 @@ pub async fn handle_connection(
                 }
             }
             SSH2_AGENTC_ADD_IDENTITY | SSH2_AGENTC_ADD_ID_CONSTRAINED => {
-                let allowed = agent.confirm_request(MessageType::AddKeys).await;
-                if allowed {
-                    send_success(&mut stream).await?;
-                } else {
+                if agent.is_locked() {
                     send_failure(&mut stream).await?;
+                    continue;
                 }
+
+                let sym_key_guard = agent.symmetric_key.read().await;
+                let sym_key = match sym_key_guard.as_ref() {
+                    Some(k) => k,
+                    None => {
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                if buf.len() < 2 {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                let mut slice = &buf[1..];
+                let pk = match russh::keys::ssh_key::private::KeypairData::decode(&mut slice) {
+                    Ok(keypair_data) => {
+                        let comment = String::decode(&mut slice).unwrap_or_default();
+                        match PrivateKey::new(keypair_data, comment) {
+                            Ok(pk) => pk,
+                            Err(e) => {
+                                tracing::warn!("Failed to construct PrivateKey: {e}");
+                                send_failure(&mut stream).await?;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let mut fallback_slice = &buf[1..];
+                        match PrivateKey::decode(&mut fallback_slice) {
+                            Ok(k) => {
+                                slice = fallback_slice;
+                                k
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to decode key from ADD_IDENTITY: {e}");
+                                send_failure(&mut stream).await?;
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                if msg_type == SSH2_AGENTC_ADD_ID_CONSTRAINED {
+                    while !slice.is_empty() {
+                        let constraint_type = slice[0];
+                        slice = &slice[1..];
+                        match constraint_type {
+                            1 => {
+                                if slice.len() >= 4 {
+                                    let _secs = u32::from_be_bytes([
+                                        slice[0], slice[1], slice[2], slice[3],
+                                    ]);
+                                    slice = &slice[4..];
+                                }
+                            }
+                            2 => {}
+                            _ => break,
+                        }
+                    }
+                }
+
+                let comment_str = pk.comment().as_str().unwrap_or("unnamed");
+                let key_comment = if comment_str.trim().is_empty() {
+                    "unnamed".to_string()
+                } else {
+                    comment_str.to_string()
+                };
+
+                let message = if !ctx.error {
+                    format!(
+                        "{} on {}>{}>{} is adding key {}",
+                        ctx.username,
+                        ctx.grandparent_process_name,
+                        ctx.parent_process_name,
+                        ctx.process_name,
+                        key_comment
+                    )
+                } else {
+                    format!("{} is adding key {}", ctx.username, key_comment)
+                };
+
+                let approved = match agent
+                    .approval_provider()
+                    .get_approval("SSH Key Addition Request", &message)
+                {
+                    Ok(app) => app,
+                    Err(e) => {
+                        tracing::warn!("Approval request error: {e}");
+                        false
+                    }
+                };
+
+                if !approved {
+                    tracing::warn!(
+                        "Addition of key '{}' denied by approval provider",
+                        key_comment
+                    );
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                let pem = match pk.to_openssh(russh::keys::ssh_key::LineEnding::LF) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("Failed to convert added key to OpenSSH PEM: {e}");
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                match agent.add_ssh_key(&pem, &key_comment, sym_key).await {
+                    Ok(_) => {
+                        send_success(&mut stream).await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to add SSH key to vault: {e}");
+                        send_failure(&mut stream).await?;
+                    }
+                }
+            }
+            SSH2_AGENTC_REMOVE_IDENTITY => {
+                if agent.is_locked() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                let sym_key_guard = agent.symmetric_key.read().await;
+                let sym_key = match sym_key_guard.as_ref() {
+                    Some(k) => k,
+                    None => {
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                if buf.len() < 5 {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                let key_blob_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                if buf.len() < 5 + key_blob_len {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+                let key_blob = &buf[5..5 + key_blob_len];
+
+                let vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!("Failed to retrieve vault keys for removal: {e}");
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                let target_pub = russh::keys::ssh_key::PublicKey::from_bytes(key_blob).ok();
+                let mut matched_key: Option<VaultSshKey> = None;
+
+                for vk in vault_keys {
+                    if let Ok(pk) = PrivateKey::from_openssh(&vk.private_key) {
+                        let mut wire_blob = Vec::new();
+                        let _ = pk.public_key().key_data().encode(&mut wire_blob);
+
+                        let is_match = wire_blob == key_blob
+                            || target_pub.as_ref() == Some(pk.public_key())
+                            || pk
+                                .public_key()
+                                .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                                .to_string()
+                                .as_bytes()
+                                == key_blob
+                            || pk
+                                .public_key()
+                                .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                                .as_bytes()
+                                == key_blob;
+
+                        if is_match {
+                            matched_key = Some(vk);
+                            break;
+                        }
+                    }
+                }
+
+                let vk = match matched_key {
+                    Some(k) => k,
+                    None => {
+                        tracing::warn!("Key to remove not found in vault");
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                let message = if !ctx.error {
+                    format!(
+                        "{} on {}>{}>{} is removing key {}",
+                        ctx.username,
+                        ctx.grandparent_process_name,
+                        ctx.parent_process_name,
+                        ctx.process_name,
+                        vk.name
+                    )
+                } else {
+                    format!("{} is removing key {}", ctx.username, vk.name)
+                };
+
+                let approved = match agent
+                    .approval_provider()
+                    .get_approval("SSH Key Removal Request", &message)
+                {
+                    Ok(app) => app,
+                    Err(e) => {
+                        tracing::warn!("Approval error on remove key: {e}");
+                        false
+                    }
+                };
+
+                if !approved {
+                    tracing::warn!("Removal of key '{}' denied by approval provider", vk.name);
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                if let Some(id) = vk.id {
+                    if let Some(client) = agent.api_client.as_ref() {
+                        if let Err(e) = client.delete_cipher(&id).await {
+                            tracing::warn!("Failed to delete cipher {id} from server: {e}");
+                        }
+                    }
+                    agent.vault.delete_cipher(&id).await;
+                }
+
+                send_success(&mut stream).await?;
+            }
+            SSH2_AGENTC_REMOVE_ALL_IDENTITIES => {
+                if agent.is_locked() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                let sym_key_guard = agent.symmetric_key.read().await;
+                let sym_key = match sym_key_guard.as_ref() {
+                    Some(k) => k,
+                    None => {
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                let vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!("Failed to retrieve vault keys for remove all: {e}");
+                        send_failure(&mut stream).await?;
+                        continue;
+                    }
+                };
+
+                let message = if !ctx.error {
+                    format!(
+                        "{} on {}>{}>{} is removing all SSH keys",
+                        ctx.username,
+                        ctx.grandparent_process_name,
+                        ctx.parent_process_name,
+                        ctx.process_name,
+                    )
+                } else {
+                    format!("{} is removing all SSH keys", ctx.username)
+                };
+
+                let approved = match agent
+                    .approval_provider()
+                    .get_approval("SSH Key Removal Request", &message)
+                {
+                    Ok(app) => app,
+                    Err(e) => {
+                        tracing::warn!("Approval error on remove all keys: {e}");
+                        false
+                    }
+                };
+
+                if !approved {
+                    tracing::warn!("Removal of all keys denied by approval provider");
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+
+                for vk in vault_keys {
+                    if let Some(id) = vk.id {
+                        if let Some(client) = agent.api_client.as_ref() {
+                            if let Err(e) = client.delete_cipher(&id).await {
+                                tracing::warn!("Failed to delete cipher {id} from server: {e}");
+                            }
+                        }
+                        agent.vault.delete_cipher(&id).await;
+                    }
+                }
+
+                send_success(&mut stream).await?;
             }
             _ => {
                 send_failure(&mut stream).await?;
@@ -1141,8 +1558,10 @@ mod tests {
         let agent = VaultAgentServer::new(vault);
 
         assert!(agent.confirm_request(MessageType::RequestKeys).await);
-        assert!(!agent.confirm_request(MessageType::AddKeys).await);
+        assert!(agent.confirm_request(MessageType::AddKeys).await);
         assert!(agent.confirm_request(MessageType::Sign).await);
+        assert!(agent.confirm_request(MessageType::RemoveKeys).await);
+        assert!(agent.confirm_request(MessageType::RemoveAllKeys).await);
         assert!(!agent.confirm_request(MessageType::Lock).await);
         assert!(!agent.confirm_request(MessageType::Unlock).await);
     }
@@ -1169,13 +1588,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_connection_add_keys_rejected() {
+    async fn test_add_requires_approval() {
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("agent_add_keys.sock");
 
         let key = make_test_key();
         let vault = Arc::new(VaultStore::new());
-        let agent = VaultAgentServer::with_key(vault, key);
+        let mock_approval = Arc::new(MockApprovalProvider::new(false));
+        let agent =
+            VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval.clone());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let s_path = socket_path.clone();
@@ -1192,9 +1613,12 @@ mod tests {
         );
         let pk = russh::keys::PrivateKey::new(keypair, "test_add").unwrap();
 
-        // Adding key should fail because confirm_request(AddKeys) returns false
+        // Adding key fails when approval is denied
         let add_res = client.add_identity(&pk, &[]).await;
         assert!(add_res.is_err());
+        assert_eq!(mock_approval.call_count(), 1);
+        let desc = mock_approval.last_description().unwrap();
+        assert!(desc.contains("is adding key"));
 
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
@@ -1883,5 +2307,413 @@ done
 
         let sign_err = SshAgentError::SigningError("signature failed".into());
         assert!(format!("{}", sign_err).contains("signature failed"));
+    }
+
+    #[tokio::test]
+    async fn test_add_ssh_key_ed25519() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::with_key(vault.clone(), key.try_clone().unwrap());
+
+        let (priv_pem, pub_openssh) = generate_test_ed25519(7, "vault-key-7");
+        let pub_key = agent
+            .add_ssh_key(&priv_pem, "vault-key-7", &key)
+            .await
+            .unwrap();
+
+        assert_eq!(pub_key.to_openssh().unwrap(), pub_openssh);
+
+        let vault_keys = vault.get_ssh_keys(&key).await.unwrap();
+        assert_eq!(vault_keys.len(), 1);
+        assert_eq!(vault_keys[0].name, "vault-key-7");
+        assert_eq!(vault_keys[0].private_key.trim(), priv_pem.trim());
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_duplicate() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::with_key(vault.clone(), key.try_clone().unwrap());
+
+        let (priv_pem, _) = generate_test_ed25519(8, "duplicate-key");
+        let res1 = agent.add_ssh_key(&priv_pem, "dup-1", &key).await;
+        assert!(res1.is_ok());
+
+        let res2 = agent.add_ssh_key(&priv_pem, "dup-2", &key).await;
+        assert!(res2.is_err());
+        assert!(format!("{:?}", res2.unwrap_err()).contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("ssh_add_cmd.sock");
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent =
+            VaultAgentServer::with_key(vault.clone(), key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let (priv_pem, pub_key) = generate_test_ed25519(15, "cli-added-key");
+        let key_file = temp_dir.path().join("id_ed25519");
+        std::fs::write(&key_file, &priv_pem).unwrap();
+        let mut perms = std::fs::metadata(&key_file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_file, perms).unwrap();
+
+        let output = tokio::process::Command::new("ssh-add")
+            .arg(&key_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add");
+
+        assert!(
+            output.status.success(),
+            "ssh-add failed: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let list_out = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert!(list_out.status.success());
+        let stdout = String::from_utf8_lossy(&list_out.stdout);
+        assert!(stdout.contains(&pub_key));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_add_constrained_lifetime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("ssh_add_constrained.sock");
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent = VaultAgentServer::with_key(vault.clone(), key.try_clone().unwrap())
+            .with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let (priv_pem, _) = generate_test_ed25519(16, "constrained-key");
+        let key_file = temp_dir.path().join("id_ed25519");
+        std::fs::write(&key_file, &priv_pem).unwrap();
+        let mut perms = std::fs::metadata(&key_file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_file, perms).unwrap();
+
+        let output = tokio::process::Command::new("ssh-add")
+            .arg("-t")
+            .arg("60")
+            .arg(&key_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -t 60");
+
+        assert!(
+            output.status.success(),
+            "ssh-add -t 60 failed: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let keys = vault.get_ssh_keys(&key).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "constrained-key");
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_d_command() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("ssh_add_d.sock");
+
+        let key = make_test_key();
+        let (vault, (_, pub_1), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent =
+            VaultAgentServer::with_key(vault.clone(), key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let pub_path = temp_dir.path().join("id_ed25519.pub");
+        std::fs::write(&pub_path, &pub_1).unwrap();
+
+        let del_res = tokio::process::Command::new("ssh-add")
+            .arg("-d")
+            .arg(&pub_path)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -d");
+
+        assert!(
+            del_res.status.success(),
+            "ssh-add -d failed: stderr: {}",
+            String::from_utf8_lossy(&del_res.stderr)
+        );
+
+        let list_out = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        let stdout = String::from_utf8_lossy(&list_out.stdout);
+        assert!(!stdout.contains("work-laptop"));
+        assert!(stdout.contains("personal-server"));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_remove_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("ssh_add_remove_all.sock");
+
+        let key = make_test_key();
+        let (vault, _, _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent =
+            VaultAgentServer::with_key(vault.clone(), key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let del_res = tokio::process::Command::new("ssh-add")
+            .arg("-D")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -D");
+
+        assert!(
+            del_res.status.success(),
+            "ssh-add -D failed: stderr: {}",
+            String::from_utf8_lossy(&del_res.stderr)
+        );
+
+        let list_out = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert_eq!(list_out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&list_out.stderr);
+        let stdout = String::from_utf8_lossy(&list_out.stdout);
+        assert!(
+            stderr.contains("The agent has no identities.")
+                || stdout.contains("The agent has no identities.")
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_full_cycle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("full_cycle.sock");
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent =
+            VaultAgentServer::with_key(vault.clone(), key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let (priv_pem, pub_key) = generate_test_ed25519(25, "full-cycle-key");
+        let key_file = temp_dir.path().join("id_ed25519");
+        let pub_file = temp_dir.path().join("id_ed25519.pub");
+        std::fs::write(&key_file, &priv_pem).unwrap();
+        std::fs::write(&pub_file, &pub_key).unwrap();
+        let mut perms = std::fs::metadata(&key_file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_file, perms).unwrap();
+
+        // 1. ssh-add
+        let add_out = tokio::process::Command::new("ssh-add")
+            .arg(&key_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add");
+        assert!(add_out.status.success());
+
+        // 2. ssh-add -L -> key is present
+        let list1 = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert!(list1.status.success());
+        let stdout1 = String::from_utf8_lossy(&list1.stdout);
+        assert!(stdout1.contains(&pub_key));
+
+        // 3. ssh-add -d -> delete key
+        let del_out = tokio::process::Command::new("ssh-add")
+            .arg("-d")
+            .arg(&pub_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -d");
+        assert!(del_out.status.success());
+
+        // 4. ssh-add -L -> key is absent
+        let list2 = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert_eq!(list2.status.code(), Some(1));
+        let stdout2 = String::from_utf8_lossy(&list2.stdout);
+        assert!(!stdout2.contains(&pub_key));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_add_syncs_to_server() {
+        use std::os::unix::fs::PermissionsExt;
+        use sw_bitwarden_api::AuthenticatedClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let server_uuid = Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path("/ciphers"))
+            .respond_with(move |req: &wiremock::Request| {
+                let mut body: serde_json::Value = req.body_json().unwrap();
+                body["id"] = serde_json::json!(server_uuid.to_string());
+                ResponseTemplate::new(200).set_body_json(body)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let delete_path = format!("/ciphers/{server_uuid}");
+        Mock::given(method("DELETE"))
+            .and(path(delete_path))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api_client = Arc::new(AuthenticatedClient::from_token(
+            server.uri(),
+            server.uri(),
+            sw_bitwarden_api::LoginToken::default(),
+        ));
+
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("sync_server.sock");
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent = VaultAgentServer::with_key(vault.clone(), key)
+            .with_approval_provider(mock_approval)
+            .with_api_client(api_client);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let (priv_pem, pub_key) = generate_test_ed25519(33, "sync-server-key");
+        let key_file = temp_dir.path().join("id_ed25519");
+        let pub_file = temp_dir.path().join("id_ed25519.pub");
+        std::fs::write(&key_file, &priv_pem).unwrap();
+        std::fs::write(&pub_file, &pub_key).unwrap();
+        let mut perms = std::fs::metadata(&key_file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_file, perms).unwrap();
+
+        // 1. Add key via ssh-add -> triggers post_cipher
+        let add_out = tokio::process::Command::new("ssh-add")
+            .arg(&key_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add");
+        assert!(add_out.status.success());
+
+        // Check vault stored cipher with server_uuid
+        let ciphers = vault.all().await;
+        assert_eq!(ciphers.len(), 1);
+        assert_eq!(ciphers[0].id, Some(server_uuid));
+
+        // 2. Remove key via ssh-add -d -> triggers delete_cipher
+        let del_out = tokio::process::Command::new("ssh-add")
+            .arg("-d")
+            .arg(&pub_file)
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -d");
+        assert!(del_out.status.success());
+
+        assert_eq!(vault.len().await, 0);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
     }
 }

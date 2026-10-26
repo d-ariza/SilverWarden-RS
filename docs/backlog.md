@@ -695,7 +695,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** pruebas funcionales con `ssh-add` y mocks de API; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-040, SW-036 · **Estado:** Pendiente
+**Depende de:** SW-040, SW-036 · **Estado:** Completado
 
 ---
 

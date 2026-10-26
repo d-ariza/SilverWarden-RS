@@ -9,12 +9,16 @@ license.workspace = true
 sw-vault = { workspace = true }
 sw-crypto = { workspace = true }
 sw-systemauth = { workspace = true }
+sw-bitwarden-api = { workspace = true }
 ssh-key = { workspace = true }
 russh = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+wiremock = "0.6"
