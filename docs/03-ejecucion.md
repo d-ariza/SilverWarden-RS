@@ -1370,6 +1370,57 @@ PASS
 
 **Estado:** ✅ SW-035 — Hecho (2026-10-25).
 
+---
+
+### [SW-034] 2FA (TOTP, Email, FIDO2 stub) (`sw-bitwarden-api`)
+
+**Fecha:** 2026-10-25  
+**Crate:** `sw-bitwarden-api`.  
+**Dependencias:** ninguna adicional.
+
+#### 1. Implementación
+
+- **Módulo `sw-bitwarden-api::twofactor`:**
+  - `TwoFactorProvider`: enum que modela los tipos de proveedores soportados por Bitwarden (`Authenticator = 0`, `Email = 1`, `Duo = 2`, `YubiKey = 3`, `U2f = 4`, `Remember = 5`, `OrganizationDuo = 6`, `WebAuthn = 7`).
+  - `parse_two_factor_error(body: &str) -> Option<(Vec<i32>, String)>`:
+    - Detección reactiva de respuestas de desafío 2FA.
+    - Soporte para arrays `TwoFactorProviders` / `twoFactorProviders` y diccionarios `TwoFactorProviders2`.
+    - Extracción de token de desafío `TwoFactorToken` / `twoFactorToken` / `authRequest`.
+  - `complete_totp`: autenticación secundaria con código TOTP (proveedor 0) vía `POST /connect/token`.
+  - `complete_email`: autenticación secundaria con código recibido por correo (proveedor 1) vía `POST /connect/token`.
+  - `send_two_factor_email_login`: envío inicial de código de verificación por correo vía `POST /two-factor/send-email-login`.
+  - `complete_fido2`: stub documentado que retorna `ApiError::NotImplemented("FIDO2 requires hardware and is postponed to post-MVP")`.
+- **Integración en `login_with_password`:**
+  - Intercepción de respuestas HTTP 401/400 que contengan `"TwoFactor"`.
+  - Retorno estructurado de `ApiError::TwoFactorRequired { providers, token }`.
+  - Preservación de `ApiError::Status` en cuerpos 2FA no reconocidos y `ApiError::Auth` para errores convencionales de credenciales.
+- **Acceso en `AuthenticatedClient`:**
+  - Métodos `complete_totp`, `complete_email`, `send_two_factor_email_login`, `complete_fido2` y accesor `http_client()`.
+
+#### 2. Pruebas realizadas
+
+- `twofactor::tests::test_login_detects_two_factor_required`: mock server respondiendo con 401 y `{"TwoFactorProviders":[0,1],"TwoFactorToken":"abc"}`, validando que `login_with_password` devuelve `ApiError::TwoFactorRequired`.
+- `twofactor::tests::test_login_two_factor_unrecognized_format_returns_status`: respuesta con `"TwoFactor"` sin token, validando degradación a `ApiError::Status`.
+- `twofactor::tests::test_complete_totp_success`: verificación del formulario enviado a `/connect/token` (`twoFactorProvider=0`, `twoFactorToken=code`, `authRequest=token`) y retorno de `LoginToken`.
+- `twofactor::tests::test_complete_email_success`: verificación del formulario enviado con `twoFactorProvider=1` y recepción del token.
+- `twofactor::tests::test_complete_email_send_step`: verificación del endpoint `POST /two-factor/send-email-login` con payload `{email, deviceIdentifier}` tanto en éxito (200) como en fallo (400).
+- `twofactor::tests::test_complete_fido2_not_implemented`: verificación de que `complete_fido2` retorna `ApiError::NotImplemented`.
+- `twofactor::tests::test_two_factor_providers_parsing`: extracción robusta en arrays PascalCase, camelCase y mapas `TwoFactorProviders2`.
+- `twofactor::tests::test_login_full_orchestration_two_factor`: orquestación completa: prelogin $\rightarrow$ derivación de clave/hash $\rightarrow$ intento de login $\rightarrow$ intercepción de `TwoFactorRequired` $\rightarrow$ resolución exitosa vía `complete_totp`.
+
+#### 3. Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 50 pasan, 0 fallan (60.08s) |
+| Pruebas `sw-config` | `cargo test -p sw-config -- --test-threads=1` | 25 pasan, 0 fallan (219.91s) |
+| Linter | `cargo clippy -p sw-bitwarden-api -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 warning informativo documentado) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api` | **92.95% líneas / 93.34% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-034 — Hecho (2026-10-25).
+
 
 
 

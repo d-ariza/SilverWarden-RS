@@ -584,7 +584,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Mock server simulando desafío 2FA TOTP con código válido e inválido.
 - Manejo claro de errores en códigos expirados/incorrectos.
 
-**Depende de:** SW-033 · **Estado:** Pendiente
+**Depende de:** SW-033 · **Estado:** Hecho (2026-10-25)
 
 ---
 

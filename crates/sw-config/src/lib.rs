@@ -237,7 +237,7 @@ pub struct LoginToken {
     pub expires_in: i64,
     pub token_type: String,
     pub refresh_token: String,
-    #[serde(default)]
+    #[serde(default, alias = "Key")]
     pub key: String,
 }
 

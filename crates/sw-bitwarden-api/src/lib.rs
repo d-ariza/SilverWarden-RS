@@ -19,6 +19,12 @@ pub use websocket::{
     run_websocket_daemon_with_options, NotificationMessage, WebsocketClient,
 };
 
+pub mod twofactor;
+pub use twofactor::{
+    complete_email, complete_fido2, complete_totp, parse_two_factor_error,
+    send_two_factor_email_login, TwoFactorProvider,
+};
+
 pub const BITWARDEN_USER_AGENT: &str = "silverwarden/0.0.1";
 pub const BITWARDEN_DEVICE_TYPE: &str = "10";
 pub const BITWARDEN_CLIENT_NAME: &str = "silverwarden";
@@ -49,6 +55,12 @@ pub enum ApiError {
 
     #[error("MessagePack decode error: {0}")]
     MsgPack(#[from] rmp_serde::decode::Error),
+
+    #[error("Two-factor authentication required")]
+    TwoFactorRequired { providers: Vec<i32>, token: String },
+
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 
     #[error("Server error ({status}): {message}")]
     Status {
@@ -172,6 +184,11 @@ impl AuthenticatedClient {
             identity_url: identity_url.into(),
             api_url: api_url.into(),
         }
+    }
+
+    /// Reference to the underlying `reqwest::Client`.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     /// Reference to the shared, mutable `LoginToken`.
@@ -436,6 +453,21 @@ impl AuthenticatedClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+
+            if (status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::BAD_REQUEST)
+                && (body.contains("TwoFactor") || body.contains("twoFactor"))
+            {
+                if let Some((providers, token)) = twofactor::parse_two_factor_error(&body) {
+                    return Err(ApiError::TwoFactorRequired { providers, token });
+                } else {
+                    return Err(ApiError::Status {
+                        status,
+                        message: body,
+                    });
+                }
+            }
+
             return Err(ApiError::Auth(format!(
                 "Login with password failed with status {status}: {body}"
             )));
@@ -569,6 +601,73 @@ impl AuthenticatedClient {
     /// Deletes a cipher by UUID from the Bitwarden vault.
     pub async fn delete_cipher(&self, uuid: &uuid::Uuid) -> Result<(), ApiError> {
         ciphers::delete_cipher(self, uuid).await
+    }
+
+    /// Completes 2FA login using an Authenticator/TOTP verification code.
+    pub async fn complete_totp(
+        &self,
+        email: &str,
+        master_password_hash: &str,
+        two_factor_token: &str,
+        totp_code: &str,
+        device_uuid: &str,
+    ) -> Result<LoginToken, ApiError> {
+        twofactor::complete_totp(
+            self,
+            email,
+            master_password_hash,
+            two_factor_token,
+            totp_code,
+            device_uuid,
+        )
+        .await
+    }
+
+    /// Completes 2FA login using an Email verification code.
+    pub async fn complete_email(
+        &self,
+        email: &str,
+        master_password_hash: &str,
+        two_factor_token: &str,
+        email_code: &str,
+        device_uuid: &str,
+    ) -> Result<LoginToken, ApiError> {
+        twofactor::complete_email(
+            self,
+            email,
+            master_password_hash,
+            two_factor_token,
+            email_code,
+            device_uuid,
+        )
+        .await
+    }
+
+    /// Sends an email with a login verification code.
+    pub async fn send_two_factor_email_login(
+        &self,
+        email: &str,
+        device_uuid: &str,
+    ) -> Result<(), ApiError> {
+        twofactor::send_two_factor_email_login(self, email, device_uuid).await
+    }
+
+    /// Completes 2FA login via FIDO2 (stub).
+    pub async fn complete_fido2(
+        &self,
+        email: &str,
+        master_password_hash: &str,
+        two_factor_token: &str,
+        device_uuid: &str,
+    ) -> Result<LoginToken, ApiError> {
+        twofactor::complete_fido2(
+            self,
+            email,
+            master_password_hash,
+            two_factor_token,
+            device_uuid,
+        )
+        .await
     }
 }
 
