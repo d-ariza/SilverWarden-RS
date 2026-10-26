@@ -17,7 +17,7 @@
 | MVP | **M1 → M2 → M3 → M4 → M5** (cripto → migración → agente → vault/API → SSH agent), **con CLI + GUI Tauri como clientes del agente** |
 | Post-MVP | Autotipo, TOTP UI, browser biometrics, Windows, empaquetado |
 | GUI | **No es "post-MVP"**. Es parte del MVP, como cliente IPC del agente (M7 se adelanta) |
-| M4 | Login y Sync completados; CRUD y Websocket en progreso. FIDO2 se pospone |
+| M4 | **✅ Completado.** Vault + API Bitwarden (SW-030 a SW-036). FIDO2 se pospone |
 | Arquitectura | **GUI = cliente IPC del agente**. Agente obligatorio |
 | Migración | Incluye config, vault, PIN y **claves SSH importadas** |
 | Coexistencia Go/Rust | **Importar una vez y seguir** (no bidireccional en caliente) |
@@ -157,7 +157,7 @@ Nota sobre sockets:
 
 - **Milestones del proyecto:**
   - **M1–M3:** ✅ **Completados.** (Criptografía, config/migración y agente/IPC/CLI).
-  - **M4:** 🔄 **En curso.** (SW-030, SW-031, SW-032, SW-033 cerradas; SW-036 en curso; SW-035, SW-034 pendientes).
+  - **M4:** ✅ **Completado.** (SW-030 a SW-036 cerradas y validadas; FIDO2 pospuesto).
   - **M5:** ⏳ **Pendiente.** (SSH agent). La base (agente, IPC, vault) está lista.
   - **M7 (GUI):** ⏳ **Pendiente.** **Se adelanta** para que la GUI esté disponible cuanto antes (no es post-MVP). Orden: Scaffold + Status → Login/Unlock → Quickaccess → Settings → SSH Keys → Pinentry/Approval.
   - **M6, M8–M10:** Post-MVP.

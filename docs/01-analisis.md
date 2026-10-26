@@ -58,7 +58,7 @@ Aplicación Rust+Tauri con **paridad 1:1** funcional respecto al Goldwarden actu
 - **M1 — Núcleo criptográfico:** ✅ **Completado.** KDF, jerarquía de claves, EncString, AES-CBC-256+HMAC, RSA, HKDF, memoria bloqueada, fuzzing. Paridad Go↔Rust verificada byte a byte.
 - **M2 — Config + migración:** ✅ **Completado.** Config cifrado (Argon2i + Tink ChaCha20-Poly1305), migración de `goldwarden.json`, backup automático.
 - **M3 — Agente + IPC:** ✅ **Completado.** Protocolo IPC propio, socket Unix (`~/.silverwarden.sock`), CallingContext con `SO_PEERCRED` y anclaje Git, session store endurecido, actions registry, CLI con clap.
-- **M4 — Vault + API Bitwarden:** 🔄 **En curso.** Login (SW-033) ✅, Sync + caché (SW-032) ✅, CRUD de ciphers (SW-036) en curso, Websocket (SW-035) pendiente, 2FA TOTP/email (SW-034) pendiente. FIDO2 se pospone a post-MVP.
+- **M4 — Vault + API Bitwarden:** ✅ **Completado.** HTTP + refresh (SW-030) ✅, Modelos (SW-031) ✅, Login (SW-033) ✅, Sync + caché (SW-032) ✅, CRUD de ciphers (SW-036) ✅, Websocket (SW-035) ✅, 2FA TOTP/Email (SW-034) ✅. FIDO2 se pospone a post-MVP.
 - **M5 — SSH agent:** ⏳ **Pendiente.** La base (agente + IPC + vault) ya está lista.
 - **M6 — Seguridad de sesión:** ⏳ **Post-MVP.**
 - **M7 — GUI Tauri:** ⏳ **Pendiente.** Ver sección 4.4 (nueva).

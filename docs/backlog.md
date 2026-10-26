@@ -497,7 +497,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Verificación de derivación del master password hash (1 iteración PBKDF2).
 - Descifrado de la clave del perfil.
 
-**Depende de:** SW-030, SW-011, SW-003 · **Estado:** En progreso (Parte 1: Login con mock server Hecho 2026-10-24; Parte 2: Persistencia/IPC pendiente)
+**Depende de:** SW-030, SW-011, SW-003 · **Estado:** Hecho (2026-10-25)
 
 ---
 

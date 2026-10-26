@@ -1,9 +1,9 @@
 # 04 — Validación (Fase 4 — Testing y aseguramiento de calidad)
 
 **Proyecto:** silverWarden-rs  
-**Alcance:** Milestones M1 + M2 + M3 (Núcleo criptográfico, Configuración/Migración, Agente/IPC)  
-**Commit validado:** `0c60879` (rama `develop`)  
-**Fecha de ejecución:** 2026-10-24  
+**Alcance:** Milestones M1 + M2 + M3 + M4 (Núcleo criptográfico, Configuración/Migración, Agente/IPC, Vault/API Bitwarden)  
+**Último commit validado:** `3f650dd` (rama `develop`)  
+**Fecha de última ejecución:** 2026-10-25  
 **Entorno:** Manjaro Linux, rustc 1.99.0, cargo 1.99.0, Node v22.22.3, webkit2gtk-4.1  
 **Rol de la IA:** Ingeniero de QA / Calidad y seguridad  
 
@@ -160,4 +160,66 @@ Todos en `.cargo/audit.toml` con justificación. Se eliminarán cuando Tauri mig
 
 **Estado: ✅ M1 + M2 + M3 APROBADOS.**
 
-**Siguiente milestone:** M4 — Vault + API Bitwarden (`sw-vault`, `sw-bitwarden-api`).
+---
+
+## 8. Validación de M4 — Vault + API Bitwarden
+
+**Commit validado:** `3f650dd`
+**Fecha de ejecución:** 2026-10-25
+**Alcance:** SW-030 a SW-036 (7 historias)
+
+### 8.1 Resumen ejecutivo
+
+**Estado global: ✅ Aprobado**
+
+M4 (Vault + API Bitwarden) cumple todos los criterios de cierre:
+
+- 7 historias completadas: HTTP, modelos, sync, login, 2FA, websocket, CRUD.
+- 250+ tests pasan en el workspace.
+- Cobertura global: 94.44% líneas / 94.27% regiones.
+- Clippy 0 warnings, fmt 0 diffs.
+- `cargo audit` sin vulnerabilidades (exit 0).
+- Paridad Go↔Rust verificada en login (master key, password hash, stretch, encKey, user symmetric key).
+
+### 8.2 Matriz de controles
+
+| Control | Herramienta | Resultado real | Estado |
+|---|---|---|---|
+| Build desde cero | cargo | `Finished` en 1m 56s | Aprobado |
+| Tests | cargo test | 250+ pasan, 0 fallan | Aprobado |
+| Cobertura global | cargo-llvm-cov | 94.44% líneas / 94.27% regiones | Aprobado |
+| Linter | clippy | 0 warnings | Aprobado |
+| Formato | rustfmt | 0 diffs | Aprobado |
+| Auditoría | cargo-audit | 0 vulns, exit 0 | Aprobado |
+| Paridad login | tests Go↔Rust | master key, hash, stretch, encKey, user key | Aprobado |
+
+### 8.3 Cobertura por crate (M4)
+
+| Crate | Líneas | Regiones | Estado |
+|---|---|---|---|
+| `sw-bitwarden-api` | 94.04% | 95.61% | ✅ |
+| `sw-vault` | 98.02% | 97.45% | ✅ |
+| `sw-config` | 97.77% | 96.57% | ✅ |
+
+### 8.4 Historias completadas
+
+| Historia | Estado | Cobertura |
+|---|---|---|
+| SW-030 HTTP + refresh | ✅ | 98.96% |
+| SW-031 Modelos | ✅ | 97.44% |
+| SW-032 Sync + caché | ✅ | 96.50% |
+| SW-033 Login | ✅ | 97.79% |
+| SW-034 2FA (TOTP/Email) | ✅ | 96.01% |
+| SW-035 Websocket | ✅ | 90.75% |
+| SW-036 CRUD + descifrado | ✅ | 97.95% |
+
+### 8.5 Excepciones y riesgos residuales
+
+- **FIDO2:** post-MVP. Requiere hardware y crate `ctap-hid-fido2` madura. Stub `NotImplemented`.
+- **`tokio 1.53.2`:** warning de `AsyncFd::new` (unsound). Documentado en `.cargo/audit.toml`.
+- **`sw-ssh-agent`:** 0% cobertura (stub `todo!()` para M5).
+
+**Estado: ✅ M4 APROBADO.**
+
+**Siguiente milestone:** M5 — SSH Agent.
+
