@@ -429,6 +429,15 @@ impl Cipher {
     }
 }
 
+/// Represents an SSH key extracted and decrypted from the vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultSshKey {
+    pub id: Option<Uuid>,
+    pub name: String,
+    pub private_key: String,
+    pub public_key: Option<String>,
+}
+
 /// Errors that can occur during vault caching, persistence, and synchronization.
 #[derive(Error, Debug)]
 pub enum VaultError {
@@ -1061,6 +1070,171 @@ impl VaultStore {
         }
 
         results
+    }
+
+    /// Extracts and decrypts SSH keys from stored ciphers asynchronously.
+    pub async fn get_ssh_keys(
+        &self,
+        user_key: &SymmetricKey,
+    ) -> Result<Vec<VaultSshKey>, VaultError> {
+        let ciphers = self.all().await;
+        Self::extract_ssh_keys(&ciphers, user_key)
+    }
+
+    /// Synchronous variant of `get_ssh_keys`.
+    pub fn blocking_get_ssh_keys(
+        &self,
+        user_key: &SymmetricKey,
+    ) -> Result<Vec<VaultSshKey>, VaultError> {
+        let ciphers = self.blocking_all();
+        Self::extract_ssh_keys(&ciphers, user_key)
+    }
+
+    /// Extracts SSH keys from a slice of ciphers (supports both SshKey ciphers and Secure Notes).
+    pub fn extract_ssh_keys(
+        ciphers: &[Cipher],
+        user_key: &SymmetricKey,
+    ) -> Result<Vec<VaultSshKey>, VaultError> {
+        let mut keys = Vec::new();
+        for cipher in ciphers {
+            if cipher.deleted_date.is_some() {
+                continue;
+            }
+
+            let cipher_key_owned = if let Some(ref enc_k) = cipher.key {
+                if !enc_k.is_null() {
+                    match sw_crypto::decrypt_with(enc_k, user_key) {
+                        Ok(kb) => SymmetricKey::from_bytes(&kb).ok(),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cipher_key = cipher_key_owned.as_ref().unwrap_or(user_key);
+
+            let name = if !cipher.name.is_null() {
+                match sw_crypto::decrypt_with(&cipher.name, cipher_key) {
+                    Ok(b) => String::from_utf8(b).unwrap_or_else(|_| "unnamed".to_string()),
+                    Err(_) => "unnamed".to_string(),
+                }
+            } else {
+                "unnamed".to_string()
+            };
+
+            if cipher.r#type == CipherType::SshKey {
+                if let Some(ref ssh) = cipher.ssh_key {
+                    let private_key = if let Some(ref pk) = ssh.private_key {
+                        if !pk.is_null() {
+                            sw_crypto::decrypt_with(pk, cipher_key)
+                                .ok()
+                                .and_then(|b| String::from_utf8(b).ok())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let public_key = if let Some(ref pubk) = ssh.public_key {
+                        if !pubk.is_null() {
+                            sw_crypto::decrypt_with(pubk, cipher_key)
+                                .ok()
+                                .and_then(|b| String::from_utf8(b).ok())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(pk_str) = private_key {
+                        keys.push(VaultSshKey {
+                            id: cipher.id,
+                            name,
+                            private_key: Self::normalize_pem(&pk_str),
+                            public_key,
+                        });
+                    }
+                }
+            } else if cipher.r#type == CipherType::Note {
+                let mut is_ssh = false;
+                let mut pk_opt = None;
+                let mut pubk_opt = None;
+
+                for field in &cipher.fields {
+                    let fname = if let Some(ref fn_enc) = field.name {
+                        if !fn_enc.is_null() {
+                            sw_crypto::decrypt_with(fn_enc, cipher_key)
+                                .ok()
+                                .and_then(|b| String::from_utf8(b).ok())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let fval = if let Some(ref fv_enc) = field.value {
+                        if !fv_enc.is_null() {
+                            sw_crypto::decrypt_with(fv_enc, cipher_key)
+                                .ok()
+                                .and_then(|b| String::from_utf8(b).ok())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let (Some(fn_str), Some(fv_str)) = (fname.as_deref(), fval.as_deref()) {
+                        if fn_str == "custom-type" && fv_str == "ssh-key" || fn_str == "ssh-key" {
+                            is_ssh = true;
+                        }
+                        if fn_str == "private-key" {
+                            pk_opt = Some(fv_str.to_string());
+                        }
+                        if fn_str == "public-key" {
+                            pubk_opt = Some(fv_str.to_string());
+                        }
+                    }
+                }
+
+                if let Some(pk_str) = pk_opt {
+                    if is_ssh || !pk_str.is_empty() {
+                        keys.push(VaultSshKey {
+                            id: cipher.id,
+                            name,
+                            private_key: Self::normalize_pem(&pk_str),
+                            public_key: pubk_opt,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    fn normalize_pem(pem: &str) -> String {
+        let trimmed = pem.trim();
+        if trimmed.starts_with("-----")
+            && !trimmed.contains('\n')
+            && trimmed.contains("-----BEGIN ")
+        {
+            if let Some(begin_end) = trimmed.find("----- ") {
+                let header = &trimmed[..begin_end + 5];
+                let remainder = &trimmed[begin_end + 5..].trim_start();
+                if let Some(last_dash) = remainder.rfind(" -----END ") {
+                    let body = &remainder[..last_dash];
+                    let footer = &remainder[last_dash + 1..];
+                    let body_lines = body.split_whitespace().collect::<Vec<_>>().join("\n");
+                    return format!("{header}\n{body_lines}\n{footer}\n");
+                }
+            }
+        }
+        trimmed.to_string()
     }
 }
 
@@ -2161,5 +2335,130 @@ mod tests {
         assert_eq!(i32::from(SecureNoteType::Generic), 0);
         assert_eq!(SecureNoteType::from(99), SecureNoteType::Other(99));
         assert_eq!(i32::from(SecureNoteType::Other(99)), 99);
+    }
+
+    #[tokio::test]
+    async fn test_get_ssh_keys_extraction() {
+        let key = make_test_key();
+        let store = VaultStore::new();
+
+        let priv_key_1 =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\ntestkey1\n-----END OPENSSH PRIVATE KEY-----\n";
+        let pub_key_1 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@test1";
+        let enc_name_1 = encrypt_with(
+            b"id_ed25519_test",
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_priv_1 = encrypt_with(
+            priv_key_1.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_pub_1 = encrypt_with(
+            pub_key_1.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+
+        let cipher_ssh = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::SshKey,
+            name: enc_name_1,
+            ssh_key: Some(SSHKeyCipher {
+                private_key: Some(enc_priv_1),
+                public_key: Some(enc_pub_1),
+                key_fingerprint: None,
+            }),
+            ..Default::default()
+        };
+
+        // Note-based SSH key
+        let priv_key_2 = "-----BEGIN RSA PRIVATE KEY----- AAAA BBBB -----END RSA PRIVATE KEY-----";
+        let pub_key_2 = "ssh-rsa AAAAB3NzaC1yc2E... user@test2";
+        let enc_name_2 =
+            encrypt_with(b"id_rsa_note", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_fn_custom =
+            encrypt_with(b"custom-type", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_fv_custom =
+            encrypt_with(b"ssh-key", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_fn_priv =
+            encrypt_with(b"private-key", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_fv_priv = encrypt_with(
+            priv_key_2.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_fn_pub =
+            encrypt_with(b"public-key", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_fv_pub = encrypt_with(
+            pub_key_2.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+
+        let cipher_note = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Note,
+            name: enc_name_2,
+            fields: vec![
+                Field {
+                    r#type: Some(FieldType::Text),
+                    name: Some(enc_fn_custom),
+                    value: Some(enc_fv_custom),
+                },
+                Field {
+                    r#type: Some(FieldType::Hidden),
+                    name: Some(enc_fn_priv),
+                    value: Some(enc_fv_priv),
+                },
+                Field {
+                    r#type: Some(FieldType::Text),
+                    name: Some(enc_fn_pub),
+                    value: Some(enc_fv_pub),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Deleted cipher should be ignored
+        let mut cipher_deleted = cipher_ssh.clone();
+        cipher_deleted.id = Some(Uuid::new_v4());
+        cipher_deleted.deleted_date = Some("2026-10-26T00:00:00Z".to_string());
+
+        store.insert(cipher_ssh).await;
+        store.insert(cipher_note).await;
+        store.insert(cipher_deleted).await;
+
+        let ssh_keys = store.get_ssh_keys(&key).await.unwrap();
+        assert_eq!(ssh_keys.len(), 2);
+
+        let key1 = ssh_keys
+            .iter()
+            .find(|k| k.name == "id_ed25519_test")
+            .unwrap();
+        assert_eq!(key1.private_key, priv_key_1.trim());
+        assert_eq!(key1.public_key.as_deref(), Some(pub_key_1));
+
+        let key2 = ssh_keys.iter().find(|k| k.name == "id_rsa_note").unwrap();
+        assert!(key2.private_key.contains("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(key2.private_key.contains("-----END RSA PRIVATE KEY-----"));
+        assert_eq!(key2.public_key.as_deref(), Some(pub_key_2));
+
+        // Blocking variant
+        let store_arc = std::sync::Arc::new(store);
+        let key_bytes = key.bytes();
+        let blocking_keys = tokio::task::spawn_blocking(move || {
+            let k = SymmetricKey::from_bytes(&key_bytes).unwrap();
+            store_arc.blocking_get_ssh_keys(&k).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blocking_keys.len(), 2);
     }
 }

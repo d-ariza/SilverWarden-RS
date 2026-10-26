@@ -614,7 +614,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** pruebas de socket y `ssh-add -L`; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-021, SW-032 · **Estado:** Pendiente
+**Depende de:** SW-021, SW-032 · **Estado:** Completado
 
 ---
 
@@ -633,7 +633,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** comparación con agente Go verificada; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-040 · **Estado:** Pendiente
+**Depende de:** SW-040 · **Estado:** Completado
 
 ---
 

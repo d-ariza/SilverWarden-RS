@@ -1446,6 +1446,53 @@ PASS
 | **Fase 3** | SW-044 + SW-045 | Add/Remove OpenSSH + Acciones IPC para GUI | `ssh-add <key>` y `ssh-add -d` modifican vault local y remoto; acciones IPC para GUI (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`). |
 | **Fase 4** | SW-046 | Interoperabilidad completa y regresión | Suite E2E con OpenSSH real, paridad byte a byte con agente Go y documentación de casos límite. |
 
+---
+
+### 5.3 Evidencia de Ejecución: [SW-040] y [SW-041] Servidor SSH Agent y List de Claves
+
+**Fecha:** 2026-10-26  
+**Crates modificados / implementados:**
+- `crates/sw-ssh-agent`: Servidor SSH Agent asíncrono con Tokio y Russh.
+  - `VaultAgentServer`: implementa `russh::keys::agent::server::Agent`. `confirm_request(msg)` permite `RequestKeys` (true), rechaza `AddKeys` (false) y autoriza `Sign` (true).
+  - Ciclo de vida y estado de bloqueo: métodos `new`, `with_key`, `unlock`, `lock`, `is_locked`, `vault`.
+  - Extracción y listado de identidades bajo demanda: `request_identities()` consulta `VaultStore`, descifra la clave privada en memoria bloqueada con la `user_symmetric_key`, la parsea con `russh::keys::PrivateKey::from_openssh`, extrae la `PublicKey` y asocia el nombre del cipher como comentario. Si el vault está bloqueado devuelve lista vacía.
+  - Servidor de socket Unix: `serve` y `serve_with_shutdown` limpian sockets huérfanos, crean el socket con permisos `0600` (`fchmod`/`set_permissions`) y ejecutan un bucle de aceptación con framing binario OpenSSH (`handle_connection`).
+  - `SshAgentServer`: struct de alto nivel para gestión del path del socket y el agente.
+- `crates/sw-vault`:
+  - `VaultSshKey`: struct con `id`, `name`, `private_key` y `public_key`.
+  - `get_ssh_keys`, `blocking_get_ssh_keys` y `extract_ssh_keys`: extracción y descifrado seguro de claves SSH tanto desde ciphers `CipherType::SshKey` como desde `CipherType::Note` (notas seguras con campos custom `ssh-key`, `private-key`, `public-key`).
+  - Normalización de encabezados PEM (`normalize_pem`).
+- `Cargo.toml`:
+  - Actualización a `russh = "0.65"` para solventar RUSTSEC-2026-0153 y RUSTSEC-2026-0154 (0 vulnerabilidades).
+
+#### Pruebas realizadas
+
+1. `test_serve_and_connect`: arranque del servidor en socket Unix temporal, conexión mediante `russh::keys::agent::client::AgentClient::connect_uds`, llamada exitosa a `request_identities()`.
+2. `test_list_empty_vault`: verificación de que con vault vacío o sin claves SSH se devuelve una lista vacía de identidades sin errores.
+3. `test_list_with_keys`: verificación con 2 claves de prueba (una tipo `CipherType::SshKey` y otra tipo `CipherType::Note`), validando nombres, formato y coincidencia exacta de claves públicas OpenSSH.
+4. `test_ssh_add_l`: prueba de integración real que ejecuta el binario `/usr/bin/ssh-add -L` apuntando a `SSH_AUTH_SOCK` en el socket temporal, verificando salida estándar con ambas claves y código de retorno 0.
+5. `test_ssh_add_l_empty_vault`: verificación de que `/usr/bin/ssh-add -L` con vault vacío devuelve código de salida 1 y mensaje estándar `"The agent has no identities."`.
+6. `test_vault_agent_server_lifecycle`: verificación de estados bloqueado/desbloqueado, limpieza de claves al bloquear y acceso a `VaultStore`.
+7. `test_confirm_request`: verificación de permisos para `RequestKeys`, `AddKeys`, `Sign`, `Lock` y `Unlock`.
+8. `test_ssh_agent_server_struct`: prueba de inicialización y `serve_with_shutdown` mediante el struct wrapper `SshAgentServer`.
+9. `test_handle_connection_add_keys_rejected`: verificación de que solicitudes `add_identity` desde el cliente son rechazadas (`confirm_request(AddKeys) = false`).
+10. `test_handle_connection_raw_stream_edge_cases`: prueba con mensajes de tipo desconocido (retornando `SSH_AGENT_FAILURE = 5`) y tramas mayores al límite máximo (`MAX_AGENT_FRAME_LEN = 256 KB`, cerrando la conexión).
+11. `test_error_display`: cobertura de formateo de `SshAgentError`.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-ssh-agent` | `cargo test -p sw-ssh-agent` | 11 pasan, 0 fallan (0.06s) |
+| Pruebas `sw-vault` | `cargo test -p sw-vault` | 27 pasan, 0 fallan (0.02s) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui` | 134+ pasan, 0 fallan |
+| Linter | `cargo clippy -p sw-ssh-agent -p sw-vault --tests -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-ssh-agent`** | `cargo llvm-cov -p sw-ssh-agent` | **91.72% líneas / 90.68% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-040 y SW-041 — Hecho (2026-10-26).
+
 
 
 

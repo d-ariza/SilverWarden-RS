@@ -8,9 +8,13 @@ license.workspace = true
 [dependencies]
 sw-vault = { workspace = true }
 sw-crypto = { workspace = true }
+sw-systemauth = { workspace = true }
 ssh-key = { workspace = true }
+russh = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
