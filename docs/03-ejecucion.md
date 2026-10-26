@@ -1540,6 +1540,15 @@ PASS
 
 **Estado:** ✅ SW-042 y SW-043 — Hecho (2026-10-26).
 
+#### Nota de Seguridad: Corrección de Bypass de Aprobación (DT-1 / D-M5-4)
+
+Se corrigió el mecanismo de bypass de aprobación en `DefaultApprovalProvider` (`crates/sw-ssh-agent/src/lib.rs`):
+- Se eliminaron las comprobaciones en tiempo de ejecución de las variables de entorno `SILVERWARDEN_SYSTEM_AUTH_DISABLED` y `GOLDWARDEN_SYSTEM_AUTH_DISABLED`, eliminando el riesgo de que el agente omita la aprobación en entornos de producción.
+- Se agregó el campo `bypass: bool` (inicializado siempre a `false` en producción).
+- Se habilitó el método `#[cfg(test)] pub fn with_bypass() -> Self` exclusivamente para tests de integración controlados.
+- Se reemplazó `test_default_approval_provider_env_bypass` por `test_default_approval_provider_no_bypass`, comprobando con un mock Assuan de `pinentry` que el proveedor solicita aprobación en producción y ejecuta el flujo de confirmación.
+- Cobertura actualizada tras el fix: **91.62% líneas / 91.71% regiones** (20 tests pasando).
+
 
 
 

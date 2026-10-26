@@ -65,25 +65,61 @@ pub trait ApprovalProvider: Send + Sync {
     fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError>;
 }
 
-/// Default approval provider using pinentry or environment variable bypass.
-#[derive(Debug, Default)]
-pub struct DefaultApprovalProvider;
+/// Default approval provider using pinentry.
+#[derive(Debug, Default, Clone)]
+pub struct DefaultApprovalProvider {
+    bypass: bool,
+    #[cfg(test)]
+    custom_bin: Option<PathBuf>,
+}
 
 impl DefaultApprovalProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            bypass: false,
+            #[cfg(test)]
+            custom_bin: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_bypass() -> Self {
+        Self {
+            bypass: true,
+            custom_bin: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_custom_bin(bin: PathBuf) -> Self {
+        Self {
+            bypass: false,
+            custom_bin: Some(bin),
+        }
     }
 }
 
 impl ApprovalProvider for DefaultApprovalProvider {
     fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError> {
-        if std::env::var("SILVERWARDEN_SYSTEM_AUTH_DISABLED").as_deref() == Ok("true")
-            || std::env::var("GOLDWARDEN_SYSTEM_AUTH_DISABLED").as_deref() == Ok("true")
-        {
-            tracing::info!("System authentication disabled via env var; approving signature");
+        if self.bypass {
+            tracing::info!("Approval bypassed via test configuration; approving signature");
             return Ok(true);
         }
 
+        #[cfg(test)]
+        let pinentry_bin = self.custom_bin.clone().or_else(|| {
+            [
+                "pinentry",
+                "pinentry-curses",
+                "pinentry-gnome3",
+                "pinentry-qt",
+                "pinentry-mac",
+            ]
+            .iter()
+            .find_map(|bin| which_bin(bin))
+        });
+
+        #[cfg(not(test))]
         let pinentry_bin = [
             "pinentry",
             "pinentry-curses",
@@ -1573,7 +1609,7 @@ e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
 
         let key = make_test_key();
         let (vault, (_, pub_1), _) = setup_test_vault_with_keys(&key).await;
-        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
         let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -1601,7 +1637,6 @@ e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
                 data_path.to_str().unwrap(),
             ])
             .env("SSH_AUTH_SOCK", &socket_path)
-            .env("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true")
             .output()
             .await
             .expect("Failed to execute ssh-keygen -Y sign");
@@ -1670,7 +1705,7 @@ e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
 
         let key = make_test_key();
         let (vault, (_, pub_1), _) = setup_test_vault_with_keys(&key).await;
-        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
         let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -1693,7 +1728,6 @@ e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
                 .args(args)
                 .current_dir(git_dir)
                 .env("SSH_AUTH_SOCK", socket_path)
-                .env("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true")
                 .output()
                 .await
                 .expect("Failed to execute git");
@@ -1769,12 +1803,53 @@ e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
     }
 
     #[test]
-    fn test_default_approval_provider_env_bypass() {
-        let provider = DefaultApprovalProvider::new();
-        std::env::set_var("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true");
-        let res = provider.get_approval("title", "desc");
+    fn test_default_approval_provider_no_bypass() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let default_prov = DefaultApprovalProvider::new();
+        assert!(!default_prov.bypass);
+
+        let bypass_prov = DefaultApprovalProvider::with_bypass();
+        assert!(bypass_prov.bypass);
+        assert!(bypass_prov.get_approval("title", "desc").unwrap());
+
+        let temp_dir = TempDir::new().unwrap();
+        let witness_file = temp_dir.path().join("witness.txt");
+        let mock_script = temp_dir.path().join("mock_pinentry.sh");
+
+        let script_content = format!(
+            r#"#!/bin/sh
+echo "called" >> "{}"
+echo "OK Pleased to meet you"
+while read -r line; do
+  case "$line" in
+    CONFIRM*)
+      echo "OK"
+      ;;
+    BYE*)
+      echo "OK"
+      exit 0
+      ;;
+    *)
+      echo "OK"
+      ;;
+  esac
+done
+"#,
+            witness_file.display()
+        );
+
+        std::fs::write(&mock_script, script_content).unwrap();
+        let mut perms = std::fs::metadata(&mock_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mock_script, perms).unwrap();
+
+        let provider = DefaultApprovalProvider::with_custom_bin(mock_script);
+        let res = provider.get_approval("Signing Test", "Approve signature");
         assert!(res.unwrap());
-        std::env::remove_var("SILVERWARDEN_SYSTEM_AUTH_DISABLED");
+        assert!(witness_file.exists());
+        let witness_content = std::fs::read_to_string(&witness_file).unwrap();
+        assert!(witness_content.contains("called"));
     }
 
     #[test]
