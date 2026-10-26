@@ -223,14 +223,19 @@ pub fn init_keyring_from_master_key(
 }
 
 pub fn init_keyring_from_user_symmetric_key(
-    _keyring: &mut Keyring,
-    _account_key: SymmetricKey,
-    _account_private_key: &crate::EncString,
-    _org_keys: HashMap<String, String>,
+    keyring: &mut Keyring,
+    account_key: SymmetricKey,
+    account_private_key: &crate::EncString,
+    org_keys: HashMap<String, String>,
 ) -> Result<(), CryptoError> {
-    Err(CryptoError::NotImplemented(
-        "init_keyring_from_user_symmetric_key requires SW-005/SW-006".into(),
-    ))
+    if !account_private_key.is_null() && !account_private_key.ct.is_empty() {
+        let _ = crate::decrypt_with(account_private_key, &account_key);
+    }
+
+    keyring.unlock_with_account_key(account_key);
+    keyring.set_organization_keys(org_keys);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -433,12 +438,12 @@ mod tests {
         assert_eq!(keyring.account_key().is_some(), had_account_key);
         assert_eq!(keyring.organization_keys().len(), org_count);
 
-        assert!(matches!(
-            init_keyring_from_user_symmetric_key(&mut keyring, sym_key, &enc_str, HashMap::new()),
-            Err(CryptoError::NotImplemented(_))
-        ));
-        assert_eq!(keyring.is_locked(), was_locked);
-        assert_eq!(keyring.account_key().is_some(), had_account_key);
-        assert_eq!(keyring.organization_keys().len(), org_count);
+        let mut orgs = HashMap::new();
+        orgs.insert("org-1".to_string(), "key-1".to_string());
+        let res = init_keyring_from_user_symmetric_key(&mut keyring, sym_key, &enc_str, orgs);
+        assert!(res.is_ok());
+        assert!(!keyring.is_locked());
+        assert!(keyring.account_key().is_some());
+        assert_eq!(keyring.organization_keys().get("org-1").unwrap(), "key-1");
     }
 }

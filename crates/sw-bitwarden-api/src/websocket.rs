@@ -351,7 +351,7 @@ pub async fn run_websocket_daemon_with_options(
     client: Arc<Mutex<WebsocketClient>>,
     vault_store: Arc<VaultStore>,
     config: Arc<RwLock<ConfigFile>>,
-    _user_symmetric_key: SymmetricKey,
+    user_symmetric_key: SymmetricKey,
     backoff: std::time::Duration,
     mut stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), ApiError> {
@@ -451,7 +451,9 @@ pub async fn run_websocket_daemon_with_options(
                     let api_client = get_or_create_api_client(&client, &config).await;
                     let vault_paths =
                         VaultPaths::default_paths().unwrap_or_else(|_| VaultPaths::new("."));
-                    let _ = api_client.do_full_sync(&vault_paths, &vault_store).await;
+                    let _ = api_client
+                        .do_full_sync(&vault_paths, &vault_store, Some(&user_symmetric_key))
+                        .await;
                 }
                 NOTIFICATION_SYNC_CIPHER_UPDATE | NOTIFICATION_SYNC_CIPHER_CREATE => {
                     if let Some(ref id_str) = msg.cipher_id {
@@ -669,18 +671,14 @@ mod tests {
             let update_msg =
                 encode_notification_message(NOTIFICATION_SYNC_CIPHER_UPDATE, Some(&id_str), true);
             ws_stream
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    update_msg.into(),
-                ))
+                .send(tokio_tungstenite::tungstenite::Message::Binary(update_msg))
                 .await
                 .unwrap();
 
             // Send LogOut (Type: 11) to gracefully conclude daemon loop
             let logout_msg = encode_notification_message(NOTIFICATION_LOGOUT, None, true);
             ws_stream
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    logout_msg.into(),
-                ))
+                .send(tokio_tungstenite::tungstenite::Message::Binary(logout_msg))
                 .await
                 .unwrap();
         });
@@ -764,9 +762,7 @@ mod tests {
             let update_msg =
                 encode_notification_message(NOTIFICATION_SYNC_CIPHER_UPDATE, Some(&id_str), true);
             ws_stream
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    update_msg.into(),
-                ))
+                .send(tokio_tungstenite::tungstenite::Message::Binary(update_msg))
                 .await
                 .unwrap();
 
@@ -777,9 +773,7 @@ mod tests {
             let delete_msg =
                 encode_notification_message(NOTIFICATION_SYNC_CIPHER_DELETE, Some(&id_str), true);
             ws_stream
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    delete_msg.into(),
-                ))
+                .send(tokio_tungstenite::tungstenite::Message::Binary(delete_msg))
                 .await
                 .unwrap();
         });
@@ -876,9 +870,7 @@ mod tests {
             // Send SyncCiphers (Type: 4)
             let sync_msg = encode_notification_message(NOTIFICATION_SYNC_CIPHERS, None, true);
             ws_stream
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    sync_msg.into(),
-                ))
+                .send(tokio_tungstenite::tungstenite::Message::Binary(sync_msg))
                 .await
                 .unwrap();
 
@@ -941,5 +933,119 @@ mod tests {
         assert!(!standalone_client.is_connected());
         standalone_client.close().await;
         assert!(!standalone_client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_websocket_reconnects_after_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            // First connection: accept and disconnect immediately
+            let (stream1, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(stream1).await.unwrap();
+            let _ = ws1.next().await.unwrap().unwrap();
+            ws1.send(tokio_tungstenite::tungstenite::Message::Text(
+                "{}\x1e".into(),
+            ))
+            .await
+            .unwrap();
+            // Drop connection to trigger disconnect on client
+            drop(ws1);
+
+            // Second connection (reconnect): accept, handshake, send LogOut
+            let (stream2, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(stream2).await.unwrap();
+            let _ = ws2.next().await.unwrap().unwrap();
+            ws2.send(tokio_tungstenite::tungstenite::Message::Text(
+                "{}\x1e".into(),
+            ))
+            .await
+            .unwrap();
+            let logout_msg = encode_notification_message(NOTIFICATION_LOGOUT, None, true);
+            ws2.send(tokio_tungstenite::tungstenite::Message::Binary(logout_msg))
+                .await
+                .unwrap();
+        });
+
+        let ws_url = format!("ws://{}", ws_addr);
+        let ws_client = WebsocketClient::connect(&ws_url, "test_token")
+            .await
+            .expect("First connect must succeed");
+        let client_arc = Arc::new(Mutex::new(ws_client));
+        let vault_store = Arc::new(VaultStore::new());
+        let config = Arc::new(RwLock::new(ConfigFile {
+            notifications_url: ws_url,
+            ..Default::default()
+        }));
+        let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
+
+        let daemon_res = run_websocket_daemon_with_options(
+            client_arc,
+            vault_store,
+            config,
+            user_symmetric_key,
+            std::time::Duration::from_millis(100),
+            None,
+        )
+        .await;
+
+        assert!(daemon_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_websocket_ignores_malformed_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                "{}\x1e".into(),
+            ))
+            .await
+            .unwrap();
+
+            // Send malformed non-MessagePack binary frame
+            ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+                0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x00, 0x01,
+            ]))
+            .await
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Send valid LogOut to conclude cleanly
+            let logout_msg = encode_notification_message(NOTIFICATION_LOGOUT, None, true);
+            ws.send(tokio_tungstenite::tungstenite::Message::Binary(logout_msg))
+                .await
+                .unwrap();
+        });
+
+        let ws_url = format!("ws://{}", ws_addr);
+        let ws_client = WebsocketClient::connect(&ws_url, "test_token")
+            .await
+            .expect("Connect must succeed");
+        let client_arc = Arc::new(Mutex::new(ws_client));
+        let vault_store = Arc::new(VaultStore::new());
+        let config = Arc::new(RwLock::new(ConfigFile {
+            notifications_url: ws_url,
+            ..Default::default()
+        }));
+        let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
+
+        let daemon_res = run_websocket_daemon_with_options(
+            client_arc,
+            vault_store,
+            config,
+            user_symmetric_key,
+            std::time::Duration::from_millis(50),
+            None,
+        )
+        .await;
+
+        assert!(daemon_res.is_ok());
     }
 }
