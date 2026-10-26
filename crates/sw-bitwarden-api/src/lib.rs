@@ -13,6 +13,12 @@ pub use sw_crypto::{KdfConfig, KdfType};
 pub mod ciphers;
 pub use ciphers::{delete_cipher, get_cipher, post_cipher, put_cipher};
 
+pub mod websocket;
+pub use websocket::{
+    encode_notification_message, parse_message_pack, run_websocket_daemon,
+    run_websocket_daemon_with_options, NotificationMessage, WebsocketClient,
+};
+
 pub const BITWARDEN_USER_AGENT: &str = "silverwarden/0.0.1";
 pub const BITWARDEN_DEVICE_TYPE: &str = "10";
 pub const BITWARDEN_CLIENT_NAME: &str = "silverwarden";
@@ -38,11 +44,23 @@ pub enum ApiError {
     #[error("Vault error: {0}")]
     Vault(#[from] sw_vault::VaultError),
 
+    #[error("WebSocket error: {0}")]
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+
+    #[error("MessagePack decode error: {0}")]
+    MsgPack(#[from] rmp_serde::decode::Error),
+
     #[error("Server error ({status}): {message}")]
     Status {
         status: reqwest::StatusCode,
         message: String,
     },
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for ApiError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(err))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

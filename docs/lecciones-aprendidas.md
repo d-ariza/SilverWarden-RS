@@ -159,7 +159,7 @@ Antes de empezar un proyecto que maneje secretos, verificar:
 8. Actualizar `backlog.md` a `Hecho`.
 
 ### 5.3. Reglas de oro
-- **Nunca** afirmar paridad sin evidencia de Go.
+- **Nunca** afirmar paridad sin evidencia.
 - **Nunca** copiar un bug del sistema de referencia.
 - **Nunca** mezclar capas (crypto ≠ HTTP ≠ vault).
 - **Siempre** documentar el bug corregido.

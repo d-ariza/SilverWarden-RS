@@ -32,3 +32,7 @@ coverage/
 *.bak*
 *.key
 *.pem
+
+# Tooling artifacts
+graphify-out/
+graphify-rs.toml

@@ -564,7 +564,7 @@ Una historia pasa a `Hecho` solo cuando:
 - Actualización reactiva del vault en memoria.
 - Tolerancia a desconexiones y reintentos.
 
-**Depende de:** SW-030, SW-032 · **Estado:** Pendiente
+**Depende de:** SW-030, SW-032 · **Estado:** Hecho (2026-10-25)
 
 ---
 

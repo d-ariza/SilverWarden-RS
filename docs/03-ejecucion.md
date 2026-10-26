@@ -1306,6 +1306,70 @@ PASS
 
 **Estado:** ✅ SW-036 — Hecho (2026-10-24).
 
+---
+
+### [SW-035] Websocket de notificaciones (`sw-bitwarden-api`)
+
+**Fecha:** 2026-10-25  
+**Crate:** `sw-bitwarden-api`.  
+**Dependencias añadidas:** `futures-util = "0.3"`, `hex = { workspace = true }` (dev).
+
+#### 1. Implementación
+
+- **Módulo `sw-bitwarden-api::websocket`:**
+  - `NotificationMessage`:
+    - `message_type: i32`
+    - `cipher_id: Option<String>`
+  - `build_hub_url(url, token)`: normalización de URLs (`http`/`https` $\rightarrow$ `ws`/`wss`), anexión de `/hub` y parámetro `access_token`.
+  - `parse_message_pack(message: &[u8]) -> Option<NotificationMessage>`:
+    - Decodificación y salto del prefijo varint SignalR de 7 bits (`lenBufferLen`) con soporte fallback para MessagePack plano sin varint.
+    - Extracción de `Type` (i32) y `Id` (String opcional) de `Payload` (en índice 4 del array SignalR `[type, headers, invocationId, target, arguments]`).
+    - Paridad byte a byte con la implementación de referencia en Go (`websocketMessageType` y `parseMessageTypeFromMessagePack`).
+  - `encode_notification_message(message_type, cipher_id, with_varint)`: helper de codificación para testing y emulación.
+  - `WebsocketClient`:
+    - `connect(url: &str, token: &str) -> Result<Self, ApiError>`: conexión asíncrona vía `tokio_tungstenite::connect_async` y envío del handshake requerido `{"protocol":"messagepack","version":1}\x1e`.
+    - `next_message(&mut self) -> Option<NotificationMessage>`: lectura asíncrona de tramas WebSocket, filtrado de tramas de control y pings (con respuesta Pong automática), ignorado de respuestas de texto a handshake y parseo MessagePack de tramas binarias.
+    - `close(&mut self)`: cierre controlado de la conexión.
+    - `is_connected(&self) -> bool`: estado de conexión activa.
+  - `run_websocket_daemon` / `run_websocket_daemon_with_options`:
+    - Bucle asíncrono con tolerancia a caídas y reconexión periódica (backoff configurable, 60s por defecto).
+    - Despacho reactivo:
+      - `SyncCiphers (4)` / `SyncVault (5)`: ejecuta `api_client.do_full_sync(&vault_paths, &vault_store)`.
+      - `SyncCipherUpdate (0)` / `SyncCipherCreate (1)`: consulta `get_cipher(uuid)` y actualiza `vault_store.insert(cipher)`.
+      - `SyncCipherDelete (9)` / `SyncLoginDelete (2)`: remueve `vault_store.delete(&uuid)`.
+      - `LogOut (11)`: limpia la bóveda en memoria (`vault_store.clear()`), cierra el socket y sale limpiamente.
+    - `ApiError`: adición de variantes `WebSocket(Box<tokio_tungstenite::tungstenite::Error>)` y `MsgPack(#[from] rmp_serde::decode::Error)`.
+
+#### 2. Pruebas realizadas
+
+- `websocket::tests::test_build_hub_url`: normalización de esquema, ruta y query de conexión para múltiples variantes de URL.
+- `websocket::tests::test_parse_message_pack_go_parity_fixtures`: validación estricta contra fixtures reales generados con el codificador MessagePack de Go:
+  - `SyncCipherUpdate` con prefijo varint (`4f95d0...`).
+  - `SyncCipherUpdate` plano sin varint (`95d0...`).
+  - `SyncCiphers` sin ID de payload (`95d00180c0ae...d004`).
+- `websocket::tests::test_parse_message_pack_synthetic_roundtrip`: serialización y deserialización sintética de notificaciones y manejo de tramas cortas/inválidas.
+- `websocket::tests::test_mock_websocket_server_handshake_and_update`:
+  - Servidor WebSocket mock aceptando conexión y validando handshake inicial SignalR.
+  - Envío de notificación `SyncCipherUpdate` (Type: 0) con UUID de prueba.
+  - Consulta mock a WireMock HTTP (`GET /ciphers/{id}`).
+  - Despacho y verificación de llamada mock.
+  - Finalización con evento `LogOut` (Type: 11) y verificación de borrado seguro.
+- `websocket::tests::test_mock_websocket_server_update_then_delete`: inserción reactiva seguida de `SyncCipherDelete` (Type: 9) con canal de apagado `stop_rx`.
+- `websocket::tests::test_websocket_client_methods_and_sync_ciphers`: validación de accesores del cliente y recepción de evento `SyncCiphers` (Type: 4) ejecutando `do_full_sync` con actualización de `last_synced`.
+
+#### 3. Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-bitwarden-api` | `cargo test -p sw-bitwarden-api` | 42 pasan, 0 fallan (58.28s) |
+| Pruebas Workspace | `cargo test --workspace --exclude sw-gui` | 245 pasan en total, 0 fallan |
+| Linter | `cargo clippy -p sw-bitwarden-api -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 warning informativo documentado) |
+| **Cobertura `sw-bitwarden-api`** | `cargo llvm-cov -p sw-bitwarden-api` | **94.72% líneas / 93.89% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-035 — Hecho (2026-10-25).
+
 
 
 
