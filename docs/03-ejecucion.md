@@ -1493,6 +1493,53 @@ PASS
 
 **Estado:** ✅ SW-040 y SW-041 — Hecho (2026-10-26).
 
+---
+
+### 5.4 Evidencia de Ejecución: [SW-042] y [SW-043] Sign, SignWithFlags y Aprobación SSH
+
+**Fecha:** 2026-10-26  
+**Crates modificados / implementados:**
+- `crates/sw-ssh-agent`:
+  - `sign_with_key` y `sign_with_key_context`: búsqueda de clave por fingerprint SHA-256 o wire blob público, descifrado bajo demanda en memoria bloqueada con `user_symmetric_key`, parseo con `russh::keys::PrivateKey::from_openssh`.
+  - Detección de payloads SSHSIG Git: reconocimiento del prefijo mágico `SSHSIG\x00\x00\x00\x03git` para distinguir peticiones de commits Git versus autenticación SSH interactiva.
+  - Soporte de flags de firma OpenSSH:
+    - `flags & 2` (`SSH_AGENT_RSA_SHA2_256`): firma RSA con SHA2-256 (`HashAlg::Sha256`).
+    - `flags & 4` (`SSH_AGENT_RSA_SHA2_512`): firma RSA con SHA2-512 (`HashAlg::Sha512`).
+    - Sin flags / default: firma estándar según tipo de clave (Ed25519 o `ssh-rsa`).
+  - Framing OpenSSH `SSH2_AGENTC_SIGN_REQUEST` (tipo 13) y `SSH2_AGENT_SIGN_RESPONSE` (tipo 14) en `handle_connection`: extracción de `CallingContext` mediante `sw_systemauth::get_calling_context(&stream)`, parseo de tramas y serialización de `Signature` al formato binario OpenSSH (`russh::keys::ssh_encoding::Encode`).
+  - Aprobación y gestión de sesiones:
+    - Integración con `sw_systemauth::SessionStore` (TTL 60 min, tipo `SessionType::SSHKey`).
+    - Trait `ApprovalProvider`:
+      - `DefaultApprovalProvider`: comprobación de bypass por variable de entorno (`SILVERWARDEN_SYSTEM_AUTH_DISABLED` / `GOLDWARDEN_SYSTEM_AUTH_DISABLED`) y llamada a `pinentry` interactivo vía protocolo Assuan estándar.
+      - `MockApprovalProvider`: inyección controlada para pruebas unitarias e integración continua sin UI interactiva.
+    - Formato de mensaje idéntico a Go: `"<user> on <grandparent>><parent>><process> is requesting git/ssh signage with key <name>"` (con fallback si hay error en la resolución del contexto).
+    - Caching de sesión: la primera petición solicita aprobación e inserta la sesión; peticiones subsiguientes del mismo árbol de procesos no solicitan re-aprobación mientras la sesión esté viva. Al invocar `lock()`, se purgan las sesiones activas.
+
+#### Pruebas realizadas
+
+1. `test_sign_with_key_ed25519`: firma de datos arbitrarios con clave Ed25519 y verificación criptográfica con `Verifier::verify`.
+2. `test_sign_with_key_context_approval_caching`: verificación de que la 1ª firma solicita aprobación al proveedor (`call_count == 1`) y la 2ª firma del mismo contexto utiliza la sesión en caché sin invocar el proveedor (`call_count == 1`).
+3. `test_sign_with_key_approval_denied`: verificación de rechazo cuando el proveedor deniega la aprobación (`SshAgentError::ApprovalDenied`).
+4. `test_detect_git_sshsig_payload`: detección del prefijo `SSHSIG` en payloads de Git y comprobación del formato del mensaje de aprobación con `"git"`.
+5. `test_rsa_signing_flags`: verificación de firmas con flags 0 (default), 2 (`rsa-sha2-256`) y 4 (`rsa-sha2-512`) sobre clave RSA de 2048 bits OpenSSH.
+6. `test_handle_connection_sign_request_raw`: envío manual de tramas `SSH2_AGENTC_SIGN_REQUEST` (tipo 13) por socket Unix y parseo de la respuesta `SSH2_AGENT_SIGN_RESPONSE` (tipo 14).
+7. `test_ssh_keygen_y_sign_and_verify`: integración E2E con el binario de sistema `/usr/bin/ssh-keygen`, firmando con `-Y sign -n file -f <key>` a través de `SSH_AUTH_SOCK` y validando con `ssh-keygen -Y verify` con archivo `allowed_signers`.
+8. `test_git_commit_signed_with_agent`: integración E2E con el binario de sistema `/usr/bin/git`, configurando `gpg.format=ssh`, `user.signingkey` y ejecutando `git commit -S -m "..."`, validando la firma con `git log -1 --show-signature` (`Good "git" signature`).
+9. `test_default_approval_provider_env_bypass`: verificación de que variables de entorno desactivan la petición de aprobación cuando se configura explícitamente para entornos no interactivos.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-ssh-agent` | `cargo test -p sw-ssh-agent` | 20 pasan, 0 fallan (0.27s) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui` | 270+ pasan, 0 fallan |
+| Linter | `cargo clippy -p sw-ssh-agent --tests -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (exit 0) |
+| **Cobertura `sw-ssh-agent`** | `cargo llvm-cov -p sw-ssh-agent` | **86.60% líneas / 88.21% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-042 y SW-043 — Hecho (2026-10-26).
+
 
 
 

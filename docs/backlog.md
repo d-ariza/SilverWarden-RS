@@ -654,7 +654,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan con OpenSSH/git reales; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-041 · **Estado:** Pendiente
+**Depende de:** SW-041 · **Estado:** Completado
 
 ---
 
@@ -675,7 +675,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** criterios pasan; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-042, SW-023 · **Estado:** Pendiente
+**Depende de:** SW-042, SW-023 · **Estado:** Completado
 
 ---
 

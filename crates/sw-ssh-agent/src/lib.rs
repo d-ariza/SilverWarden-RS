@@ -11,6 +11,7 @@ pub use russh::keys::agent::AgentIdentity;
 use russh::keys::ssh_encoding::Encode;
 use russh::keys::PrivateKey;
 use sw_crypto::SymmetricKey;
+use sw_systemauth::{CallingContext, SessionStore, SessionType};
 use sw_vault::VaultStore;
 
 pub const SSH_AGENT_FAILURE: u8 = 5;
@@ -25,6 +26,10 @@ pub const SSH2_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
 pub const SSH2_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
 pub const MAX_AGENT_FRAME_LEN: usize = 256 * 1024;
 
+pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
+pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
+pub const SSHSIG_GIT_MAGIC: &[u8] = b"SSHSIG\x00\x00\x00\x03git";
+
 #[derive(Error, Debug)]
 pub enum SshAgentError {
     #[error("IO error: {0}")]
@@ -36,11 +41,197 @@ pub enum SshAgentError {
     #[error("Key parsing error: {0}")]
     KeyError(String),
 
+    #[error("Key not found")]
+    KeyNotFound,
+
+    #[error("Vault is locked")]
+    VaultLocked,
+
+    #[error("Approval denied: {0}")]
+    ApprovalDenied(String),
+
+    #[error("Signing error: {0}")]
+    SigningError(String),
+
     #[error("Encoding error: {0}")]
     EncodingError(String),
 
     #[error("Agent failure")]
     AgentFailure,
+}
+
+/// Trait abstracting approval requests (e.g., via pinentry, desktop prompt, or test mocks).
+pub trait ApprovalProvider: Send + Sync {
+    fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError>;
+}
+
+/// Default approval provider using pinentry or environment variable bypass.
+#[derive(Debug, Default)]
+pub struct DefaultApprovalProvider;
+
+impl DefaultApprovalProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ApprovalProvider for DefaultApprovalProvider {
+    fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError> {
+        if std::env::var("SILVERWARDEN_SYSTEM_AUTH_DISABLED").as_deref() == Ok("true")
+            || std::env::var("GOLDWARDEN_SYSTEM_AUTH_DISABLED").as_deref() == Ok("true")
+        {
+            tracing::info!("System authentication disabled via env var; approving signature");
+            return Ok(true);
+        }
+
+        let pinentry_bin = [
+            "pinentry",
+            "pinentry-curses",
+            "pinentry-gnome3",
+            "pinentry-qt",
+            "pinentry-mac",
+        ]
+        .iter()
+        .find_map(|bin| which_bin(bin));
+
+        let bin = match pinentry_bin {
+            Some(b) => b,
+            None => {
+                tracing::warn!("No pinentry binary found for approval dialog");
+                return Err(SshAgentError::ApprovalDenied(
+                    "No pinentry binary available".into(),
+                ));
+            }
+        };
+
+        run_pinentry_confirm(&bin, title, description)
+    }
+}
+
+fn which_bin(name: &str) -> Option<PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let full = dir.join(name);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn run_pinentry_confirm(bin: &Path, title: &str, description: &str) -> Result<bool, SshAgentError> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| SshAgentError::ApprovalDenied(format!("Failed to spawn pinentry: {e}")))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| SshAgentError::ApprovalDenied("Failed to open pinentry stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SshAgentError::ApprovalDenied("Failed to open pinentry stdout".into()))?;
+    let mut reader = BufReader::new(stdout);
+
+    // Initial OK greeting from pinentry
+    let mut greeting = String::new();
+    let _ = reader.read_line(&mut greeting);
+
+    let mut send_cmd = |cmd: &str| -> Result<String, SshAgentError> {
+        stdin
+            .write_all(cmd.as_bytes())
+            .map_err(|e| SshAgentError::ApprovalDenied(e.to_string()))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| SshAgentError::ApprovalDenied(e.to_string()))?;
+        stdin
+            .flush()
+            .map_err(|e| SshAgentError::ApprovalDenied(e.to_string()))?;
+
+        loop {
+            let mut resp = String::new();
+            let bytes_read = reader
+                .read_line(&mut resp)
+                .map_err(|e| SshAgentError::ApprovalDenied(e.to_string()))?;
+            if bytes_read == 0 {
+                return Err(SshAgentError::ApprovalDenied(
+                    "Pinentry closed unexpectedly".into(),
+                ));
+            }
+            if resp.starts_with("OK") || resp.starts_with("ERR") {
+                return Ok(resp);
+            }
+        }
+    };
+
+    let _ = send_cmd(&format!("SETTITLE {}", title.replace(['\n', '\r'], " ")));
+    let _ = send_cmd(&format!(
+        "SETDESC {}",
+        description.replace(['\n', '\r'], " ")
+    ));
+    let _ = send_cmd(&format!("SETPROMPT {}", title.replace(['\n', '\r'], " ")));
+    let confirm_res = send_cmd("CONFIRM")?;
+    let _ = send_cmd("BYE");
+    let _ = child.wait();
+
+    if confirm_res.starts_with("OK") {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Mock approval provider for deterministic unit and integration tests.
+#[derive(Debug, Default)]
+pub struct MockApprovalProvider {
+    approved: AtomicBool,
+    call_count: std::sync::atomic::AtomicUsize,
+    last_title: std::sync::RwLock<Option<String>>,
+    last_description: std::sync::RwLock<Option<String>>,
+}
+
+impl MockApprovalProvider {
+    pub fn new(approved: bool) -> Self {
+        Self {
+            approved: AtomicBool::new(approved),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            last_title: std::sync::RwLock::new(None),
+            last_description: std::sync::RwLock::new(None),
+        }
+    }
+
+    pub fn set_approved(&self, approved: bool) {
+        self.approved.store(approved, Ordering::SeqCst);
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    pub fn last_title(&self) -> Option<String> {
+        self.last_title.read().unwrap().clone()
+    }
+
+    pub fn last_description(&self) -> Option<String> {
+        self.last_description.read().unwrap().clone()
+    }
+}
+
+impl ApprovalProvider for MockApprovalProvider {
+    fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        *self.last_title.write().unwrap() = Some(title.to_string());
+        *self.last_description.write().unwrap() = Some(description.to_string());
+        Ok(self.approved.load(Ordering::SeqCst))
+    }
 }
 
 /// Agent server integrating with SilverWarden Vault and implementing `russh::keys::agent::server::Agent`.
@@ -49,6 +240,8 @@ pub struct VaultAgentServer {
     vault: Arc<VaultStore>,
     symmetric_key: Arc<RwLock<Option<SymmetricKey>>>,
     is_locked: Arc<AtomicBool>,
+    session_store: Arc<RwLock<SessionStore>>,
+    approval_provider: Arc<dyn ApprovalProvider>,
 }
 
 impl VaultAgentServer {
@@ -58,6 +251,8 @@ impl VaultAgentServer {
             vault,
             symmetric_key: Arc::new(RwLock::new(None)),
             is_locked: Arc::new(AtomicBool::new(true)),
+            session_store: Arc::new(RwLock::new(SessionStore::new())),
+            approval_provider: Arc::new(DefaultApprovalProvider::new()),
         }
     }
 
@@ -67,7 +262,31 @@ impl VaultAgentServer {
             vault,
             symmetric_key: Arc::new(RwLock::new(Some(key))),
             is_locked: Arc::new(AtomicBool::new(false)),
+            session_store: Arc::new(RwLock::new(SessionStore::new())),
+            approval_provider: Arc::new(DefaultApprovalProvider::new()),
         }
+    }
+
+    /// Overrides the approval provider (used in tests or custom dialog integrators).
+    pub fn with_approval_provider(mut self, provider: Arc<dyn ApprovalProvider>) -> Self {
+        self.approval_provider = provider;
+        self
+    }
+
+    /// Overrides the session store.
+    pub fn with_session_store(mut self, sessions: Arc<RwLock<SessionStore>>) -> Self {
+        self.session_store = sessions;
+        self
+    }
+
+    /// Access to the underlying session store.
+    pub fn session_store(&self) -> &Arc<RwLock<SessionStore>> {
+        &self.session_store
+    }
+
+    /// Access to the underlying approval provider.
+    pub fn approval_provider(&self) -> &Arc<dyn ApprovalProvider> {
+        &self.approval_provider
     }
 
     /// Unlocks the agent server with the provided user symmetric key.
@@ -77,11 +296,12 @@ impl VaultAgentServer {
         self.is_locked.store(false, Ordering::SeqCst);
     }
 
-    /// Locks the agent server, clearing the cached user symmetric key.
+    /// Locks the agent server, clearing the cached user symmetric key and wiping sessions.
     pub async fn lock(&self) {
         let mut guard = self.symmetric_key.write().await;
         *guard = None;
         self.is_locked.store(true, Ordering::SeqCst);
+        self.session_store.write().await.wipe();
     }
 
     /// Returns whether the vault is locked.
@@ -130,6 +350,150 @@ impl VaultAgentServer {
         }
 
         Ok(identities)
+    }
+
+    /// Signs data with a vault SSH key matched by public key wire blob or fingerprint.
+    pub async fn sign_with_key(
+        &self,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+    ) -> Result<Vec<u8>, SshAgentError> {
+        self.sign_with_key_context(key_blob, data, flags, None)
+            .await
+    }
+
+    /// Signs data with a vault SSH key, applying session authorization and pinentry approval if context is present.
+    pub async fn sign_with_key_context(
+        &self,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+        context: Option<&CallingContext>,
+    ) -> Result<Vec<u8>, SshAgentError> {
+        if self.is_locked() {
+            return Err(SshAgentError::VaultLocked);
+        }
+
+        let key_guard = self.symmetric_key.read().await;
+        let sym_key = match key_guard.as_ref() {
+            Some(k) => k,
+            None => return Err(SshAgentError::VaultLocked),
+        };
+
+        let vault_keys = self
+            .vault
+            .get_ssh_keys(sym_key)
+            .await
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        let target_pub = russh::keys::ssh_key::PublicKey::from_bytes(key_blob).ok();
+
+        let mut matched_pk: Option<(russh::keys::PrivateKey, String)> = None;
+        for vk in vault_keys {
+            if let Ok(pk) = russh::keys::PrivateKey::from_openssh(&vk.private_key) {
+                let mut wire_blob = Vec::new();
+                let _ = pk.public_key().key_data().encode(&mut wire_blob);
+
+                let is_match = wire_blob == key_blob
+                    || target_pub.as_ref() == Some(pk.public_key())
+                    || pk
+                        .public_key()
+                        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                        .to_string()
+                        .as_bytes()
+                        == key_blob
+                    || pk
+                        .public_key()
+                        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                        .as_bytes()
+                        == key_blob;
+
+                if is_match {
+                    matched_pk = Some((pk, vk.name));
+                    break;
+                }
+            }
+        }
+
+        let (pk, key_name) = matched_pk.ok_or(SshAgentError::KeyNotFound)?;
+
+        // Paso 3: Detectar firma de git (SSHSIG)
+        let is_git = data.starts_with(SSHSIG_GIT_MAGIC);
+
+        // Paso 4: Aprobación con pinentry / SessionStore
+        if let Some(ctx) = context {
+            let session_valid = self
+                .session_store
+                .read()
+                .await
+                .verify_session(ctx, SessionType::SSHKey);
+
+            if !session_valid {
+                let action = if is_git { "git" } else { "ssh" };
+                let message = if !ctx.error {
+                    format!(
+                        "{} on {}>{}>{} is requesting {} signage with key {}",
+                        ctx.username,
+                        ctx.grandparent_process_name,
+                        ctx.parent_process_name,
+                        ctx.process_name,
+                        action,
+                        key_name
+                    )
+                } else {
+                    format!(
+                        "{} is requesting {} signage with key {}",
+                        ctx.username, action, key_name
+                    )
+                };
+
+                let approved = self
+                    .approval_provider
+                    .get_approval("SSH Key Signing Request", &message)?;
+
+                if approved {
+                    self.session_store.write().await.create_session(
+                        ctx,
+                        SessionType::SSHKey,
+                        std::time::Duration::from_secs(3600),
+                    );
+                } else {
+                    return Err(SshAgentError::ApprovalDenied("Approval not given".into()));
+                }
+            } else {
+                tracing::info!("Using cached SSH session approval");
+            }
+        }
+
+        // Paso 5: Flags de firma (RSA) & firma
+        use russh::keys::signature::Signer;
+        use russh::keys::ssh_encoding::Encode;
+        use russh::keys::ssh_key::private::KeypairData;
+        use russh::keys::ssh_key::{HashAlg, Signature};
+
+        let keypair = pk.key_data();
+        let sig: Signature = match keypair {
+            KeypairData::Rsa(ref rsa) => {
+                let hash = if (flags & SSH_AGENT_RSA_SHA2_256) != 0 {
+                    Some(HashAlg::Sha256)
+                } else if (flags & SSH_AGENT_RSA_SHA2_512) != 0 {
+                    Some(HashAlg::Sha512)
+                } else {
+                    None
+                };
+                Signer::try_sign(&(rsa, hash), data)
+                    .map_err(|e| SshAgentError::SigningError(e.to_string()))?
+            }
+            _ => Signer::try_sign(keypair, data)
+                .map_err(|e| SshAgentError::SigningError(e.to_string()))?,
+        };
+
+        let mut sig_blob = Vec::new();
+        sig.encode(&mut sig_blob)
+            .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        Ok(sig_blob)
     }
 }
 
@@ -241,6 +605,7 @@ pub async fn handle_connection(
     mut stream: UnixStream,
     agent: VaultAgentServer,
 ) -> Result<(), SshAgentError> {
+    let ctx = sw_systemauth::get_calling_context(&stream);
     let mut len_buf = [0u8; 4];
 
     loop {
@@ -316,11 +681,64 @@ pub async fn handle_connection(
             }
             SSH2_AGENTC_SIGN_REQUEST => {
                 let allowed = agent.confirm_request(MessageType::Sign).await && !agent.is_locked();
-                if allowed {
-                    // Sign will be implemented in SW-042/SW-043
+                if !allowed {
                     send_failure(&mut stream).await?;
-                } else {
+                    continue;
+                }
+
+                // Parse: [u32 key_blob_len][key_blob][u32 data_len][data][u32 flags]
+                let mut offset = 1;
+                if offset + 4 > buf.len() {
                     send_failure(&mut stream).await?;
+                    continue;
+                }
+                let key_len =
+                    u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + key_len > buf.len() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+                let key_blob = &buf[offset..offset + key_len];
+                offset += key_len;
+
+                if offset + 4 > buf.len() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+                let data_len =
+                    u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + data_len > buf.len() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+                let data = &buf[offset..offset + data_len];
+                offset += data_len;
+
+                if offset + 4 > buf.len() {
+                    send_failure(&mut stream).await?;
+                    continue;
+                }
+                let flags = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+
+                match agent
+                    .sign_with_key_context(key_blob, data, flags, Some(&ctx))
+                    .await
+                {
+                    Ok(sig_blob) => {
+                        let mut resp_body = Vec::new();
+                        resp_body.push(SSH2_AGENT_SIGN_RESPONSE);
+                        (sig_blob.len() as u32)
+                            .encode(&mut resp_body)
+                            .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+                        resp_body.extend_from_slice(&sig_blob);
+                        send_frame(&mut stream, &resp_body).await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Sign request rejected or failed: {}", e);
+                        send_failure(&mut stream).await?;
+                    }
                 }
             }
             SSH2_AGENTC_ADD_IDENTITY | SSH2_AGENTC_ADD_ID_CONSTRAINED => {
@@ -791,6 +1209,574 @@ mod tests {
         let _ = server_handle.await;
     }
 
+    const TEST_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
+NhAAAAAwEAAQAAAQEA6HNXGgWxM+VCFHvJptz8GHPlOrgN8uybPY6o4u4IaC0PUKL/oUSC\n\
+HcEZ5fu4w1MUj4VVkziPtRm4cRnn1tksFnMOPawRyiCH9luCqWbrcnV3Y50EVnczCSPBBF\n\
+j5FDg4IaOhrqak77DBzBqo5tOF/rqRgwFxfnwdXzX5UkrzDrqsclvEWeNWQIXLNCkXMQLi\n\
+xgrrML3i+clg8JbXpI2y3HVOCEIYXq0RVwKhhHI6ybPoWnY0zZZX0oBFQRY3zJsvU/rwUw\n\
+iM76Ad5fvlSB0RO7D3nmtFP50SNFo1d9jlS+fPg7Lw2L+1Fhd54mIvG4BBFLFEMzaePUin\n\
+D8r4AGcl+QAAA8jidw+/4ncPvwAAAAdzc2gtcnNhAAABAQDoc1caBbEz5UIUe8mm3PwYc+\n\
+U6uA3y7Js9jqji7ghoLQ9Qov+hRIIdwRnl+7jDUxSPhVWTOI+1GbhxGefW2SwWcw49rBHK\n\
+IIf2W4KpZutydXdjnQRWdzMJI8EEWPkUODgho6GupqTvsMHMGqjm04X+upGDAXF+fB1fNf\n\
+lSSvMOuqxyW8RZ41ZAhcs0KRcxAuLGCuswveL5yWDwltekjbLcdU4IQhherRFXAqGEcjrJ\n\
+s+hadjTNllfSgEVBFjfMmy9T+vBTCIzvoB3l++VIHRE7sPeea0U/nRI0WjV32OVL58+Dsv\n\
+DYv7UWF3niYi8bgEEUsUQzNp49SKcPyvgAZyX5AAAAAwEAAQAAAQAFskRXJDeDY6OfRyj5\n\
+/sOj/adOgsONaXjIU0LLwYZ/mtUUfzb4jA3v5wFxfyxGQG+023S0bl1hooLAZiCX6QR5X8\n\
+7SSHhz6S8ectUlaFPY7WjynGXb1888yC8bBcCZFA5kwN2aNIz3r0wR1RTdB+cGzg3Op2x7\n\
+8puGb7N6H3whoBZbVRxKI5U1NzJ+tmRXZVK63/eeBoyf0qiFVEAQzMJ4Lq3dVFtZbkDIbZ\n\
+F2FAU2Yfv3bCXvFvLS0VKD2/BeXMhDwG89WQJC9B4RYpcMlwcGd1NKBalZPxCvic2jA9MI\n\
+UhJ+yBSUM0N9CuQTWsn4LfJTEdVCHGoBOcevYEH6GIDlAAAAgQDLJVUlScfqqbNQGDSjHE\n\
+oCoQBmUzdxhrnd4BwA6T5j5Vhd0ISuZ0g5DVFjhhHHch/6/lpaxUlabAN7cNc5m5uN6lQ3\n\
+nEMi13ue2XkFrS231xbD7y7lKFqg5ThhaL9dWKzn/LInYwfsM/25QcrRWii3p7SIHgIZ/Q\n\
+9a0xAub5BNFAAAAIEA9pg3z4QOCtSQ3OLW9ileVv2IwTCWTQ9KconJShqcBVWlps8hHXL+\n\
+gyXtA0s+OSwpSBTQDLzOHWMjHvSTr9LTpGphci/o1cyGWDO/y9H7cZtg1WVuIBcEWcY/C3\n\
+LIDalawfn3+mPZaOVXBpWTDiwf+Wiw/TquWpntplYJbi5U1HUAAACBAPFRBJD0MUrjF42v\n\
+8CEtxmX7m9wQcuVLkJ5XPGoPXx7GoaHmTH1mnZycVLWOevoU3W1YdARraR7Wr0M3+hENEu\n\
+Djy0VhpOceL/ugQCXmvmRscqf3I15V7/QqkReDnzR/Ww/RyNgHUeFBY20nrodL9NAmkmc0\n\
+e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
+-----END OPENSSH PRIVATE KEY-----";
+
+    const TEST_RSA_PUB: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDoc1caBbEz5UIUe8mm3PwYc+U6uA3y7Js9jqji7ghoLQ9Qov+hRIIdwRnl+7jDUxSPhVWTOI+1GbhxGefW2SwWcw49rBHKIIf2W4KpZutydXdjnQRWdzMJI8EEWPkUODgho6GupqTvsMHMGqjm04X+upGDAXF+fB1fNflSSvMOuqxyW8RZ41ZAhcs0KRcxAuLGCuswveL5yWDwltekjbLcdU4IQhherRFXAqGEcjrJs+hadjTNllfSgEVBFjfMmy9T+vBTCIzvoB3l++VIHRE7sPeea0U/nRI0WjV32OVL58+DsvDYv7UWF3niYi8bgEEUsUQzNp49SKcPyvgAZyX5 rsa-server";
+
+    #[tokio::test]
+    async fn test_sign_with_key_ed25519() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let agent = VaultAgentServer::with_key(vault, key);
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let test_data = b"Testing Ed25519 signature in SilverWarden";
+        let sig_bytes = agent.sign_with_key(&key_blob, test_data, 0).await.unwrap();
+
+        use russh::keys::ssh_encoding::Decode;
+        use russh::keys::ssh_key::Signature;
+        let mut slice = sig_bytes.as_slice();
+        let sig = Signature::decode(&mut slice).expect("Valid signature blob");
+        assert_eq!(sig.algorithm().as_str(), "ssh-ed25519");
+
+        use russh::keys::signature::Verifier;
+        pk.public_key()
+            .key_data()
+            .verify(test_data, &sig)
+            .expect("Signature verification should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_sign_with_key_context_approval_caching() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let agent =
+            VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval.clone());
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let ctx = CallingContext {
+            username: "hermes".into(),
+            process_name: "git".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "alacritty".into(),
+            process_pid: 1000,
+            parent_process_pid: 900,
+            grandparent_process_pid: 800,
+            error: false,
+            authenticated: true,
+        };
+
+        // 1st signing request: prompts approval
+        let sig1 = agent
+            .sign_with_key_context(&key_blob, b"data1", 0, Some(&ctx))
+            .await
+            .unwrap();
+        assert!(!sig1.is_empty());
+        assert_eq!(mock_approval.call_count(), 1);
+        assert_eq!(
+            mock_approval.last_title().as_deref(),
+            Some("SSH Key Signing Request")
+        );
+        let desc1 = mock_approval.last_description().unwrap();
+        assert!(desc1.contains(
+            "hermes on alacritty>bash>git is requesting ssh signage with key work-laptop"
+        ));
+
+        // 2nd signing request: session is cached, no prompt!
+        let sig2 = agent
+            .sign_with_key_context(&key_blob, b"data2", 0, Some(&ctx))
+            .await
+            .unwrap();
+        assert!(!sig2.is_empty());
+        assert_eq!(mock_approval.call_count(), 1); // Still 1!
+    }
+
+    #[tokio::test]
+    async fn test_sign_with_key_approval_denied() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(false));
+        let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let ctx = CallingContext {
+            username: "hermes".into(),
+            process_name: "ssh".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "tmux".into(),
+            process_pid: 2000,
+            parent_process_pid: 1900,
+            grandparent_process_pid: 1800,
+            error: false,
+            authenticated: true,
+        };
+
+        let res = agent
+            .sign_with_key_context(&key_blob, b"data", 0, Some(&ctx))
+            .await;
+        assert!(matches!(res, Err(SshAgentError::ApprovalDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn test_detect_git_sshsig_payload() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let agent =
+            VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval.clone());
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let ctx = CallingContext {
+            username: "hermes".into(),
+            process_name: "git".into(),
+            parent_process_name: "bash".into(),
+            grandparent_process_name: "terminal".into(),
+            process_pid: 3000,
+            parent_process_pid: 2900,
+            grandparent_process_pid: 2800,
+            error: false,
+            authenticated: true,
+        };
+
+        // Git SSHSIG payload
+        let git_data = [SSHSIG_GIT_MAGIC, b"tree 12345\nparent abcde\n"].concat();
+        let _ = agent
+            .sign_with_key_context(&key_blob, &git_data, 0, Some(&ctx))
+            .await
+            .unwrap();
+
+        let desc = mock_approval.last_description().unwrap();
+        assert!(desc.contains("is requesting git signage with key work-laptop"));
+
+        // Clear session
+        agent.session_store().write().await.wipe();
+
+        // Non-git payload with error context
+        let err_ctx = CallingContext {
+            username: "unknown_user".into(),
+            error: true,
+            authenticated: false,
+            ..Default::default()
+        };
+        let ssh_data = b"ssh connection challenge data";
+        let _ = agent
+            .sign_with_key_context(&key_blob, ssh_data, 0, Some(&err_ctx))
+            .await
+            .unwrap();
+
+        let desc_err = mock_approval.last_description().unwrap();
+        assert_eq!(
+            desc_err,
+            "unknown_user is requesting ssh signage with key work-laptop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rsa_signing_flags() {
+        let key = make_test_key();
+        let store = Arc::new(VaultStore::new());
+
+        let enc_name =
+            encrypt_with(b"rsa-server", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_priv = encrypt_with(
+            TEST_RSA_PEM.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_pub = encrypt_with(
+            TEST_RSA_PUB.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+
+        let cipher_rsa = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::SshKey,
+            name: enc_name,
+            ssh_key: Some(SSHKeyCipher {
+                private_key: Some(enc_priv),
+                public_key: Some(enc_pub),
+                key_fingerprint: None,
+            }),
+            ..Default::default()
+        };
+        store.insert(cipher_rsa).await;
+
+        let agent = VaultAgentServer::with_key(store, key);
+        let pk = PrivateKey::from_openssh(TEST_RSA_PEM).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let data = b"data to sign with RSA";
+
+        use russh::keys::signature::Verifier;
+        use russh::keys::ssh_encoding::Decode;
+        use russh::keys::ssh_key::Signature;
+
+        // 1. flags = 0 -> default ssh-rsa
+        let sig_blob_default = agent.sign_with_key(&key_blob, data, 0).await.unwrap();
+        let mut slice_default = sig_blob_default.as_slice();
+        let sig_default = Signature::decode(&mut slice_default).unwrap();
+        assert_eq!(sig_default.algorithm().as_str(), "ssh-rsa");
+        pk.public_key()
+            .key_data()
+            .verify(data, &sig_default)
+            .expect("ssh-rsa valid");
+
+        // 2. flags = 2 (SSH_AGENT_RSA_SHA2_256) -> rsa-sha2-256
+        let sig_blob_sha256 = agent
+            .sign_with_key(&key_blob, data, SSH_AGENT_RSA_SHA2_256)
+            .await
+            .unwrap();
+        let mut slice_sha256 = sig_blob_sha256.as_slice();
+        let sig_sha256 = Signature::decode(&mut slice_sha256).unwrap();
+        assert_eq!(sig_sha256.algorithm().as_str(), "rsa-sha2-256");
+        pk.public_key()
+            .key_data()
+            .verify(data, &sig_sha256)
+            .expect("rsa-sha2-256 valid");
+
+        // 3. flags = 4 (SSH_AGENT_RSA_SHA2_512) -> rsa-sha2-512
+        let sig_blob_sha512 = agent
+            .sign_with_key(&key_blob, data, SSH_AGENT_RSA_SHA2_512)
+            .await
+            .unwrap();
+        let mut slice_sha512 = sig_blob_sha512.as_slice();
+        let sig_sha512 = Signature::decode(&mut slice_sha512).unwrap();
+        assert_eq!(sig_sha512.algorithm().as_str(), "rsa-sha2-512");
+        pk.public_key()
+            .key_data()
+            .verify(data, &sig_sha512)
+            .expect("rsa-sha2-512 valid");
+    }
+
+    #[tokio::test]
+    async fn test_handle_connection_sign_request_raw() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("agent_raw_sign.sock");
+
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+
+        // 1. Successful sign request
+        let data = b"payload to be signed via socket";
+        let mut req_body = Vec::new();
+        req_body.push(SSH2_AGENTC_SIGN_REQUEST);
+        (key_blob.len() as u32).encode(&mut req_body).unwrap();
+        req_body.extend_from_slice(&key_blob);
+        (data.len() as u32).encode(&mut req_body).unwrap();
+        req_body.extend_from_slice(data);
+        0u32.encode(&mut req_body).unwrap(); // flags = 0
+
+        send_frame(&mut stream, &req_body).await.unwrap();
+
+        let mut resp_len = [0u8; 4];
+        stream.read_exact(&mut resp_len).await.unwrap();
+        let len = u32::from_be_bytes(resp_len) as usize;
+        let mut resp_buf = vec![0u8; len];
+        stream.read_exact(&mut resp_buf).await.unwrap();
+
+        assert_eq!(resp_buf[0], SSH2_AGENT_SIGN_RESPONSE);
+        let sig_len = u32::from_be_bytes(resp_buf[1..5].try_into().unwrap()) as usize;
+        let sig_blob = &resp_buf[5..5 + sig_len];
+
+        use russh::keys::signature::Verifier;
+        use russh::keys::ssh_encoding::Decode;
+        use russh::keys::ssh_key::Signature;
+        let mut slice = sig_blob;
+        let sig = Signature::decode(&mut slice).unwrap();
+        pk.public_key().key_data().verify(data, &sig).unwrap();
+
+        // 2. Unknown key blob -> SSH_AGENT_FAILURE
+        let mut fail_req = Vec::new();
+        fail_req.push(SSH2_AGENTC_SIGN_REQUEST);
+        let bad_key = vec![0x99; 32];
+        (bad_key.len() as u32).encode(&mut fail_req).unwrap();
+        fail_req.extend_from_slice(&bad_key);
+        (data.len() as u32).encode(&mut fail_req).unwrap();
+        fail_req.extend_from_slice(data);
+        0u32.encode(&mut fail_req).unwrap();
+
+        send_frame(&mut stream, &fail_req).await.unwrap();
+        let mut fail_len = [0u8; 4];
+        stream.read_exact(&mut fail_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(fail_len), 1);
+        let mut fail_code = [0u8; 1];
+        stream.read_exact(&mut fail_code).await.unwrap();
+        assert_eq!(fail_code[0], SSH_AGENT_FAILURE);
+
+        // 3. Locked agent -> SSH_AGENT_FAILURE
+        agent.lock().await;
+        send_frame(&mut stream, &req_body).await.unwrap();
+        let mut lock_len = [0u8; 4];
+        stream.read_exact(&mut lock_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(lock_len), 1);
+        let mut lock_code = [0u8; 1];
+        stream.read_exact(&mut lock_code).await.unwrap();
+        assert_eq!(lock_code[0], SSH_AGENT_FAILURE);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_keygen_y_sign_and_verify() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("keygen_sign.sock");
+
+        let key = make_test_key();
+        let (vault, (_, pub_1), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let pub_path = temp_dir.path().join("id_ed25519.pub");
+        std::fs::write(&pub_path, &pub_1).unwrap();
+
+        let data_path = temp_dir.path().join("document.txt");
+        std::fs::write(&data_path, b"Authentic document for signing").unwrap();
+
+        let sign_res = tokio::process::Command::new("ssh-keygen")
+            .args([
+                "-Y",
+                "sign",
+                "-f",
+                pub_path.to_str().unwrap(),
+                "-n",
+                "file",
+                data_path.to_str().unwrap(),
+            ])
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .env("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true")
+            .output()
+            .await
+            .expect("Failed to execute ssh-keygen -Y sign");
+
+        assert!(
+            sign_res.status.success(),
+            "ssh-keygen -Y sign failed: stderr={}",
+            String::from_utf8_lossy(&sign_res.stderr)
+        );
+
+        let sig_path = temp_dir.path().join("document.txt.sig");
+        assert!(sig_path.exists(), "Signature file must exist");
+
+        // Allowed signers file
+        let allowed_signers = temp_dir.path().join("allowed_signers");
+        std::fs::write(
+            &allowed_signers,
+            format!("test@silverwarden.local {}\n", pub_1),
+        )
+        .unwrap();
+
+        let data_bytes = std::fs::read(&data_path).unwrap();
+        let mut verify_cmd = tokio::process::Command::new("ssh-keygen");
+        verify_cmd
+            .args([
+                "-Y",
+                "verify",
+                "-f",
+                allowed_signers.to_str().unwrap(),
+                "-I",
+                "test@silverwarden.local",
+                "-n",
+                "file",
+                "-s",
+                sig_path.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = verify_cmd
+            .spawn()
+            .expect("Failed to spawn ssh-keygen -Y verify");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&data_bytes).await.unwrap();
+        }
+        let verify_res = child
+            .wait_with_output()
+            .await
+            .expect("Failed to wait on verify");
+
+        assert!(
+            verify_res.status.success(),
+            "ssh-keygen -Y verify failed: stderr={}",
+            String::from_utf8_lossy(&verify_res.stderr)
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_git_commit_signed_with_agent() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("git_sign.sock");
+
+        let key = make_test_key();
+        let (vault, (_, pub_1), _) = setup_test_vault_with_keys(&key).await;
+        let mock_approval = Arc::new(MockApprovalProvider::new(true));
+        let agent = VaultAgentServer::with_key(vault, key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        let git_dir = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        async fn run_git(
+            args: &[&str],
+            git_dir: &Path,
+            socket_path: &Path,
+        ) -> std::process::Output {
+            let res = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(git_dir)
+                .env("SSH_AUTH_SOCK", socket_path)
+                .env("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true")
+                .output()
+                .await
+                .expect("Failed to execute git");
+            assert!(
+                res.status.success(),
+                "git {:?} failed: stderr={}",
+                args,
+                String::from_utf8_lossy(&res.stderr)
+            );
+            res
+        }
+
+        run_git(&["init", "-b", "main"], &git_dir, &socket_path).await;
+        run_git(
+            &["config", "user.name", "SilverWarden Test"],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+        run_git(
+            &["config", "user.email", "test@silverwarden.local"],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+        run_git(&["config", "gpg.format", "ssh"], &git_dir, &socket_path).await;
+        let key_pub_path = git_dir.join("id_ed25519.pub");
+        std::fs::write(&key_pub_path, &pub_1).unwrap();
+        run_git(
+            &["config", "user.signingkey", key_pub_path.to_str().unwrap()],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+        let allowed_signers_path = git_dir.join("allowed_signers");
+        std::fs::write(
+            &allowed_signers_path,
+            format!("test@silverwarden.local {}\n", pub_1),
+        )
+        .unwrap();
+        run_git(
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                allowed_signers_path.to_str().unwrap(),
+            ],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+        run_git(
+            &["config", "commit.gpgsign", "true"],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+
+        std::fs::write(git_dir.join("README.md"), "test commit").unwrap();
+        run_git(&["add", "README.md"], &git_dir, &socket_path).await;
+        run_git(
+            &["commit", "-m", "Signed commit from silverwarden agent"],
+            &git_dir,
+            &socket_path,
+        )
+        .await;
+
+        let log_res = run_git(&["log", "--show-signature", "-1"], &git_dir, &socket_path).await;
+        let stdout = String::from_utf8_lossy(&log_res.stdout);
+        assert!(stdout.contains("Good \"git\" signature"));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[test]
+    fn test_default_approval_provider_env_bypass() {
+        let provider = DefaultApprovalProvider::new();
+        std::env::set_var("SILVERWARDEN_SYSTEM_AUTH_DISABLED", "true");
+        let res = provider.get_approval("title", "desc");
+        assert!(res.unwrap());
+        std::env::remove_var("SILVERWARDEN_SYSTEM_AUTH_DISABLED");
+    }
+
     #[test]
     fn test_error_display() {
         let io_err = SshAgentError::Io(std::io::Error::new(
@@ -810,5 +1796,17 @@ mod tests {
 
         let fail_err = SshAgentError::AgentFailure;
         assert_eq!(format!("{}", fail_err), "Agent failure");
+
+        let not_found_err = SshAgentError::KeyNotFound;
+        assert_eq!(format!("{}", not_found_err), "Key not found");
+
+        let locked_err = SshAgentError::VaultLocked;
+        assert_eq!(format!("{}", locked_err), "Vault is locked");
+
+        let denied_err = SshAgentError::ApprovalDenied("cancelled".into());
+        assert!(format!("{}", denied_err).contains("cancelled"));
+
+        let sign_err = SshAgentError::SigningError("signature failed".into());
+        assert!(format!("{}", sign_err).contains("signature failed"));
     }
 }
