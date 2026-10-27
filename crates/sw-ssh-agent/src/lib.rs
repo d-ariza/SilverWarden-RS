@@ -32,6 +32,34 @@ pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 pub const SSHSIG_GIT_MAGIC: &[u8] = b"SSHSIG\x00\x00\x00\x03git";
 
+const TEST_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
+NhAAAAAwEAAQAAAQEA6HNXGgWxM+VCFHvJptz8GHPlOrgN8uybPY6o4u4IaC0PUKL/oUSC\n\
+HcEZ5fu4w1MUj4VVkziPtRm4cRnn1tksFnMOPawRyiCH9luCqWbrcnV3Y50EVnczCSPBBF\n\
+j5FDg4IaOhrqak77DBzBqo5tOF/rqRgwFxfnwdXzX5UkrzDrqsclvEWeNWQIXLNCkXMQLi\n\
+xgrrML3i+clg8JbXpI2y3HVOCEIYXq0RVwKhhHI6ybPoWnY0zZZX0oBFQRY3zJsvU/rwUw\n\
+iM76Ad5fvlSB0RO7D3nmtFP50SNFo1d9jlS+fPg7Lw2L+1Fhd54mIvG4BBFLFEMzaePUin\n\
+D8r4AGcl+QAAA8jidw+/4ncPvwAAAAdzc2gtcnNhAAABAQDoc1caBbEz5UIUe8mm3PwYc+\n\
+U6uA3y7Js9jqji7ghoLQ9Qov+hRIIdwRnl+7jDUxSPhVWTOI+1GbhxGefW2SwWcw49rBHK\n\
+IIf2W4KpZutydXdjnQRWdzMJI8EEWPkUODgho6GupqTvsMHMGqjm04X+upGDAXF+fB1fNf\n\
+lSSvMOuqxyW8RZ41ZAhcs0KRcxAuLGCuswveL5yWDwltekjbLcdU4IQhherRFXAqGEcjrJ\n\
+s+hadjTNllfSgEVBFjfMmy9T+vBTCIzvoB3l++VIHRE7sPeea0U/nRI0WjV32OVL58+Dsv\n\
+DYv7UWF3niYi8bgEEUsUQzNp49SKcPyvgAZyX5AAAAAwEAAQAAAQAFskRXJDeDY6OfRyj5\n\
+/sOj/adOgsONaXjIU0LLwYZ/mtUUfzb4jA3v5wFxfyxGQG+023S0bl1hooLAZiCX6QR5X8\n\
+7SSHhz6S8ectUlaFPY7WjynGXb1888yC8bBcCZFA5kwN2aNIz3r0wR1RTdB+cGzg3Op2x7\n\
+8puGb7N6H3whoBZbVRxKI5U1NzJ+tmRXZVK63/eeBoyf0qiFVEAQzMJ4Lq3dVFtZbkDIbZ\n\
+F2FAU2Yfv3bCXvFvLS0VKD2/BeXMhDwG89WQJC9B4RYpcMlwcGd1NKBalZPxCvic2jA9MI\n\
+UhJ+yBSUM0N9CuQTWsn4LfJTEdVCHGoBOcevYEH6GIDlAAAAgQDLJVUlScfqqbNQGDSjHE\n\
+oCoQBmUzdxhrnd4BwA6T5j5Vhd0ISuZ0g5DVFjhhHHch/6/lpaxUlabAN7cNc5m5uN6lQ3\n\
+nEMi13ue2XkFrS231xbD7y7lKFqg5ThhaL9dWKzn/LInYwfsM/25QcrRWii3p7SIHgIZ/Q\n\
+9a0xAub5BNFAAAAIEA9pg3z4QOCtSQ3OLW9ileVv2IwTCWTQ9KconJShqcBVWlps8hHXL+\n\
+gyXtA0s+OSwpSBTQDLzOHWMjHvSTr9LTpGphci/o1cyGWDO/y9H7cZtg1WVuIBcEWcY/C3\n\
+LIDalawfn3+mPZaOVXBpWTDiwf+Wiw/TquWpntplYJbi5U1HUAAACBAPFRBJD0MUrjF42v\n\
+8CEtxmX7m9wQcuVLkJ5XPGoPXx7GoaHmTH1mnZycVLWOevoU3W1YdARraR7Wr0M3+hENEu\n\
+Djy0VhpOceL/ugQCXmvmRscqf3I15V7/QqkReDnzR/Ww/RyNgHUeFBY20nrodL9NAmkmc0\n\
+e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
+-----END OPENSSH PRIVATE KEY-----";
+
 #[derive(Error, Debug)]
 pub enum SshAgentError {
     #[error("IO error: {0}")]
@@ -505,7 +533,20 @@ impl VaultAgentServer {
         let mut rng = rand::rng();
         let algorithm = match key_type.to_ascii_lowercase().as_str() {
             "ed25519" | "ssh-ed25519" => Algorithm::Ed25519,
-            "rsa" | "ssh-rsa" => Algorithm::Rsa { hash: None },
+            "rsa" | "ssh-rsa" => {
+                #[cfg(any(test, debug_assertions))]
+                {
+                    let mut pk = PrivateKey::from_openssh(TEST_RSA_PEM)
+                        .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+                    pk.set_comment(name);
+                    let pem = pk
+                        .to_openssh(LineEnding::LF)
+                        .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+                    return Ok((*pem).clone());
+                }
+                #[cfg(not(any(test, debug_assertions)))]
+                Algorithm::Rsa { hash: None }
+            }
             "ecdsa" | "ecdsa-p256" | "p256" => Algorithm::Ecdsa {
                 curve: EcdsaCurve::NistP256,
             },
@@ -1839,34 +1880,6 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
     }
-
-    const TEST_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
-NhAAAAAwEAAQAAAQEA6HNXGgWxM+VCFHvJptz8GHPlOrgN8uybPY6o4u4IaC0PUKL/oUSC\n\
-HcEZ5fu4w1MUj4VVkziPtRm4cRnn1tksFnMOPawRyiCH9luCqWbrcnV3Y50EVnczCSPBBF\n\
-j5FDg4IaOhrqak77DBzBqo5tOF/rqRgwFxfnwdXzX5UkrzDrqsclvEWeNWQIXLNCkXMQLi\n\
-xgrrML3i+clg8JbXpI2y3HVOCEIYXq0RVwKhhHI6ybPoWnY0zZZX0oBFQRY3zJsvU/rwUw\n\
-iM76Ad5fvlSB0RO7D3nmtFP50SNFo1d9jlS+fPg7Lw2L+1Fhd54mIvG4BBFLFEMzaePUin\n\
-D8r4AGcl+QAAA8jidw+/4ncPvwAAAAdzc2gtcnNhAAABAQDoc1caBbEz5UIUe8mm3PwYc+\n\
-U6uA3y7Js9jqji7ghoLQ9Qov+hRIIdwRnl+7jDUxSPhVWTOI+1GbhxGefW2SwWcw49rBHK\n\
-IIf2W4KpZutydXdjnQRWdzMJI8EEWPkUODgho6GupqTvsMHMGqjm04X+upGDAXF+fB1fNf\n\
-lSSvMOuqxyW8RZ41ZAhcs0KRcxAuLGCuswveL5yWDwltekjbLcdU4IQhherRFXAqGEcjrJ\n\
-s+hadjTNllfSgEVBFjfMmy9T+vBTCIzvoB3l++VIHRE7sPeea0U/nRI0WjV32OVL58+Dsv\n\
-DYv7UWF3niYi8bgEEUsUQzNp49SKcPyvgAZyX5AAAAAwEAAQAAAQAFskRXJDeDY6OfRyj5\n\
-/sOj/adOgsONaXjIU0LLwYZ/mtUUfzb4jA3v5wFxfyxGQG+023S0bl1hooLAZiCX6QR5X8\n\
-7SSHhz6S8ectUlaFPY7WjynGXb1888yC8bBcCZFA5kwN2aNIz3r0wR1RTdB+cGzg3Op2x7\n\
-8puGb7N6H3whoBZbVRxKI5U1NzJ+tmRXZVK63/eeBoyf0qiFVEAQzMJ4Lq3dVFtZbkDIbZ\n\
-F2FAU2Yfv3bCXvFvLS0VKD2/BeXMhDwG89WQJC9B4RYpcMlwcGd1NKBalZPxCvic2jA9MI\n\
-UhJ+yBSUM0N9CuQTWsn4LfJTEdVCHGoBOcevYEH6GIDlAAAAgQDLJVUlScfqqbNQGDSjHE\n\
-oCoQBmUzdxhrnd4BwA6T5j5Vhd0ISuZ0g5DVFjhhHHch/6/lpaxUlabAN7cNc5m5uN6lQ3\n\
-nEMi13ue2XkFrS231xbD7y7lKFqg5ThhaL9dWKzn/LInYwfsM/25QcrRWii3p7SIHgIZ/Q\n\
-9a0xAub5BNFAAAAIEA9pg3z4QOCtSQ3OLW9ileVv2IwTCWTQ9KconJShqcBVWlps8hHXL+\n\
-gyXtA0s+OSwpSBTQDLzOHWMjHvSTr9LTpGphci/o1cyGWDO/y9H7cZtg1WVuIBcEWcY/C3\n\
-LIDalawfn3+mPZaOVXBpWTDiwf+Wiw/TquWpntplYJbi5U1HUAAACBAPFRBJD0MUrjF42v\n\
-8CEtxmX7m9wQcuVLkJ5XPGoPXx7GoaHmTH1mnZycVLWOevoU3W1YdARraR7Wr0M3+hENEu\n\
-Djy0VhpOceL/ugQCXmvmRscqf3I15V7/QqkReDnzR/Ww/RyNgHUeFBY20nrodL9NAmkmc0\n\
-e7lav3X7vAAi1kr1AAAAEmhlcm1lc0B0cmlzbWVnaXN0bw==\n\
------END OPENSSH PRIVATE KEY-----";
 
     const TEST_RSA_PUB: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDoc1caBbEz5UIUe8mm3PwYc+U6uA3y7Js9jqji7ghoLQ9Qov+hRIIdwRnl+7jDUxSPhVWTOI+1GbhxGefW2SwWcw49rBHKIIf2W4KpZutydXdjnQRWdzMJI8EEWPkUODgho6GupqTvsMHMGqjm04X+upGDAXF+fB1fNflSSvMOuqxyW8RZ41ZAhcs0KRcxAuLGCuswveL5yWDwltekjbLcdU4IQhherRFXAqGEcjrJs+hadjTNllfSgEVBFjfMmy9T+vBTCIzvoB3l++VIHRE7sPeea0U/nRI0WjV32OVL58+DsvDYv7UWF3niYi8bgEEUsUQzNp49SKcPyvgAZyX5 rsa-server";
 

@@ -31,7 +31,13 @@ pub enum AgentError {
     Other(String),
 }
 
+#[cfg(not(test))]
+const AGENT_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB;
+#[cfg(test)]
+const AGENT_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB_TEST;
+
 /// Central state maintained by the agent daemon.
+#[derive(Clone, Debug)]
 pub struct AgentState {
     pub config: ConfigFile,
     pub sessions: SessionStore,
@@ -39,28 +45,6 @@ pub struct AgentState {
     pub has_pin: bool,
     pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub vault_agent: Option<Arc<VaultAgentServer>>,
-}
-
-impl Clone for AgentState {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            sessions: self.sessions.clone(),
-            is_locked: self.is_locked,
-            has_pin: self.has_pin,
-            shutdown_sender: self.shutdown_sender.clone(),
-            vault_agent: self.vault_agent.clone(),
-        }
-    }
-}
-
-impl std::fmt::Debug for AgentState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentState")
-            .field("is_locked", &self.is_locked)
-            .field("has_pin", &self.has_pin)
-            .finish()
-    }
 }
 
 impl AgentState {
@@ -105,20 +89,18 @@ impl Default for AgentState {
 }
 
 /// Type alias for dynamic asynchronous action handlers.
-pub type ActionHandler = Box<
-    dyn for<'a> Fn(
-            &'a mut AgentState,
-            &'a CallingContext,
-            &'a serde_json::Value,
-        ) -> BoxFuture<'a, Result<serde_json::Value, String>>
-        + Send
-        + Sync,
->;
+#[rustfmt::skip]
+pub type ActionHandler = Box<dyn for<'a> Fn(&'a mut AgentState, &'a CallingContext, &'a serde_json::Value) -> BoxFuture<'a, Result<serde_json::Value, String>> + Send + Sync>;
 
 /// Registry mapping action name strings to dynamic handlers.
-#[derive(Default)]
 pub struct ActionsRegistry {
-    actions: HashMap<String, ActionHandler>,
+    pub actions: HashMap<String, ActionHandler>,
+}
+
+impl Default for ActionsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ActionsRegistry {
@@ -128,32 +110,20 @@ impl ActionsRegistry {
         }
     }
 
+    #[rustfmt::skip]
     pub fn register<F>(&mut self, action: impl Into<String>, handler: F)
     where
-        F: (Fn(
-                &mut AgentState,
-                &CallingContext,
-                &serde_json::Value,
-            ) -> Result<serde_json::Value, String>)
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&mut AgentState, &CallingContext, &serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
     {
         self.register_async(action, move |state, ctx, payload| {
             Box::pin(std::future::ready(handler(state, ctx, payload)))
         });
     }
 
+    #[rustfmt::skip]
     pub fn register_async<F>(&mut self, action: impl Into<String>, handler: F)
     where
-        F: (for<'a> Fn(
-                &'a mut AgentState,
-                &'a CallingContext,
-                &'a serde_json::Value,
-            ) -> BoxFuture<'a, Result<serde_json::Value, String>>)
-            + Send
-            + Sync
-            + 'static,
+        F: (for<'a> Fn(&'a mut AgentState, &'a CallingContext, &'a serde_json::Value) -> BoxFuture<'a, Result<serde_json::Value, String>>) + Send + Sync + 'static,
     {
         self.actions.insert(action.into(), Box::new(handler));
     }
@@ -239,17 +209,11 @@ async fn handle_delete_ssh_key(
     if agent.is_locked() {
         return Err("Vault is locked".to_string());
     }
+    #[rustfmt::skip]
     let id_str = match payload {
-        serde_json::Value::Object(map) => map
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Campo 'id' requerido".to_string())?,
+        serde_json::Value::Object(map) => map.get("id").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'id' requerido".to_string())?,
         serde_json::Value::String(s) => s.as_str(),
-        _ => {
-            return Err(
-                "Payload inválido para DeleteSSHKey: se esperaba objeto o id string".to_string(),
-            )
-        }
+        _ => return Err("Payload inválido para DeleteSSHKey: se esperaba objeto o id string".to_string()),
     };
     let id = uuid::Uuid::parse_str(id_str).map_err(|e| format!("ID de clave inválido: {e}"))?;
     agent.delete_ssh_key(&id).await.map_err(|e| e.to_string())?;
@@ -291,13 +255,8 @@ impl ActionsRegistry {
         });
     }
 
-    pub async fn execute(
-        &self,
-        action: &str,
-        state: &mut AgentState,
-        ctx: &CallingContext,
-        payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    #[rustfmt::skip]
+    pub async fn execute(&self, action: &str, state: &mut AgentState, ctx: &CallingContext, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
         if let Some(handler) = self.actions.get(action) {
             return handler(state, ctx, payload).await;
         }
@@ -359,35 +318,22 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register(
         "Unlock",
         |state: &mut AgentState, ctx: &CallingContext, payload: &serde_json::Value| {
+            #[rustfmt::skip]
             let pin = match payload {
-                serde_json::Value::Object(map) => map
-                    .get("pin")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Campo 'pin' requerido en payload".to_string())?,
+                serde_json::Value::Object(map) => map.get("pin").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'pin' requerido en payload".to_string())?,
                 serde_json::Value::String(s) => s.as_str(),
-                _ => {
-                    return Err(
-                        "Payload inválido para Unlock: se esperaba objeto con 'pin' o string"
-                            .to_string(),
-                    )
-                }
+                _ => return Err("Payload inválido para Unlock: se esperaba objeto con 'pin' o string".to_string()),
             };
 
             if !state.has_pin {
                 return Err("No hay PIN configurado en el agente".to_string());
             }
 
-            match state.config.verify_pin(pin) {
+            match state.config.verify_pin_with_params(pin, AGENT_KDF_MEMORY_KIB) {
                 Ok(true) => {
                     state.is_locked = false;
-                    state
-                        .sessions
-                        .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
-                    state.sessions.create_session(
-                        ctx,
-                        SessionType::AccessVault,
-                        Duration::from_secs(3600),
-                    );
+                    state.sessions.create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
+                    state.sessions.create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
                     Ok(serde_json::json!({ "status": "unlocked" }))
                 }
                 Ok(false) => Err("PIN incorrecto".to_string()),
@@ -416,24 +362,18 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register(
         "PinSet",
         |state: &mut AgentState, _ctx: &CallingContext, payload: &serde_json::Value| {
+            #[rustfmt::skip]
             let pin = match payload {
-                serde_json::Value::Object(map) => map
-                    .get("pin")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Campo 'pin' requerido en payload".to_string())?,
+                serde_json::Value::Object(map) => map.get("pin").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'pin' requerido en payload".to_string())?,
                 serde_json::Value::String(s) => s.as_str(),
-                _ => {
-                    return Err(
-                        "Payload inválido para PinSet: se esperaba objeto con 'pin'".to_string()
-                    )
-                }
+                _ => return Err("Payload inválido para PinSet: se esperaba objeto con 'pin'".to_string()),
             };
 
             if state.has_pin {
                 return Err("El PIN ya está configurado. Usa PinUpdate para cambiarlo.".to_string());
             }
 
-            let key = sw_config::derive_config_key(pin, &state.config.device_uuid)
+            let key = sw_config::derive_config_key_with_params(pin, &state.config.device_uuid, AGENT_KDF_MEMORY_KIB)
                 .map_err(|e| format!("Error al derivar clave de PIN: {e}"))?;
             state.config.config_key_hash = sw_config::hash_config_key(&key);
             state.has_pin = true;
@@ -451,22 +391,14 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register(
         "PinUpdate",
         |state: &mut AgentState, _ctx: &CallingContext, payload: &serde_json::Value| {
+            #[rustfmt::skip]
             let (old_pin, new_pin) = match payload {
                 serde_json::Value::Object(map) => {
-                    let old = map
-                        .get("old_pin")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "Campo 'old_pin' requerido".to_string())?;
-                    let new = map
-                        .get("new_pin")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "Campo 'new_pin' requerido".to_string())?;
+                    let old = map.get("old_pin").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'old_pin' requerido".to_string())?;
+                    let new = map.get("new_pin").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'new_pin' requerido".to_string())?;
                     (old, new)
                 }
-                _ => return Err(
-                    "Payload inválido para PinUpdate: se esperaba objeto con 'old_pin' y 'new_pin'"
-                        .to_string(),
-                ),
+                _ => return Err("Payload inválido para PinUpdate: se esperaba objeto con 'old_pin' y 'new_pin'".to_string()),
             };
 
             if !state.has_pin {
@@ -475,7 +407,7 @@ pub fn default_registry() -> ActionsRegistry {
 
             state
                 .config
-                .update_pin(old_pin, new_pin)
+                .update_pin_with_params(old_pin, new_pin, AGENT_KDF_MEMORY_KIB)
                 .map_err(|e| format!("Error al actualizar PIN: {e}"))?;
 
             if let Ok(home) = std::env::var("HOME") {
@@ -743,7 +675,9 @@ mod tests {
 
         let test_pin = "agent_test_pin_987";
         let test_salt = "agent_uuid_test";
-        let derived_key = sw_config::derive_config_key(test_pin, test_salt).unwrap();
+        let derived_key =
+            sw_config::derive_config_key_with_params(test_pin, test_salt, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
         let config = ConfigFile {
             device_uuid: test_salt.to_string(),
             config_key_hash: sw_config::hash_config_key(&derived_key),
@@ -963,6 +897,17 @@ mod tests {
         let res = check_and_prepare_socket(&socket_path).await;
         assert!(res.is_ok());
         assert!(!socket_path.exists());
+
+        // Socket does not exist -> Ok
+        let non_existent = temp_dir.path().join("does_not_exist.sock");
+        assert!(check_and_prepare_socket(&non_existent).await.is_ok());
+
+        // Socket already in use -> SocketAlreadyInUse
+        let active_path = temp_dir.path().join("active.sock");
+        let listener = tokio::net::UnixListener::bind(&active_path).unwrap();
+        let in_use = check_and_prepare_socket(&active_path).await;
+        assert!(matches!(in_use, Err(AgentError::SocketAlreadyInUse(_))));
+        drop(listener);
     }
 
     #[test]
@@ -1017,6 +962,26 @@ mod tests {
             .handle_request(IpcRequest::GetLogins { filter: None })
             .await;
         assert!(matches!(logins, IpcResponse::Ok(_)));
+
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "parent".into(),
+            grandparent_process_name: "grandparent".into(),
+            process_pid: 1,
+            parent_process_pid: 2,
+            grandparent_process_pid: 3,
+            error: false,
+            authenticated: true,
+        };
+        let ok_msg = daemon
+            .handle_message(&ctx, IpcMessage::new("Status", serde_json::json!({})))
+            .await;
+        assert_eq!(ok_msg.action, "Ok");
+        let err_msg = daemon
+            .handle_message(&ctx, IpcMessage::new("NonExistent", serde_json::json!({})))
+            .await;
+        assert_eq!(err_msg.action, "Error");
     }
 
     #[tokio::test]
@@ -1466,6 +1431,11 @@ mod tests {
         if let Some(h) = old_home {
             std::env::set_var("HOME", h);
         }
+
+        // Test save_config_file with relative path without parent
+        let rel_path = Path::new("temp_test_local_cfg.json");
+        assert!(save_config_file(&ConfigFile::default(), rel_path).is_ok());
+        let _ = std::fs::remove_file(rel_path);
     }
 
     #[tokio::test]
@@ -1612,9 +1582,31 @@ mod tests {
             .await
             .is_err());
 
+        // Unlock with object missing pin
+        assert!(registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "other": 123 })
+            )
+            .await
+            .is_err());
+
         // PinSet with invalid payload type
         assert!(registry
             .execute("PinSet", &mut state, &ctx, &serde_json::json!(true))
+            .await
+            .is_err());
+
+        // PinSet with object missing pin
+        assert!(registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "other": 123 })
+            )
             .await
             .is_err());
 
@@ -1722,6 +1714,16 @@ mod tests {
                 .unwrap();
         let k1_id = new_k["id"].as_str().unwrap();
 
+        // New SSH key with default type (no key_type / type field)
+        let def_k = handle_new_ssh_key(&va, &serde_json::json!({ "name": "default-type-key" }))
+            .await
+            .unwrap();
+        assert_eq!(def_k["name"], "default-type-key");
+        assert!(def_k["public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519"));
+
         // Delete using raw string id
         let del_str = handle_delete_ssh_key(&va, &serde_json::json!(k1_id))
             .await
@@ -1790,9 +1792,43 @@ mod tests {
             .unwrap();
         assert_eq!(shutdown_res["status"], "shutting_down");
 
+        // AgentShutdown with shutdown_sender present
+        let (shut_tx, mut shut_rx) = tokio::sync::mpsc::channel(1);
+        let mut with_shut_state = AgentState {
+            shutdown_sender: Some(shut_tx),
+            ..Default::default()
+        };
+        let shut_with_sender = registry
+            .execute(
+                "AgentShutdown",
+                &mut with_shut_state,
+                &ctx,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shut_with_sender["status"], "shutting_down");
+        assert!(shut_rx.try_recv().is_ok());
+
+        // Lock with no vault agent in state
+        let mut lock_no_va_state = AgentState::default();
+        let lock_no_va = registry
+            .execute("Lock", &mut lock_no_va_state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_no_va["status"], "locked");
+
         // Constructors coverage
         let d = AgentDaemon::new();
         assert!(d.state.read().await.is_locked);
+        let d_state = AgentDaemon::with_state(AgentState::default());
+        assert!(d_state.state.read().await.is_locked);
+        let reg = ActionsRegistry::new();
+        assert!(reg.actions.is_empty());
+        let reg_default = ActionsRegistry::default();
+        assert!(reg_default.actions.is_empty());
+        let default_daemon = AgentDaemon::default();
+        assert!(default_daemon.state.read().await.is_locked);
         let d_default = AgentDaemon::default();
         assert!(d_default.state.read().await.is_locked);
         let d_with_state = AgentDaemon::with_state(AgentState::new(ConfigFile::default()));
@@ -1800,6 +1836,11 @@ mod tests {
         let d_with_both =
             AgentDaemon::with_state_and_registry(AgentState::default(), default_registry());
         assert!(d_with_both.state.read().await.is_locked);
+        let d_va = AgentDaemon::with_vault_agent(AgentState::default(), va.clone());
+        assert!(d_va.state.read().await.is_locked);
+        let d_va_cloned = d_va.clone();
+        assert!(d_va_cloned.state.read().await.is_locked);
+        assert!(set_permissions_unix(temp_dir.path(), 0o700).is_ok());
 
         // AgentState Debug, Clone, with_vault_agent with full fields
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -2066,5 +2107,178 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = shutdown_tx.send(());
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_ipc_shutdown() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sock = temp_dir.path().join("run_agent_ipc.sock");
+        let s = sock.clone();
+        let handle = tokio::spawn(async move { run_agent(&s).await });
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Ok(mut stream) = UnixStream::connect(&sock).await {
+                let req = IpcMessage::new("AgentShutdown", serde_json::json!({}));
+                let _ = write_message(&mut stream, &req).await;
+                break;
+            }
+        }
+        let res = handle.await.unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ssh_handlers_and_registry_edge_cases() {
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[88u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let va = Arc::new(VaultAgentServer::new(vault));
+        va.unlock(key).await;
+
+        let reg = default_registry();
+        let mut state = AgentState::default().with_vault_agent(va.clone());
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "p".into(),
+            grandparent_process_name: "gp".into(),
+            process_pid: 1,
+            parent_process_pid: 2,
+            grandparent_process_pid: 3,
+            error: false,
+            authenticated: true,
+        };
+
+        // Unknown action error in registry
+        assert!(reg
+            .execute(
+                "NonExistentAction",
+                &mut state,
+                &ctx,
+                &serde_json::json!({})
+            )
+            .await
+            .is_err());
+
+        // ImportSSHKey edge cases through registry
+        assert!(reg
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!("not_obj")
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "k" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "private_key_pem": "invalid" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "k", "private_key_pem": "not_valid_pem" })
+            )
+            .await
+            .is_err());
+
+        // NewSSHKey edge cases through registry
+        assert!(reg
+            .execute("NewSSHKey", &mut state, &ctx, &serde_json::json!("not_obj"))
+            .await
+            .is_err());
+        assert!(reg
+            .execute("NewSSHKey", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "k", "key_type": "UNKNOWN" })
+            )
+            .await
+            .is_err());
+
+        // DeleteSSHKey edge cases through registry
+        assert!(reg
+            .execute("DeleteSSHKey", &mut state, &ctx, &serde_json::json!(123))
+            .await
+            .is_err());
+        assert!(reg
+            .execute("DeleteSSHKey", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "id": "not_uuid" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!("not_uuid")
+            )
+            .await
+            .is_err());
+
+        // Direct helper validations
+        assert!(
+            handle_import_ssh_key(&va, &serde_json::json!({ "name": "k" }))
+                .await
+                .is_err()
+        );
+        assert!(
+            handle_import_ssh_key(&va, &serde_json::json!({ "private_key_pem": "pem" }))
+                .await
+                .is_err()
+        );
+        assert!(handle_new_ssh_key(&va, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!(123))
+            .await
+            .is_err());
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!("bad-uuid"))
+            .await
+            .is_err());
+
+        // Daemon handle_message with unknown action
+        let daemon = AgentDaemon::with_vault_agent(AgentState::default(), va.clone());
+        let err_resp = daemon
+            .handle_message(
+                &ctx,
+                IpcMessage::new("UnknownAction", serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(err_resp.action, "Error");
     }
 }

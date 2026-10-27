@@ -17,7 +17,6 @@ pub const KDF_ITERATIONS: u32 = 2;
 pub const KDF_MEMORY_KIB: u32 = 2 * 1024 * 1024; // 2 GiB (2048 MiB), matches Goldwarden Go KDFMemory
 pub const KDF_PARALLELISM: u32 = 8;
 
-#[cfg(test)]
 pub const KDF_MEMORY_KIB_TEST: u32 = 4 * 1024;
 
 #[derive(Error, Debug)]
