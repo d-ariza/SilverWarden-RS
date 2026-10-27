@@ -1608,6 +1608,57 @@ Se corrigió el mecanismo de bypass de aprobación en `DefaultApprovalProvider` 
 
 **Estado:** ✅ SW-044 — Hecho (2026-10-26).
 
+---
+
+### 5.6 Evidencia de Ejecución: [SW-045] Acciones IPC para la GUI (ListSSHKeys, ImportSSHKey, NewSSHKey, DeleteSSHKey)
+
+**Fecha:** 2026-10-26  
+**Crates modificados / implementados:**
+- `crates/sw-ssh-agent`:
+  - `SshKeySummary`: estructura pública con `id: Option<Uuid>`, `name: String`, `fingerprint: String`, `public_key: String` (serializable con serde). **Bajo ningún concepto expone la clave privada**.
+  - `generate_key_pem`: función sincrónica auxiliar que genera pares de claves en formato OpenSSH PEM para los algoritmos `ed25519`, `rsa` (2048 bits) y `ecdsa` (P-256), liberando el generador pseudoaleatorio antes de cruzar límites `Send`.
+  - Métodos añadidos a `VaultAgentServer`:
+    - `get_symmetric_key(&self) -> Option<SymmetricKey>`: expone de manera segura la clave simétrica del vault desbloqueado para operaciones autorizadas.
+    - `list_ssh_keys(&self) -> Result<Vec<SshKeySummary>, SshAgentError>`: extrae todas las identidades SSH del vault, deserializa metadatos y devuelve únicamente información pública.
+    - `delete_ssh_key(&self, id: Uuid) -> Result<bool, SshAgentError>`: elimina la clave tanto del `VaultStore` en memoria como del servidor Bitwarden remoto si `api_client` está configurado.
+    - `import_ssh_key(&self, name: &str, pem: &str) -> Result<SshKeySummary, SshAgentError>`: añade una clave existente cifrándola y sincronizándola con el servidor.
+    - `new_ssh_key(&self, name: &str, key_type: &str) -> Result<SshKeySummary, SshAgentError>`: genera un nuevo par, lo cifra, lo almacena y retorna el resumen público.
+    - `std::fmt::Debug` para `VaultAgentServer` sin fugar información confidencial.
+- `crates/sw-agent`:
+  - Refactorización de `ActionsRegistry` con `ActionHandler` dinámico asíncrono (`Box<dyn for<'a> Fn(...) -> BoxFuture<'a, ...> + Send + Sync>`), soportando tanto handlers síncronos (`register`) como asíncronos nativos (`register_async`).
+  - Handlers IPC implementados:
+    - `ListSSHKeys`: ejecuta `handle_list_ssh_keys`, devolviendo `Vec<SshKeySummary>`.
+    - `ImportSSHKey`: ejecuta `handle_import_ssh_key`, validando campos `name` y `private_key_pem`.
+    - `NewSSHKey`: ejecuta `handle_new_ssh_key`, validando `name` y `key_type` (ed25519, rsa, ecdsa).
+    - `DeleteSSHKey`: ejecuta `handle_delete_ssh_key`, aceptando payload `{ "id": "<uuid>" }` o `<uuid>` directamente.
+  - Registro en `default_registry()` (delegando a `state.vault_agent` cuando está presente) y constructor de conveniencia `default_registry_with_ssh(agent: Arc<VaultAgentServer>)`.
+  - Soporte para `AgentState::with_vault_agent(agent)` y derivación manual de `Clone` y `Debug`.
+
+#### Pruebas realizadas
+
+1. `test_vault_agent_server_ssh_helpers` (`sw-ssh-agent`): ciclo completo de list, import, new y delete directo sobre `VaultAgentServer`.
+2. `test_actions_registry_direct` (`sw-agent`): validación directa de registro y ejecución de acciones dinámicas síncronas y asíncronas.
+3. `test_ssh_actions_full_lifecycle` (`sw-agent`): ciclo de vida completo de las 4 acciones IPC mediante `ActionsRegistry` con `VaultAgentServer` desbloqueado, validando que `ListSSHKeys` nunca retorna la clave privada y que `NewSSHKey` soporta Ed25519, RSA y ECDSA.
+4. `test_ssh_actions_daemon_ipc_messages` (`sw-agent`): verificación de comunicación IPC real a través de sockets Unix enviando `IpcMessage` serializados y recibiendo `IpcResponse`.
+5. `test_ssh_actions_invalid_payloads` (`sw-agent`): validación exhaustiva de payloads malformados, tipos de clave desconocidos, UUIDs inválidos y estados de vault bloqueado.
+6. `test_default_registry_with_vault_agent_in_state` (`sw-agent`): verificación de que el registro por defecto despacha a `state.vault_agent` y reporta error adecuado cuando el agente no está configurado.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas `sw-agent` | `cargo test -p sw-agent` | 16 pasan, 0 fallan (85.71s) |
+| Pruebas `sw-ssh-agent` | `cargo test -p sw-ssh-agent` | 29 pasan, 0 fallan (7.62s) |
+| Pruebas workspace | `cargo test --workspace --exclude sw-gui --release` | Todos los tests pasan, 0 fallan |
+| Linter | `cargo clippy -p sw-agent -p sw-ssh-agent --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advisory permitido en `.cargo/audit.toml`) |
+| **Cobertura `sw-agent`** | `cargo llvm-cov -p sw-agent --lib` | **98.75% líneas / 97.90% regiones** (umbral: ≥85%) |
+| **Cobertura `sw-ssh-agent`** | `cargo llvm-cov -p sw-ssh-agent --lib` | **89.13% líneas / 89.77% regiones** (umbral: ≥85%) |
+
+**Estado:** ✅ SW-045 — Hecho (2026-10-26).
+
+
 
 
 

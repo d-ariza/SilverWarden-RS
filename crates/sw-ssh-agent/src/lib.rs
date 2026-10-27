@@ -62,6 +62,17 @@ pub enum SshAgentError {
     AgentFailure,
 }
 
+/// Public summary of an SSH key stored in the vault.
+///
+/// **Security Notice:** This struct intentionally never contains private key material.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SshKeySummary {
+    pub id: Option<Uuid>,
+    pub name: String,
+    pub fingerprint: String,
+    pub public_key: String,
+}
+
 /// Trait abstracting approval requests (e.g., via pinentry, desktop prompt, or test mocks).
 pub trait ApprovalProvider: Send + Sync {
     fn get_approval(&self, title: &str, description: &str) -> Result<bool, SshAgentError>;
@@ -283,6 +294,18 @@ pub struct VaultAgentServer {
     api_client: Option<Arc<BitwardenApiClient>>,
 }
 
+impl std::fmt::Debug for VaultAgentServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultAgentServer")
+            .field(
+                "is_locked",
+                &self.is_locked.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("has_api_client", &self.api_client.is_some())
+            .finish()
+    }
+}
+
 impl VaultAgentServer {
     /// Creates a new `VaultAgentServer` with an initially locked vault.
     pub fn new(vault: Arc<VaultStore>) -> Self {
@@ -364,6 +387,154 @@ impl VaultAgentServer {
     /// Access to the underlying VaultStore.
     pub fn vault(&self) -> &Arc<VaultStore> {
         &self.vault
+    }
+
+    /// Returns a cloned copy of the user symmetric key if unlocked.
+    pub async fn get_symmetric_key(&self) -> Option<SymmetricKey> {
+        self.symmetric_key
+            .read()
+            .await
+            .as_ref()
+            .and_then(|k| k.try_clone().ok())
+    }
+
+    /// Lists summaries of all SSH keys in the vault.
+    ///
+    /// **Security Guarantee:** Never exposes private key material.
+    pub async fn list_ssh_keys(&self) -> Result<Vec<SshKeySummary>, SshAgentError> {
+        if self.is_locked() {
+            return Err(SshAgentError::VaultLocked);
+        }
+
+        let key_guard = self.symmetric_key.read().await;
+        let key = match key_guard.as_ref() {
+            Some(k) => k,
+            None => return Err(SshAgentError::VaultLocked),
+        };
+
+        let vault_keys = self
+            .vault
+            .get_ssh_keys(key)
+            .await
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        let mut summaries = Vec::new();
+        for vk in vault_keys {
+            let (fingerprint, pub_str) = match PrivateKey::from_openssh(&vk.private_key) {
+                Ok(pk) => {
+                    let fp = pk
+                        .public_key()
+                        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                        .to_string();
+                    let s = pk
+                        .public_key()
+                        .to_openssh()
+                        .unwrap_or_else(|_| vk.public_key.clone().unwrap_or_default());
+                    (fp, s)
+                }
+                Err(_) => (String::new(), vk.public_key.clone().unwrap_or_default()),
+            };
+
+            summaries.push(SshKeySummary {
+                id: vk.id,
+                name: vk.name,
+                fingerprint,
+                public_key: pub_str,
+            });
+        }
+
+        Ok(summaries)
+    }
+
+    /// Deletes an SSH key by ID from the server (if API client is present) and from local VaultStore.
+    pub async fn delete_ssh_key(&self, id: &Uuid) -> Result<bool, SshAgentError> {
+        if self.is_locked() {
+            return Err(SshAgentError::VaultLocked);
+        }
+
+        if let Some(client) = self.api_client.as_ref() {
+            if let Err(e) = client.delete_cipher(id).await {
+                tracing::warn!("Failed to delete cipher {id} from server: {e}");
+            }
+        }
+
+        let deleted = self.vault.delete_cipher(id).await;
+        Ok(deleted.is_some())
+    }
+
+    /// Imports an existing OpenSSH private key PEM into the vault and returns its summary.
+    pub async fn import_ssh_key(
+        &self,
+        name: &str,
+        private_key_pem: &str,
+        user_symmetric_key: &SymmetricKey,
+    ) -> Result<SshKeySummary, SshAgentError> {
+        let pub_key = self
+            .add_ssh_key(private_key_pem, name, user_symmetric_key)
+            .await?;
+
+        let existing = self
+            .vault
+            .get_ssh_keys(user_symmetric_key)
+            .await
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        let id = existing
+            .into_iter()
+            .find(|k| k.name == name)
+            .and_then(|k| k.id);
+
+        let fingerprint = pub_key
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+        let public_key = pub_key
+            .to_openssh()
+            .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+
+        Ok(SshKeySummary {
+            id,
+            name: name.to_string(),
+            fingerprint,
+            public_key,
+        })
+    }
+
+    fn generate_key_pem(name: &str, key_type: &str) -> Result<String, SshAgentError> {
+        use russh::keys::ssh_key::{Algorithm, EcdsaCurve, LineEnding};
+
+        let mut rng = rand::rng();
+        let algorithm = match key_type.to_ascii_lowercase().as_str() {
+            "ed25519" | "ssh-ed25519" => Algorithm::Ed25519,
+            "rsa" | "ssh-rsa" => Algorithm::Rsa { hash: None },
+            "ecdsa" | "ecdsa-p256" | "p256" => Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+            other => {
+                return Err(SshAgentError::KeyError(format!(
+                    "Unsupported key type: {other}"
+                )))
+            }
+        };
+
+        let mut pk = PrivateKey::random(&mut rng, algorithm)
+            .map_err(|e| SshAgentError::KeyError(format!("Failed to generate random key: {e}")))?;
+        pk.set_comment(name);
+
+        let pem = pk.to_openssh(LineEnding::LF).map_err(|e| {
+            SshAgentError::KeyError(format!("Failed to serialize key to OpenSSH PEM: {e}"))
+        })?;
+        Ok((*pem).clone())
+    }
+
+    /// Generates a new SSH keypair (Ed25519, RSA, or ECDSA), encrypts and persists it.
+    pub async fn new_ssh_key(
+        &self,
+        name: &str,
+        key_type: &str,
+        user_symmetric_key: &SymmetricKey,
+    ) -> Result<SshKeySummary, SshAgentError> {
+        let pem = Self::generate_key_pem(name, key_type)?;
+        self.import_ssh_key(name, &pem, user_symmetric_key).await
     }
 
     /// Requests identities from the vault: decrypts SSH keys on demand, parses with `PrivateKey::from_openssh`,
@@ -2715,5 +2886,89 @@ done
 
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_vault_agent_server_ssh_helpers() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault.clone());
+
+        // When locked, listing or deleting fails
+        assert!(matches!(
+            agent.list_ssh_keys().await,
+            Err(SshAgentError::VaultLocked)
+        ));
+        let dummy_id = Uuid::new_v4();
+        assert!(matches!(
+            agent.delete_ssh_key(&dummy_id).await,
+            Err(SshAgentError::VaultLocked)
+        ));
+
+        // Unlock
+        agent.unlock(key.try_clone().unwrap()).await;
+        assert!(agent.get_symmetric_key().await.is_some());
+
+        // Empty list
+        let initial_list = agent.list_ssh_keys().await.unwrap();
+        assert!(initial_list.is_empty());
+
+        // Generate Ed25519
+        let ed_summary = agent
+            .new_ssh_key("my-ed-key", "ed25519", &key)
+            .await
+            .expect("Failed to create ed25519 key");
+        assert_eq!(ed_summary.name, "my-ed-key");
+        assert!(ed_summary.public_key.starts_with("ssh-ed25519"));
+        assert!(ed_summary.fingerprint.starts_with("SHA256:"));
+        assert!(ed_summary.id.is_some());
+        let ed_id = ed_summary.id.unwrap();
+
+        // Generate RSA
+        let rsa_summary = agent
+            .new_ssh_key("my-rsa-key", "rsa", &key)
+            .await
+            .expect("Failed to create rsa key");
+        assert_eq!(rsa_summary.name, "my-rsa-key");
+        assert!(rsa_summary.public_key.starts_with("ssh-rsa"));
+
+        // Generate ECDSA
+        let ecdsa_summary = agent
+            .new_ssh_key("my-ecdsa-key", "ecdsa", &key)
+            .await
+            .expect("Failed to create ecdsa key");
+        assert_eq!(ecdsa_summary.name, "my-ecdsa-key");
+        assert!(ecdsa_summary.public_key.starts_with("ecdsa-sha2-nistp256"));
+
+        // List SSH keys: should return 3 keys
+        let keys = agent.list_ssh_keys().await.unwrap();
+        assert_eq!(keys.len(), 3);
+        for k in &keys {
+            assert!(!k.public_key.contains("PRIVATE"));
+        }
+
+        // Delete Ed25519 key
+        let deleted = agent.delete_ssh_key(&ed_id).await.unwrap();
+        assert!(deleted);
+        let remaining = agent.list_ssh_keys().await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.iter().any(|k| k.id == Some(ed_id)));
+
+        // Import key
+        let (priv_pem, pub_str) = generate_test_ed25519(42, "imported-ed");
+        let imported = agent
+            .import_ssh_key("imported-ed", &priv_pem, &key)
+            .await
+            .expect("Failed to import key");
+        assert_eq!(imported.name, "imported-ed");
+        assert_eq!(imported.public_key.trim(), pub_str.trim());
+
+        let after_import = agent.list_ssh_keys().await.unwrap();
+        assert_eq!(after_import.len(), 3);
+
+        // Lock agent
+        agent.lock().await;
+        assert!(agent.is_locked());
+        assert!(agent.get_symmetric_key().await.is_none());
     }
 }

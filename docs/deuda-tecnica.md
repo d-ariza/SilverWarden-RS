@@ -44,11 +44,10 @@ Cada item de deuda se registra con:
 
 ## DT-4 — Acciones IPC para la GUI (SW-045)
 
-- **Descripción:** el agente no expone `ListSSHKeys`, `ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`. La GUI no puede gestionar claves SSH.
-- **Impacto:** Medio (la GUI no puede funcionar como gestor de claves).
-- **Motivo:** pendiente de SW-045.
-- **Retoma:** SW-045 (M5).
-- **Estado:** Abierta.
+- **Descripción:** el agente no exponía `ListSSHKeys`, `ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`. La GUI no podía gestionar claves SSH.
+- **Impacto:** Medio (la GUI no podía funcionar como gestor de claves).
+- **Resolución:** Implementadas las 4 acciones IPC en `sw-agent` con handlers asíncronos (`register_ssh_actions` y delegación en `default_registry`), integradas con `VaultAgentServer` en `sw-ssh-agent`. `ListSSHKeys` devuelve exclusivamente `SshKeySummary` ({ id, name, fingerprint, public_key }), nunca exponiendo la clave privada. Soporte para generación Ed25519, RSA y ECDSA en `NewSSHKey`, importación PEM cifrada en `ImportSSHKey`, y eliminación sincronizada con Bitwarden en `DeleteSSHKey`. Cobertura de tests: 98.75% líneas en `sw-agent`.
+- **Estado:** Cerrada (2026-10-26).
 
 ## DT-5 — GUI Tauri (M7)
 

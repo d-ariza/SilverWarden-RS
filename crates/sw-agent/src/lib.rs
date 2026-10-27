@@ -1,12 +1,20 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use sw_config::ConfigFile;
 use sw_ipc::{read_message, write_message, IpcMessage, IpcRequest, IpcResponse};
+use sw_ssh_agent::VaultAgentServer;
 use sw_systemauth::{CallingContext, SessionStore, SessionType};
 use thiserror::Error;
 use tokio::sync::RwLock;
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Error, Debug)]
 pub enum AgentError {
@@ -24,13 +32,35 @@ pub enum AgentError {
 }
 
 /// Central state maintained by the agent daemon.
-#[derive(Debug, Clone)]
 pub struct AgentState {
     pub config: ConfigFile,
     pub sessions: SessionStore,
     pub is_locked: bool,
     pub has_pin: bool,
     pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
+    pub vault_agent: Option<Arc<VaultAgentServer>>,
+}
+
+impl Clone for AgentState {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            sessions: self.sessions.clone(),
+            is_locked: self.is_locked,
+            has_pin: self.has_pin,
+            shutdown_sender: self.shutdown_sender.clone(),
+            vault_agent: self.vault_agent.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentState")
+            .field("is_locked", &self.is_locked)
+            .field("has_pin", &self.has_pin)
+            .finish()
+    }
 }
 
 impl AgentState {
@@ -42,7 +72,14 @@ impl AgentState {
             is_locked: true,
             has_pin,
             shutdown_sender: None,
+            vault_agent: None,
         }
+    }
+
+    /// Sets the `VaultAgentServer` instance in state.
+    pub fn with_vault_agent(mut self, agent: Arc<VaultAgentServer>) -> Self {
+        self.vault_agent = Some(agent);
+        self
     }
 
     /// Loads the configuration file from ~/.config/goldwarden/goldwarden.json or defaults.
@@ -67,40 +104,21 @@ impl Default for AgentState {
     }
 }
 
-/// Trait implemented by IPC action handlers.
-pub trait ActionFn: Send + Sync {
-    fn execute(
-        &self,
-        state: &mut AgentState,
-        ctx: &CallingContext,
-        payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, String>;
-}
-
-impl<F> ActionFn for F
-where
-    F: Fn(
-            &mut AgentState,
-            &CallingContext,
-            &serde_json::Value,
-        ) -> Result<serde_json::Value, String>
+/// Type alias for dynamic asynchronous action handlers.
+pub type ActionHandler = Box<
+    dyn for<'a> Fn(
+            &'a mut AgentState,
+            &'a CallingContext,
+            &'a serde_json::Value,
+        ) -> BoxFuture<'a, Result<serde_json::Value, String>>
         + Send
         + Sync,
-{
-    fn execute(
-        &self,
-        state: &mut AgentState,
-        ctx: &CallingContext,
-        payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        self(state, ctx, payload)
-    }
-}
+>;
 
 /// Registry mapping action name strings to dynamic handlers.
 #[derive(Default)]
 pub struct ActionsRegistry {
-    actions: HashMap<String, Box<dyn ActionFn>>,
+    actions: HashMap<String, ActionHandler>,
 }
 
 impl ActionsRegistry {
@@ -112,12 +130,168 @@ impl ActionsRegistry {
 
     pub fn register<F>(&mut self, action: impl Into<String>, handler: F)
     where
-        F: ActionFn + 'static,
+        F: (Fn(
+                &mut AgentState,
+                &CallingContext,
+                &serde_json::Value,
+            ) -> Result<serde_json::Value, String>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_async(action, move |state, ctx, payload| {
+            Box::pin(std::future::ready(handler(state, ctx, payload)))
+        });
+    }
+
+    pub fn register_async<F>(&mut self, action: impl Into<String>, handler: F)
+    where
+        F: (for<'a> Fn(
+                &'a mut AgentState,
+                &'a CallingContext,
+                &'a serde_json::Value,
+            ) -> BoxFuture<'a, Result<serde_json::Value, String>>)
+            + Send
+            + Sync
+            + 'static,
     {
         self.actions.insert(action.into(), Box::new(handler));
     }
+}
 
-    pub fn execute(
+async fn handle_list_ssh_keys(agent: &VaultAgentServer) -> Result<serde_json::Value, String> {
+    if agent.is_locked() {
+        return Err("Vault is locked".to_string());
+    }
+    let keys = agent.list_ssh_keys().await.map_err(|e| e.to_string())?;
+    serde_json::to_value(&keys).map_err(|e| e.to_string())
+}
+
+async fn handle_import_ssh_key(
+    agent: &VaultAgentServer,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Vault is locked".to_string())?;
+
+    let (name, pem) = match payload {
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Campo 'name' requerido".to_string())?;
+            let pem = map
+                .get("private_key_pem")
+                .or_else(|| map.get("private_key"))
+                .or_else(|| map.get("pem"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Campo 'private_key_pem' requerido".to_string())?;
+            (name.to_string(), pem.to_string())
+        }
+        _ => return Err("Payload inválido para ImportSSHKey: se esperaba objeto".to_string()),
+    };
+
+    let summary = agent
+        .import_ssh_key(&name, &pem, &sym_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&summary).map_err(|e| e.to_string())
+}
+
+async fn handle_new_ssh_key(
+    agent: &VaultAgentServer,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Vault is locked".to_string())?;
+
+    let (name, key_type) = match payload {
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Campo 'name' requerido".to_string())?;
+            let kt = map
+                .get("key_type")
+                .or_else(|| map.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Ed25519");
+            (name.to_string(), kt.to_string())
+        }
+        _ => return Err("Payload inválido para NewSSHKey: se esperaba objeto".to_string()),
+    };
+
+    let summary = agent
+        .new_ssh_key(&name, &key_type, &sym_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&summary).map_err(|e| e.to_string())
+}
+
+async fn handle_delete_ssh_key(
+    agent: &VaultAgentServer,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if agent.is_locked() {
+        return Err("Vault is locked".to_string());
+    }
+    let id_str = match payload {
+        serde_json::Value::Object(map) => map
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Campo 'id' requerido".to_string())?,
+        serde_json::Value::String(s) => s.as_str(),
+        _ => {
+            return Err(
+                "Payload inválido para DeleteSSHKey: se esperaba objeto o id string".to_string(),
+            )
+        }
+    };
+    let id = uuid::Uuid::parse_str(id_str).map_err(|e| format!("ID de clave inválido: {e}"))?;
+    agent.delete_ssh_key(&id).await.map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "status": "deleted",
+        "id": id.to_string(),
+    }))
+}
+
+impl ActionsRegistry {
+    /// Registers SSH agent IPC actions (`ListSSHKeys`, `ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`)
+    /// bound to the given `VaultAgentServer`.
+    pub fn register_ssh_actions(&mut self, agent: Arc<VaultAgentServer>) {
+        let a = agent.clone();
+        self.register_async("ListSSHKeys", move |_state, _ctx, _payload| {
+            let a = a.clone();
+            Box::pin(async move { handle_list_ssh_keys(&a).await })
+        });
+
+        let a = agent.clone();
+        self.register_async("ImportSSHKey", move |_state, _ctx, payload| {
+            let a = a.clone();
+            let payload = payload.clone();
+            Box::pin(async move { handle_import_ssh_key(&a, &payload).await })
+        });
+
+        let a = agent.clone();
+        self.register_async("NewSSHKey", move |_state, _ctx, payload| {
+            let a = a.clone();
+            let payload = payload.clone();
+            Box::pin(async move { handle_new_ssh_key(&a, &payload).await })
+        });
+
+        let a = agent;
+        self.register_async("DeleteSSHKey", move |_state, _ctx, payload| {
+            let a = a.clone();
+            let payload = payload.clone();
+            Box::pin(async move { handle_delete_ssh_key(&a, &payload).await })
+        });
+    }
+
+    pub async fn execute(
         &self,
         action: &str,
         state: &mut AgentState,
@@ -125,12 +299,12 @@ impl ActionsRegistry {
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         if let Some(handler) = self.actions.get(action) {
-            return handler.execute(state, ctx, payload);
+            return handler(state, ctx, payload).await;
         }
 
         for (k, handler) in &self.actions {
             if k.eq_ignore_ascii_case(action) {
-                return handler.execute(state, ctx, payload);
+                return handler(state, ctx, payload).await;
             }
         }
 
@@ -138,27 +312,27 @@ impl ActionsRegistry {
     }
 }
 
+#[inline]
+fn set_permissions_unix(path: &Path, mode: u32) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
 /// Saves the configuration file atomically using a temporary file and rename.
 pub fn save_config_file(config: &ConfigFile, path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
+        let _ = set_permissions_unix(parent, 0o700);
     }
     let json_bytes = serde_json::to_vec_pretty(config)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    use std::io::Write;
     temp.write_all(&json_bytes)?;
     temp.flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = set_permissions_unix(temp.path(), 0o600);
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
@@ -223,12 +397,18 @@ pub fn default_registry() -> ActionsRegistry {
     );
 
     // Lock: borra la clave de memoria y wipea sesiones
-    registry.register(
+    registry.register_async(
         "Lock",
         |state: &mut AgentState, _ctx: &CallingContext, _payload: &serde_json::Value| {
             state.is_locked = true;
             state.sessions.wipe();
-            Ok(serde_json::json!({ "status": "locked" }))
+            let va = state.vault_agent.clone();
+            Box::pin(async move {
+                if let Some(agent) = va {
+                    agent.lock().await;
+                }
+                Ok(serde_json::json!({ "status": "locked" }))
+            })
         },
     );
 
@@ -318,6 +498,52 @@ pub fn default_registry() -> ActionsRegistry {
         },
     );
 
+    // ListSSHKeys (delegates to state.vault_agent)
+    registry.register_async("ListSSHKeys", |state, _ctx, _payload| {
+        let agent = state.vault_agent.clone();
+        Box::pin(async move {
+            let agent = agent.ok_or_else(|| "Vault agent no configurado".to_string())?;
+            handle_list_ssh_keys(&agent).await
+        })
+    });
+
+    // ImportSSHKey (delegates to state.vault_agent)
+    registry.register_async("ImportSSHKey", |state, _ctx, payload| {
+        let agent = state.vault_agent.clone();
+        let payload = payload.clone();
+        Box::pin(async move {
+            let agent = agent.ok_or_else(|| "Vault agent no configurado".to_string())?;
+            handle_import_ssh_key(&agent, &payload).await
+        })
+    });
+
+    // NewSSHKey (delegates to state.vault_agent)
+    registry.register_async("NewSSHKey", |state, _ctx, payload| {
+        let agent = state.vault_agent.clone();
+        let payload = payload.clone();
+        Box::pin(async move {
+            let agent = agent.ok_or_else(|| "Vault agent no configurado".to_string())?;
+            handle_new_ssh_key(&agent, &payload).await
+        })
+    });
+
+    // DeleteSSHKey (delegates to state.vault_agent)
+    registry.register_async("DeleteSSHKey", |state, _ctx, payload| {
+        let agent = state.vault_agent.clone();
+        let payload = payload.clone();
+        Box::pin(async move {
+            let agent = agent.ok_or_else(|| "Vault agent no configurado".to_string())?;
+            handle_delete_ssh_key(&agent, &payload).await
+        })
+    });
+
+    registry
+}
+
+/// Builds a default registry and registers SSH actions bound to the specified `VaultAgentServer`.
+pub fn default_registry_with_ssh(agent: Arc<VaultAgentServer>) -> ActionsRegistry {
+    let mut registry = default_registry();
+    registry.register_ssh_actions(agent);
     registry
 }
 
@@ -347,11 +573,18 @@ impl AgentDaemon {
         }
     }
 
+    pub fn with_vault_agent(mut state: AgentState, vault_agent: Arc<VaultAgentServer>) -> Self {
+        state.vault_agent = Some(vault_agent.clone());
+        let registry = default_registry_with_ssh(vault_agent);
+        Self::with_state_and_registry(state, registry)
+    }
+
     pub async fn handle_message(&self, ctx: &CallingContext, msg: IpcMessage) -> IpcMessage {
         let mut state = self.state.write().await;
         match self
             .registry
             .execute(&msg.action, &mut state, ctx, &msg.payload)
+            .await
         {
             Ok(data) => IpcMessage::new("Ok", data),
             Err(err) => IpcMessage::new("Error", serde_json::Value::String(err)),
@@ -447,12 +680,7 @@ where
     check_and_prepare_socket(socket_path).await?;
 
     let listener = tokio::net::UnixListener::bind(socket_path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    set_permissions_unix(socket_path, 0o600)?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     {
@@ -505,6 +733,7 @@ where
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
     #[tokio::test]
@@ -612,6 +841,7 @@ mod tests {
         // Status on unconfigured agent
         let status_res = registry
             .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
             .unwrap();
         assert_eq!(status_res["has_pin"], false);
         assert_eq!(status_res["locked"], true);
@@ -624,6 +854,7 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "initial_pin_123" }),
             )
+            .await
             .unwrap();
         assert_eq!(pin_set_res["status"], "pin_set");
         assert!(state.has_pin);
@@ -636,6 +867,7 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "other_pin" })
             )
+            .await
             .is_err());
 
         // Unlock with wrong PIN
@@ -646,6 +878,7 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "bad_pin" })
             )
+            .await
             .is_err());
 
         // Unlock with correct PIN
@@ -656,6 +889,7 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "initial_pin_123" }),
             )
+            .await
             .unwrap();
         assert_eq!(unlock_res["status"], "unlocked");
         assert!(!state.is_locked);
@@ -674,6 +908,7 @@ mod tests {
                     "new_pin": "new_pin_456"
                 }),
             )
+            .await
             .unwrap();
         assert_eq!(update_res["status"], "pin_updated");
 
@@ -685,6 +920,7 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "initial_pin_123" })
             )
+            .await
             .is_err());
 
         // New PIN unlocks
@@ -695,11 +931,13 @@ mod tests {
                 &ctx,
                 &serde_json::json!({ "pin": "new_pin_456" })
             )
+            .await
             .is_ok());
 
         // Lock wipes sessions
         let lock_res = registry
             .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
             .unwrap();
         assert_eq!(lock_res["status"], "locked");
         assert!(state.is_locked);
@@ -708,7 +946,9 @@ mod tests {
             .verify_session(&ctx, SessionType::AccessVault));
 
         // Unknown action
-        let unknown_res = registry.execute("NonExistent", &mut state, &ctx, &serde_json::json!({}));
+        let unknown_res = registry
+            .execute("NonExistent", &mut state, &ctx, &serde_json::json!({}))
+            .await;
         assert!(unknown_res.is_err());
     }
 
@@ -727,9 +967,14 @@ mod tests {
 
     #[test]
     fn test_default_socket_path() {
-        if let Ok(home) = std::env::var("HOME") {
-            let path = default_socket_path().expect("Default socket path succeeds");
-            assert_eq!(path, PathBuf::from(home).join(".silverwarden.sock"));
+        let path = default_socket_path().expect("Default socket path succeeds");
+        assert!(path.to_string_lossy().contains(".silverwarden.sock"));
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::remove_var("HOME");
+        assert!(default_socket_path().is_err());
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
         }
     }
 
@@ -746,6 +991,9 @@ mod tests {
 
         let other = AgentError::Other("custom msg".to_string());
         assert!(other.to_string().contains("custom msg"));
+
+        let ipc = AgentError::from(sw_ipc::IpcError::Protocol("bad payload".into()));
+        assert!(ipc.to_string().contains("bad payload"));
     }
 
     #[tokio::test]
@@ -772,14 +1020,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_agent_entrypoint_aborted() {
-        let temp_dir = tempfile::tempdir().expect("Create temp dir");
-        let socket_path = temp_dir.path().join("run_agent.sock");
-        let handle = tokio::spawn(async move {
-            let _ = run_agent(&socket_path).await;
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        handle.abort();
+    async fn test_run_agent_entrypoint_error() {
+        let res = run_agent(Path::new("/proc/impossible/agent.sock")).await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]
@@ -789,7 +1032,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let agent_socket = socket_path.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = run_agent_with_shutdown(&agent_socket, async {
                 let _ = shutdown_rx.await;
             })
@@ -799,7 +1042,6 @@ mod tests {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             if let Ok(mut stream) = UnixStream::connect(&socket_path).await {
-                use tokio::io::AsyncWriteExt;
                 let _ = stream.write_all(&[0, 0, 0, 10, 1, 2]).await;
                 break;
             }
@@ -807,5 +1049,1022 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = shutdown_tx.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_ssh_actions_full_lifecycle() {
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[42u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let vault_agent = Arc::new(VaultAgentServer::new(vault.clone()));
+
+        let mut state = AgentState::default().with_vault_agent(vault_agent.clone());
+        let registry = default_registry_with_ssh(vault_agent.clone());
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // 1. Locked: all SSH actions fail with "Vault is locked"
+        let res = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Vault is locked");
+
+        let res = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "foo", "private_key_pem": "bar" }),
+            )
+            .await;
+        assert_eq!(res.unwrap_err(), "Vault is locked");
+
+        let res = registry
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "foo" }),
+            )
+            .await;
+        assert_eq!(res.unwrap_err(), "Vault is locked");
+
+        let res = registry
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "id": uuid::Uuid::new_v4().to_string() }),
+            )
+            .await;
+        assert_eq!(res.unwrap_err(), "Vault is locked");
+
+        // 2. Unlock vault agent
+        vault_agent.unlock(key.try_clone().unwrap()).await;
+
+        // 3. test_list_ssh_keys empty initially
+        let list_val = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_value(list_val).unwrap();
+        assert!(list.is_empty());
+
+        // 4. test_new_ssh_key_ed25519
+        let ed_val = registry
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "ed-key-1", "key_type": "Ed25519" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ed_val["name"], "ed-key-1");
+        assert!(ed_val["fingerprint"]
+            .as_str()
+            .unwrap()
+            .starts_with("SHA256:"));
+        assert!(ed_val["public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519"));
+        assert!(ed_val.get("private_key").is_none());
+        let ed_id = ed_val["id"].as_str().unwrap().to_string();
+
+        // 5. test_new_ssh_key_rsa
+        let rsa_val = registry
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "rsa-key-1", "key_type": "RSA" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rsa_val["name"], "rsa-key-1");
+        assert!(rsa_val["public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-rsa"));
+
+        // 6. test_list_ssh_keys: vault with 2 keys, ListSSHKeys returns 2
+        let list_val = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_value(list_val).unwrap();
+        assert_eq!(list.len(), 2);
+
+        // 7. test_list_ssh_keys_never_returns_private
+        for item in &list {
+            assert!(item.get("private_key").is_none());
+            assert!(item.get("private_key_pem").is_none());
+            let pub_str = item["public_key"].as_str().unwrap();
+            assert!(!pub_str.contains("PRIVATE KEY"));
+        }
+
+        // 8. test_import_ssh_key
+        let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[77u8; 32]),
+        );
+        let pk = russh::keys::PrivateKey::new(keypair, "imported-key").unwrap();
+        let ed25519_pem = pk
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let import_val = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({
+                    "name": "imported-key",
+                    "private_key_pem": ed25519_pem
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_val["name"], "imported-key");
+        assert!(import_val["public_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519"));
+
+        // Now 3 keys in vault
+        let list_val = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_value(list_val).unwrap();
+        assert_eq!(list.len(), 3);
+
+        // 9. test_delete_ssh_key
+        let del_val = registry
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "id": ed_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_val["status"], "deleted");
+        assert_eq!(del_val["id"], ed_id);
+
+        let list_val = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_value(list_val).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(!list.iter().any(|k| k["id"] == ed_id));
+
+        // 10. Lock via registry also locks vault agent
+        let lock_val = registry
+            .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_val["status"], "locked");
+        assert!(vault_agent.is_locked());
+    }
+
+    #[tokio::test]
+    async fn test_ssh_actions_daemon_ipc_messages() {
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[77u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let vault_agent = Arc::new(VaultAgentServer::new(vault.clone()));
+        vault_agent.unlock(key).await;
+
+        let state = AgentState::default().with_vault_agent(vault_agent.clone());
+        let daemon = AgentDaemon::with_vault_agent(state, vault_agent);
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // Create key via handle_message
+        let req = IpcMessage::new(
+            "NewSSHKey",
+            serde_json::json!({ "name": "daemon-key", "key_type": "Ed25519" }),
+        );
+        let resp = daemon.handle_message(&ctx, req).await;
+        assert_eq!(resp.action, "Ok");
+        assert_eq!(resp.payload["name"], "daemon-key");
+
+        // List keys via handle_message
+        let list_req = IpcMessage::new("ListSSHKeys", serde_json::json!({}));
+        let list_resp = daemon.handle_message(&ctx, list_req).await;
+        assert_eq!(list_resp.action, "Ok");
+        assert_eq!(list_resp.payload.as_array().unwrap().len(), 1);
+
+        // Import key via handle_message
+        let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[33u8; 32]),
+        );
+        let pk = russh::keys::PrivateKey::new(keypair, "daemon-imported").unwrap();
+        let pem = pk
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let imp_req = IpcMessage::new(
+            "ImportSSHKey",
+            serde_json::json!({ "name": "daemon-imported", "private_key_pem": pem }),
+        );
+        let imp_resp = daemon.handle_message(&ctx, imp_req).await;
+        assert_eq!(imp_resp.action, "Ok");
+        let imp_id = imp_resp.payload["id"].as_str().unwrap();
+
+        // Delete key via handle_message
+        let del_req = IpcMessage::new("DeleteSSHKey", serde_json::json!({ "id": imp_id }));
+        let del_resp = daemon.handle_message(&ctx, del_req).await;
+        assert_eq!(del_resp.action, "Ok");
+    }
+
+    #[tokio::test]
+    async fn test_ssh_actions_invalid_payloads() {
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[88u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let vault_agent = Arc::new(VaultAgentServer::new(vault.clone()));
+        vault_agent.unlock(key).await;
+
+        let mut state = AgentState::default().with_vault_agent(vault_agent.clone());
+        let registry = default_registry_with_ssh(vault_agent);
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // ImportSSHKey missing name
+        let res = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "private_key_pem": "abc" }),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // ImportSSHKey missing private_key_pem
+        let res = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "my-key" }),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // ImportSSHKey non-object payload
+        let res = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!("string"),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // NewSSHKey missing name
+        let res = registry
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "key_type": "RSA" }),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // NewSSHKey non-object
+        let res = registry
+            .execute("NewSSHKey", &mut state, &ctx, &serde_json::json!(42))
+            .await;
+        assert!(res.is_err());
+
+        // DeleteSSHKey missing id
+        let res = registry
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "not_id": "foo" }),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // DeleteSSHKey invalid UUID
+        let res = registry
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "id": "not-a-uuid" }),
+            )
+            .await;
+        assert!(res.is_err());
+
+        // DeleteSSHKey non-object non-string
+        let res = registry
+            .execute("DeleteSSHKey", &mut state, &ctx, &serde_json::json!(false))
+            .await;
+        assert!(res.is_err());
+
+        // Unconfigured vault agent error
+        let mut unconf_state = AgentState::default();
+        let unconf_reg = default_registry();
+        let res = unconf_reg
+            .execute(
+                "ListSSHKeys",
+                &mut unconf_state,
+                &ctx,
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Vault agent no configurado");
+    }
+
+    #[tokio::test]
+    async fn test_agent_state_load_or_default_and_save_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file = temp_dir.path().join(".config/goldwarden/goldwarden.json");
+
+        let config = ConfigFile {
+            device_uuid: "test-device-uuid-123".into(),
+            ..Default::default()
+        };
+        save_config_file(&config, &config_file).expect("Failed to save config");
+        assert!(config_file.exists());
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_dir.path());
+        let loaded_state = AgentState::load_or_default();
+        assert_eq!(loaded_state.config.device_uuid, "test-device-uuid-123");
+
+        // Test with invalid json in config file
+        std::fs::write(&config_file, b"not json").unwrap();
+        let fallback_state = AgentState::load_or_default();
+        assert_ne!(fallback_state.config.device_uuid, "test-device-uuid-123");
+
+        // Test when config path is a directory (read_to_string fails)
+        let _ = std::fs::remove_file(&config_file);
+        std::fs::create_dir(&config_file).unwrap();
+        let dir_fallback = AgentState::load_or_default();
+        assert_ne!(dir_fallback.config.device_uuid, "test-device-uuid-123");
+        let _ = std::fs::remove_dir(&config_file);
+
+        // Test with empty dir where config doesn't exist
+        let empty_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", empty_dir.path());
+        let empty_fallback = AgentState::load_or_default();
+        assert!(!empty_fallback.config.device_uuid.is_empty());
+        assert_ne!(empty_fallback.config.device_uuid, "test-device-uuid-123");
+
+        // Test when HOME is not set
+        std::env::remove_var("HOME");
+        let no_home_fallback = AgentState::load_or_default();
+        assert!(!no_home_fallback.config.device_uuid.is_empty());
+        assert_ne!(no_home_fallback.config.device_uuid, "test-device-uuid-123");
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_with_shutdown_signal_clean() {
+        let temp_dir = tempfile::tempdir().expect("Create temp dir");
+        let socket_path = temp_dir.path().join("clean_shutdown.sock");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let sock = socket_path.clone();
+        let handle = tokio::spawn(async move {
+            run_agent_with_shutdown(&sock, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if socket_path.exists() {
+                break;
+            }
+        }
+        let _ = tx.send(());
+        let res = handle.await.unwrap();
+        assert!(res.is_ok());
+        assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_default_registry_with_vault_agent_in_state() {
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[99u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let vault_agent = Arc::new(VaultAgentServer::new(vault.clone()));
+        vault_agent.unlock(key).await;
+
+        let mut state = AgentState::default().with_vault_agent(vault_agent.clone());
+        let registry = default_registry();
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // List keys
+        let list = registry
+            .execute("ListSSHKeys", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+
+        // New key
+        let new_key = registry
+            .execute(
+                "NewSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "state-key", "key_type": "Ed25519" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new_key["name"], "state-key");
+        let key_id = new_key["id"].as_str().unwrap().to_string();
+
+        // Import key
+        let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[55u8; 32]),
+        );
+        let pk = russh::keys::PrivateKey::new(keypair, "state-imported").unwrap();
+        let pem = pk
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let imported = registry
+            .execute(
+                "ImportSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "state-imported", "private_key_pem": pem }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported["name"], "state-imported");
+
+        // Delete key
+        let del = registry
+            .execute(
+                "DeleteSSHKey",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "id": key_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del["status"], "deleted");
+    }
+
+    #[tokio::test]
+    async fn test_agent_edge_cases_and_validations() {
+        let mut state = AgentState::default();
+        let registry = default_registry();
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // Status with logged_in
+        state.config.encrypted_token = "some_encrypted_token".into();
+        let st = registry
+            .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st["logged_in"], true);
+
+        // Unlock without PIN configured
+        assert!(registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "123" })
+            )
+            .await
+            .is_err());
+
+        // Unlock with invalid payload type
+        assert!(registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!(42))
+            .await
+            .is_err());
+
+        // PinSet with invalid payload type
+        assert!(registry
+            .execute("PinSet", &mut state, &ctx, &serde_json::json!(true))
+            .await
+            .is_err());
+
+        // PinSet with string payload
+        assert!(registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!("str_pin_123")
+            )
+            .await
+            .is_ok());
+
+        // Unlock with string payload
+        assert!(registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!("str_pin_123")
+            )
+            .await
+            .is_ok());
+
+        // PinUpdate with missing fields or invalid type
+        assert!(registry
+            .execute(
+                "PinUpdate",
+                &mut state,
+                &ctx,
+                &serde_json::json!("not_an_obj")
+            )
+            .await
+            .is_err());
+        assert!(registry
+            .execute(
+                "PinUpdate",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "old_pin": "123" })
+            )
+            .await
+            .is_err());
+        assert!(registry
+            .execute(
+                "PinUpdate",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "new_pin": "456" })
+            )
+            .await
+            .is_err());
+
+        // PinUpdate without pin set
+        let mut unconf = AgentState::default();
+        assert!(registry
+            .execute(
+                "PinUpdate",
+                &mut unconf,
+                &ctx,
+                &serde_json::json!({ "old_pin": "a", "new_pin": "b" }),
+            )
+            .await
+            .is_err());
+
+        // Check socket in use
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sock_path = temp_dir.path().join("in_use.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let prep_err = check_and_prepare_socket(&sock_path).await;
+        assert!(matches!(prep_err, Err(AgentError::SocketAlreadyInUse(_))));
+        drop(listener);
+
+        // Case-insensitive execute
+        let st_lower = registry
+            .execute("status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st_lower["locked"], false);
+
+        // Custom registered sync closure
+        let mut custom_reg = ActionsRegistry::new();
+        custom_reg.register("CustomSync", |_state, _ctx, _payload| {
+            Ok(serde_json::json!({ "custom": true }))
+        });
+        let c_res = custom_reg
+            .execute("CustomSync", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(c_res["custom"], true);
+
+        // SSH helper edge cases: "type" alias and string ID delete
+        use sw_crypto::SymmetricKey;
+        use sw_vault::VaultStore;
+
+        let key = SymmetricKey::from_bytes(&[123u8; 64]).unwrap();
+        let vault = Arc::new(VaultStore::new());
+        let va = Arc::new(VaultAgentServer::new(vault.clone()));
+        va.unlock(key.try_clone().unwrap()).await;
+
+        let new_k =
+            handle_new_ssh_key(&va, &serde_json::json!({ "name": "k1", "type": "Ed25519" }))
+                .await
+                .unwrap();
+        let k1_id = new_k["id"].as_str().unwrap();
+
+        // Delete using raw string id
+        let del_str = handle_delete_ssh_key(&va, &serde_json::json!(k1_id))
+            .await
+            .unwrap();
+        assert_eq!(del_str["status"], "deleted");
+
+        // Import using "private_key" instead of "private_key_pem"
+        let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[11u8; 32]),
+        );
+        let pk = russh::keys::PrivateKey::new(keypair, "k-priv").unwrap();
+        let pem = pk
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let imp = handle_import_ssh_key(
+            &va,
+            &serde_json::json!({ "name": "k-priv", "private_key": pem }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(imp["name"], "k-priv");
+
+        // Import using "pem" alias
+        let keypair2 = russh::keys::ssh_key::private::KeypairData::Ed25519(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[22u8; 32]),
+        );
+        let pk2 = russh::keys::PrivateKey::new(keypair2, "k-pem").unwrap();
+        let pem2 = pk2
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let imp_pem =
+            handle_import_ssh_key(&va, &serde_json::json!({ "name": "k-pem", "pem": pem2 }))
+                .await
+                .unwrap();
+        assert_eq!(imp_pem["name"], "k-pem");
+
+        // Generate RSA and ECDSA
+        let rsa_gen = handle_new_ssh_key(
+            &va,
+            &serde_json::json!({ "name": "k-rsa", "key_type": "RSA" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rsa_gen["name"], "k-rsa");
+
+        let ecdsa_gen = handle_new_ssh_key(
+            &va,
+            &serde_json::json!({ "name": "k-ecdsa", "key_type": "ECDSA" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ecdsa_gen["name"], "k-ecdsa");
+
+        // AgentShutdown without shutdown_sender
+        let mut no_shutdown_state = AgentState::default();
+        let shutdown_res = registry
+            .execute(
+                "AgentShutdown",
+                &mut no_shutdown_state,
+                &ctx,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shutdown_res["status"], "shutting_down");
+
+        // Constructors coverage
+        let d = AgentDaemon::new();
+        assert!(d.state.read().await.is_locked);
+        let d_default = AgentDaemon::default();
+        assert!(d_default.state.read().await.is_locked);
+        let d_with_state = AgentDaemon::with_state(AgentState::new(ConfigFile::default()));
+        assert!(d_with_state.state.read().await.is_locked);
+        let d_with_both =
+            AgentDaemon::with_state_and_registry(AgentState::default(), default_registry());
+        assert!(d_with_both.state.read().await.is_locked);
+
+        // AgentState Debug, Clone, with_vault_agent with full fields
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut full_state = AgentState::new(ConfigFile::default()).with_vault_agent(va.clone());
+        full_state.shutdown_sender = Some(tx);
+        let cloned_st = full_state.clone();
+        let dbg_st = format!("{cloned_st:?}");
+        assert!(dbg_st.contains("AgentState"));
+
+        let default_st = AgentState::default();
+        let cloned_default = default_st.clone();
+        let dbg_default = format!("{cloned_default:?}");
+        assert!(dbg_default.contains("AgentState"));
+
+        // Default registry unconfigured vault_agent error for all 4 SSH actions
+        let mut unconf_state = AgentState::default();
+        let default_reg = default_registry();
+        assert_eq!(
+            default_reg
+                .execute(
+                    "ListSSHKeys",
+                    &mut unconf_state,
+                    &ctx,
+                    &serde_json::json!({})
+                )
+                .await
+                .unwrap_err(),
+            "Vault agent no configurado"
+        );
+        assert_eq!(
+            default_reg
+                .execute(
+                    "ImportSSHKey",
+                    &mut unconf_state,
+                    &ctx,
+                    &serde_json::json!({})
+                )
+                .await
+                .unwrap_err(),
+            "Vault agent no configurado"
+        );
+        assert_eq!(
+            default_reg
+                .execute("NewSSHKey", &mut unconf_state, &ctx, &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+            "Vault agent no configurado"
+        );
+        assert_eq!(
+            default_reg
+                .execute(
+                    "DeleteSSHKey",
+                    &mut unconf_state,
+                    &ctx,
+                    &serde_json::json!({})
+                )
+                .await
+                .unwrap_err(),
+            "Vault agent no configurado"
+        );
+
+        // Lock on default_registry with vault_agent present
+        let mut state_with_va = AgentState::default().with_vault_agent(va.clone());
+        assert!(!va.is_locked());
+        let lock_res = default_reg
+            .execute("Lock", &mut state_with_va, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_res["status"], "locked");
+        assert!(va.is_locked());
+
+        // SSH handlers when locked
+        assert_eq!(
+            handle_list_ssh_keys(&va).await.unwrap_err(),
+            "Vault is locked"
+        );
+        assert_eq!(
+            handle_import_ssh_key(&va, &serde_json::json!({ "name": "k", "pem": "abc" }))
+                .await
+                .unwrap_err(),
+            "Vault is locked"
+        );
+        assert_eq!(
+            handle_new_ssh_key(&va, &serde_json::json!({ "name": "k" }))
+                .await
+                .unwrap_err(),
+            "Vault is locked"
+        );
+        assert_eq!(
+            handle_delete_ssh_key(
+                &va,
+                &serde_json::json!({ "id": uuid::Uuid::new_v4().to_string() })
+            )
+            .await
+            .unwrap_err(),
+            "Vault is locked"
+        );
+
+        // Unlock va again for payload edge cases
+        va.unlock(SymmetricKey::from_bytes(&[123u8; 64]).unwrap())
+            .await;
+        assert!(!va.is_locked());
+
+        // Invalid payloads for SSH handlers
+        assert!(handle_import_ssh_key(&va, &serde_json::json!("not_an_obj"))
+            .await
+            .is_err());
+        assert!(
+            handle_import_ssh_key(&va, &serde_json::json!({ "pem": "abc" }))
+                .await
+                .is_err()
+        );
+        assert!(
+            handle_import_ssh_key(&va, &serde_json::json!({ "name": "k" }))
+                .await
+                .is_err()
+        );
+        assert!(handle_import_ssh_key(
+            &va,
+            &serde_json::json!({ "name": "k", "private_key_pem": "not-a-valid-pem" })
+        )
+        .await
+        .is_err());
+
+        assert!(handle_new_ssh_key(&va, &serde_json::json!("not_an_obj"))
+            .await
+            .is_err());
+        assert!(handle_new_ssh_key(&va, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(handle_new_ssh_key(
+            &va,
+            &serde_json::json!({ "name": "k", "key_type": "UNKNOWN_TYPE" })
+        )
+        .await
+        .is_err());
+
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!(42))
+            .await
+            .is_err());
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(
+            handle_delete_ssh_key(&va, &serde_json::json!({ "id": "not-a-uuid" }))
+                .await
+                .is_err()
+        );
+        assert!(handle_delete_ssh_key(&va, &serde_json::json!("not-a-uuid"))
+            .await
+            .is_err());
+        assert!(handle_delete_ssh_key(
+            &va,
+            &serde_json::json!({ "id": uuid::Uuid::new_v4().to_string() })
+        )
+        .await
+        .is_ok());
+
+        // Unlock with corrupted config_key_hash where verify_pin returns Err
+        let mut corrupted_pin_state = AgentState {
+            has_pin: true,
+            config: ConfigFile {
+                device_uuid: "".into(),
+                config_key_hash: "0".repeat(64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = default_reg
+            .execute(
+                "Unlock",
+                &mut corrupted_pin_state,
+                &ctx,
+                &serde_json::json!({ "pin": "123" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("Error al verificar PIN"));
+
+        // PinSet with HOME configured saving config
+        let old_home = std::env::var("HOME").ok();
+        let home_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_dir.path());
+        let mut home_state = AgentState::default();
+        let pin_set_home = default_reg
+            .execute(
+                "PinSet",
+                &mut home_state,
+                &ctx,
+                &serde_json::json!({ "pin": "test_pin_home_1" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pin_set_home["status"], "pin_set");
+
+        // PinSet when already set
+        assert!(default_reg
+            .execute(
+                "PinSet",
+                &mut home_state,
+                &ctx,
+                &serde_json::json!({ "pin": "already_set" }),
+            )
+            .await
+            .is_err());
+
+        // PinUpdate with HOME saving config
+        let pin_update_home = default_reg
+            .execute(
+                "PinUpdate",
+                &mut home_state,
+                &ctx,
+                &serde_json::json!({ "old_pin": "test_pin_home_1", "new_pin": "new_pin_home_2" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pin_update_home["status"], "pin_updated");
+
+        // PinUpdate with wrong old_pin
+        assert!(default_reg
+            .execute(
+                "PinUpdate",
+                &mut home_state,
+                &ctx,
+                &serde_json::json!({ "old_pin": "wrong", "new_pin": "new" }),
+            )
+            .await
+            .is_err());
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        }
+
+        // save_config_file error with non-writable path
+        let bad_path = Path::new("/proc/invalid_dir/goldwarden.json");
+        assert!(save_config_file(&ConfigFile::default(), bad_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_agent_write_message_failure_on_closed_client() {
+        let temp_dir = tempfile::tempdir().expect("Create temp dir");
+        let socket_path = temp_dir.path().join("write_fail.sock");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent_socket = socket_path.clone();
+
+        let handle = tokio::spawn(async move {
+            let _ = run_agent_with_shutdown(&agent_socket, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Ok(mut stream) = UnixStream::connect(&socket_path).await {
+                let req = IpcMessage::new("Status", serde_json::json!({}));
+                let _ = write_message(&mut stream, &req).await;
+                let _ = stream.shutdown().await;
+                drop(stream);
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
     }
 }

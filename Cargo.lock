@@ -5621,17 +5621,22 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "sw-agent"
 version = "0.1.0"
 dependencies = [
+ "russh",
  "serde",
  "serde_json",
  "sw-config",
  "sw-crypto",
  "sw-ipc",
+ "sw-ssh-agent",
  "sw-systemauth",
+ "sw-vault",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -5779,7 +5784,9 @@ dependencies = [
 name = "sw-ssh-agent"
 version = "0.1.0"
 dependencies = [
+ "rand 0.10.3",
  "russh",
+ "serde",
  "serde_json",
  "ssh-key 0.6.7",
  "sw-bitwarden-api",

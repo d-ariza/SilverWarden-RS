@@ -82,7 +82,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rmp-serde = "1.3"
 
 # SSH Key parsing and crypto
-ssh-key = { version = "0.6", features = ["rsa", "ed25519", "crypto"] }
+ssh-key = { version = "0.6", features = ["rsa", "ed25519", "crypto", "p256"] }
 russh = "0.65"
 
 # Linux / System integrations

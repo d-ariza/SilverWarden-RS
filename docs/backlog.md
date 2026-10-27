@@ -717,7 +717,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** tests unitarios y de integración para las 4 acciones IPC; evidencia en `03-ejecucion.md`.
 
-**Depende de:** SW-044, SW-021 · **Estado:** Pendiente
+**Depende de:** SW-044, SW-021 · **Estado:** Completado (2026-10-26)
 
 ---
 
