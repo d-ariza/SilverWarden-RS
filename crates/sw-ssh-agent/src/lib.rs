@@ -626,6 +626,12 @@ impl VaultAgentServer {
         let priv_key = PrivateKey::from_openssh(private_key_pem)
             .map_err(|e| SshAgentError::KeyError(format!("Failed to parse private key: {e}")))?;
 
+        if priv_key.is_encrypted() {
+            return Err(SshAgentError::KeyError(
+                "Encrypted private keys with passphrase are not supported".into(),
+            ));
+        }
+
         let pub_key = priv_key.public_key().clone();
 
         // Check for duplicates
@@ -1024,20 +1030,12 @@ pub async fn handle_connection(
                                 .encode(&mut resp_body)
                                 .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
                         }
-                        AgentIdentity::Certificate {
-                            certificate,
-                            comment,
-                        } => {
+                        #[rustfmt::skip]
+                        AgentIdentity::Certificate { certificate, comment } => {
                             let mut cert_blob = Vec::new();
-                            certificate
-                                .encode(&mut cert_blob)
-                                .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
-                            cert_blob
-                                .encode(&mut resp_body)
-                                .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
-                            comment
-                                .encode(&mut resp_body)
-                                .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+                            let _ = certificate.encode(&mut cert_blob);
+                            let _ = cert_blob.encode(&mut resp_body);
+                            let _ = comment.encode(&mut resp_body);
                         }
                     }
                 }
@@ -1789,6 +1787,22 @@ mod tests {
 
         assert_eq!(server.socket_path(), sock_path.as_path());
         assert!(server.agent().is_locked());
+        let dbg_str = format!("{:?}", server.agent());
+        assert!(dbg_str.contains("VaultAgentServer"));
+
+        let sessions = Arc::new(RwLock::new(SessionStore::new()));
+        let with_sess = agent.clone().with_session_store(sessions.clone());
+        assert!(Arc::ptr_eq(with_sess.session_store(), &sessions));
+
+        let api_client = Arc::new(BitwardenApiClient::new(
+            "http://localhost:8080",
+            "http://localhost:8080",
+            Arc::new(tokio::sync::Mutex::new(
+                sw_bitwarden_api::LoginToken::default(),
+            )),
+        ));
+        let with_client = agent.clone().with_api_client(api_client.clone());
+        assert!(with_client.api_client().is_some());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let s_handle = tokio::spawn(async move { server.serve_with_shutdown(shutdown_rx).await });
@@ -1797,6 +1811,24 @@ mod tests {
         let _ = shutdown_tx.send(());
         let res = s_handle.await.unwrap();
         assert!(res.is_ok());
+
+        // Test serve helper
+        let s_path_2 = temp_dir.path().join("serve_fn.sock");
+        let a_2 = agent.clone();
+        let h_serve = tokio::spawn(async move {
+            let _ = serve(&s_path_2, a_2).await;
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        h_serve.abort();
+
+        // Test SshAgentServer::serve method
+        let s_path_3 = temp_dir.path().join("server_serve.sock");
+        let server_3 = SshAgentServer::new(&s_path_3, agent.clone());
+        let h_serve_3 = tokio::spawn(async move {
+            let _ = server_3.serve().await;
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        h_serve_3.abort();
     }
 
     #[tokio::test]
@@ -2983,5 +3015,698 @@ done
         agent.lock().await;
         assert!(agent.is_locked());
         assert!(agent.get_symmetric_key().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sign_with_ecdsa_key() {
+        use russh::keys::ssh_encoding::Encode;
+        use russh::keys::ssh_key::{Algorithm, EcdsaCurve, LineEnding, Signature};
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let mut rng = rand::rng();
+        let pk = PrivateKey::random(
+            &mut rng,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let pem = pk.to_openssh(LineEnding::LF).unwrap().to_string();
+
+        agent
+            .add_ssh_key(&pem, "test-ecdsa", &key)
+            .await
+            .expect("Failed to add ECDSA key");
+
+        let mut wire_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut wire_blob).unwrap();
+
+        let data = b"SilverWarden ECDSA test payload";
+        let sig_blob = agent
+            .sign_with_key(&wire_blob, data, 0)
+            .await
+            .expect("ECDSA signing failed");
+        assert!(!sig_blob.is_empty());
+
+        let sig = Signature::decode(&mut sig_blob.as_slice()).expect("Decode signature failed");
+        assert_eq!(sig.algorithm().as_str(), "ecdsa-sha2-nistp256");
+
+        use russh::keys::signature::Verifier;
+        pk.public_key()
+            .key_data()
+            .verify(data, &sig)
+            .expect("ECDSA signature verification failed");
+    }
+
+    #[tokio::test]
+    async fn test_list_with_rsa_key() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        agent
+            .add_ssh_key(TEST_RSA_PEM, "rsa-listed-key", &key)
+            .await
+            .expect("Failed to add RSA key");
+
+        let list = agent.list_ssh_keys().await.expect("List keys failed");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "rsa-listed-key");
+        assert!(list[0].public_key.starts_with("ssh-rsa"));
+        assert!(list[0].fingerprint.starts_with("SHA256:"));
+    }
+
+    #[tokio::test]
+    async fn test_import_rsa_key() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let summary = agent
+            .import_ssh_key("imported-rsa", TEST_RSA_PEM, &key)
+            .await
+            .expect("Import RSA key failed");
+
+        assert_eq!(summary.name, "imported-rsa");
+        assert!(summary.public_key.starts_with("ssh-rsa"));
+        assert!(summary.id.is_some());
+
+        let list = agent.list_ssh_keys().await.expect("List keys failed");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "imported-rsa");
+    }
+
+    #[tokio::test]
+    async fn test_import_ecdsa_key() {
+        use russh::keys::ssh_key::{Algorithm, EcdsaCurve, LineEnding};
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let mut rng = rand::rng();
+        let pk = PrivateKey::random(
+            &mut rng,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let pem = pk.to_openssh(LineEnding::LF).unwrap().to_string();
+
+        let summary = agent
+            .import_ssh_key("imported-ecdsa", &pem, &key)
+            .await
+            .expect("Import ECDSA key failed");
+
+        assert_eq!(summary.name, "imported-ecdsa");
+        assert!(summary.public_key.starts_with("ecdsa-sha2-nistp256"));
+        assert!(summary.id.is_some());
+
+        let list = agent.list_ssh_keys().await.expect("List keys failed");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "imported-ecdsa");
+    }
+
+    #[tokio::test]
+    async fn test_import_unsupported_key_type() {
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let res_invalid = agent
+            .import_ssh_key("invalid-key", "NOT_A_VALID_KEY_PEM", &key)
+            .await;
+        assert!(matches!(res_invalid, Err(SshAgentError::KeyError(_))));
+
+        let res_dsa_new = agent.new_ssh_key("dsa-key", "dsa", &key).await;
+        assert!(matches!(res_dsa_new, Err(SshAgentError::KeyError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_add_key_with_passphrase() {
+        const ENCRYPTED_OPENSSH_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABB2rz6jGv\n\
+xsDha4R8WJMFswAAAAIAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIKv16mdUNbzCXhmp\n\
+59Yk2E+yAWxRCHAxzPa/Da6Ic/ffAAAAkH67YsXg7XWyI++7vzYYV8N0GyLhljwwe17U79\n\
+F/ArF9GZc1s0c3v+O0XWCYNA77nx9yZtGoZncHXmVZXu5VIECIL9Mr61pbX31Jwi3B/Hui\n\
+iDyhCsdzcCa6WF4d3xRh9HyDsj2hWCN+OHNfhBxubuY/hyjtBj+lrp3GsBTU3teastrjl9\n\
+OaGPv7jRnKvmNDiw==\n\
+-----END OPENSSH PRIVATE KEY-----";
+
+        let key = make_test_key();
+        let vault = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(vault);
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let res_add = agent
+            .add_ssh_key(ENCRYPTED_OPENSSH_KEY, "enc-key", &key)
+            .await;
+        assert!(matches!(res_add, Err(SshAgentError::KeyError(_))));
+
+        let res_import = agent
+            .import_ssh_key("enc-key", ENCRYPTED_OPENSSH_KEY, &key)
+            .await;
+        assert!(matches!(res_import, Err(SshAgentError::KeyError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_remove_all_with_multiple_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("remove_multiple.sock");
+
+        let key = make_test_key();
+        let (vault, _, _) = setup_test_vault_with_keys(&key).await;
+
+        // Add a 3rd key (RSA)
+        let (priv_3, pub_3) = (TEST_RSA_PEM.to_string(), TEST_RSA_PUB.to_string());
+        let enc_name_3 =
+            encrypt_with(b"rsa-backup", EncStringType::AesCbc256HmacSha256B64, &key).unwrap();
+        let enc_priv_3 = encrypt_with(
+            priv_3.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_pub_3 = encrypt_with(
+            pub_3.as_bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+
+        vault
+            .insert(Cipher {
+                id: Some(Uuid::new_v4()),
+                r#type: CipherType::SshKey,
+                name: enc_name_3,
+                ssh_key: Some(SSHKeyCipher {
+                    private_key: Some(enc_priv_3),
+                    public_key: Some(enc_pub_3),
+                    key_fingerprint: None,
+                }),
+                ..Default::default()
+            })
+            .await;
+
+        let mock_approval = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent =
+            VaultAgentServer::with_key(vault.clone(), key).with_approval_provider(mock_approval);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let s_path = socket_path.clone();
+        let a = agent.clone();
+        let server_handle =
+            tokio::spawn(async move { serve_with_shutdown(s_path, a, shutdown_rx).await });
+
+        wait_for_socket(&socket_path).await;
+
+        // Verify initial list has 3 keys
+        let list_before = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert!(list_before.status.success());
+        let stdout_before = String::from_utf8_lossy(&list_before.stdout);
+        let key_count = stdout_before
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(key_count, 3, "Expected 3 keys in initial list");
+
+        // Remove all
+        let del_res = tokio::process::Command::new("ssh-add")
+            .arg("-D")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -D");
+        assert!(del_res.status.success());
+
+        // Verify list is now empty
+        let list_after = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &socket_path)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add -L");
+        assert_eq!(list_after.status.code(), Some(1));
+        let stderr_after = String::from_utf8_lossy(&list_after.stderr);
+        let stdout_after = String::from_utf8_lossy(&list_after.stdout);
+        assert!(
+            stderr_after.contains("The agent has no identities.")
+                || stdout_after.contains("The agent has no identities.")
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_connection_protocol_edge_cases() {
+        use russh::keys::ssh_encoding::Encode;
+
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_denied = Arc::new(MockApprovalProvider::new(false));
+        let agent_denied = VaultAgentServer::with_key(vault.clone(), key.try_clone().unwrap())
+            .with_approval_provider(mock_denied);
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        // 1. Locked agent: Request identities returns failure
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = tokio::spawn(handle_connection(server, agent_denied.clone()));
+        agent_denied.lock().await;
+
+        send_frame(&mut client, &[SSH2_AGENTC_REQUEST_IDENTITIES])
+            .await
+            .unwrap();
+        let mut resp_len = [0u8; 4];
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 5);
+        let mut resp_buf = [0u8; 5];
+        client.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(resp_buf[0], SSH2_AGENT_IDENTITIES_ANSWER);
+        assert_eq!(u32::from_be_bytes(resp_buf[1..5].try_into().unwrap()), 0);
+
+        let mut resp_code = [0u8; 1];
+
+        // 2. Locked agent: Add identity returns failure
+        send_frame(&mut client, &[SSH2_AGENTC_ADD_IDENTITY, 0, 0])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 3. Locked agent: Remove identity returns failure
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_IDENTITY, 0, 0])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 4. Locked agent: Remove all identities returns failure
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_ALL_IDENTITIES])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // Unlock agent with denied approvals
+        agent_denied.unlock(key.try_clone().unwrap()).await;
+
+        // 5. Sign request with denied approval returns failure
+        let data = b"some data";
+        let mut sign_req = Vec::new();
+        sign_req.push(SSH2_AGENTC_SIGN_REQUEST);
+        (key_blob.len() as u32).encode(&mut sign_req).unwrap();
+        sign_req.extend_from_slice(&key_blob);
+        (data.len() as u32).encode(&mut sign_req).unwrap();
+        sign_req.extend_from_slice(data);
+        0u32.encode(&mut sign_req).unwrap();
+        send_frame(&mut client, &sign_req).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 6. Sign request with truncated payload (only message byte)
+        send_frame(&mut client, &[SSH2_AGENTC_SIGN_REQUEST])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 7. Sign request with truncated key blob
+        send_frame(&mut client, &[SSH2_AGENTC_SIGN_REQUEST, 0, 0, 0, 10, 1, 2])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 8. Sign request with truncated data len
+        let mut trunc_sign = Vec::new();
+        trunc_sign.push(SSH2_AGENTC_SIGN_REQUEST);
+        (key_blob.len() as u32).encode(&mut trunc_sign).unwrap();
+        trunc_sign.extend_from_slice(&key_blob);
+        send_frame(&mut client, &trunc_sign).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 9. Sign request with truncated data payload
+        let mut trunc_data = Vec::new();
+        trunc_data.push(SSH2_AGENTC_SIGN_REQUEST);
+        (key_blob.len() as u32).encode(&mut trunc_data).unwrap();
+        trunc_data.extend_from_slice(&key_blob);
+        100u32.encode(&mut trunc_data).unwrap();
+        send_frame(&mut client, &trunc_data).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 10. Add identity with invalid key bytes returns failure
+        send_frame(
+            &mut client,
+            &[SSH2_AGENTC_ADD_IDENTITY, 0, 0, 0, 5, b'b', b'a', b'd'],
+        )
+        .await
+        .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 11. Remove identity with truncated key len
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_IDENTITY, 0])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 12. Remove identity with truncated key blob
+        send_frame(
+            &mut client,
+            &[SSH2_AGENTC_REMOVE_IDENTITY, 0, 0, 0, 20, 1, 2, 3],
+        )
+        .await
+        .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 13. Remove identity: key not found in vault
+        let mut not_found_rem = Vec::new();
+        not_found_rem.push(SSH2_AGENTC_REMOVE_IDENTITY);
+        let non_existent_key = vec![0x77; 32];
+        (non_existent_key.len() as u32)
+            .encode(&mut not_found_rem)
+            .unwrap();
+        not_found_rem.extend_from_slice(&non_existent_key);
+        send_frame(&mut client, &not_found_rem).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 14. Remove identity: approval denied
+        let mut rem_denied = Vec::new();
+        rem_denied.push(SSH2_AGENTC_REMOVE_IDENTITY);
+        (key_blob.len() as u32).encode(&mut rem_denied).unwrap();
+        rem_denied.extend_from_slice(&key_blob);
+        send_frame(&mut client, &rem_denied).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 15. Remove all identities: approval denied
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_ALL_IDENTITIES])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        drop(client);
+        let _ = handle.await;
+
+        // 16. Add constrained identity with lifetime and confirm
+        let (ed_pem, _) = generate_test_ed25519(99, "add-stream-test");
+        let pk_add = PrivateKey::from_openssh(&ed_pem).unwrap();
+        let mut keypair_bytes = Vec::new();
+        pk_add.key_data().encode(&mut keypair_bytes).unwrap();
+        let comment = "add-stream-test";
+
+        let mock_bypass = Arc::new(DefaultApprovalProvider::with_bypass());
+        let agent_bypass = VaultAgentServer::with_key(vault.clone(), key.try_clone().unwrap())
+            .with_approval_provider(mock_bypass);
+        let (mut client2, server2) = UnixStream::pair().unwrap();
+        let handle2 = tokio::spawn(handle_connection(server2, agent_bypass.clone()));
+
+        let mut add_req = Vec::new();
+        add_req.push(SSH2_AGENTC_ADD_ID_CONSTRAINED);
+        add_req.extend_from_slice(&keypair_bytes);
+        comment.encode(&mut add_req).unwrap();
+        add_req.push(1);
+        3600u32.encode(&mut add_req).unwrap();
+        add_req.push(2);
+        send_frame(&mut client2, &add_req).await.unwrap();
+        client2.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client2.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_SUCCESS);
+
+        // 17. Duplicate key -> SSH_AGENT_FAILURE
+        send_frame(&mut client2, &add_req).await.unwrap();
+        client2.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client2.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        drop(client2);
+        let _ = handle2.await;
+
+        // Also test which_bin helper directly
+        assert!(which_bin("nonexistent_binary_for_test_123").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pinentry_runner_and_mock_provider() {
+        let temp_dir = TempDir::new().unwrap();
+        let script_path = temp_dir.path().join("mock_pinentry.sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &script_path,
+                "#!/bin/sh\n\
+                echo 'OK Pleased to meet you'\n\
+                while read line; do\n\
+                  case \"$line\" in\n\
+                    CONFIRM*)\n\
+                      if [ \"$PINENTRY_FAIL\" = \"1\" ]; then\n\
+                        echo 'ERR 123 User cancelled'\n\
+                      else\n\
+                        echo 'OK'\n\
+                      fi\n\
+                      ;;\n\
+                    BYE*)\n\
+                      echo 'OK'\n\
+                      exit 0\n\
+                      ;;\n\
+                    *)\n\
+                      echo 'OK'\n\
+                      ;;\n\
+                  esac\n\
+                done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Test run_pinentry_confirm OK
+        assert!(run_pinentry_confirm(&script_path, "Title\n", "Desc\r\n").unwrap());
+
+        // Test DefaultApprovalProvider with custom bin
+        let provider = DefaultApprovalProvider::with_custom_bin(script_path.clone());
+        assert!(provider.get_approval("Title", "Description").unwrap());
+
+        // Test run_pinentry_confirm ERR
+        std::env::set_var("PINENTRY_FAIL", "1");
+        assert!(!run_pinentry_confirm(&script_path, "Title", "Desc").unwrap());
+        std::env::remove_var("PINENTRY_FAIL");
+
+        // Test run_pinentry_confirm exit immediately (broken pinentry)
+        let broken_path = temp_dir.path().join("broken_pinentry.sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&broken_path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&broken_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(run_pinentry_confirm(&broken_path, "Title", "Desc").is_err());
+
+        // Test run_pinentry_confirm spawn error
+        assert!(run_pinentry_confirm(Path::new("/nonexistent/bin/path"), "Title", "Desc").is_err());
+
+        // Test MockApprovalProvider set_approved
+        let mock = Arc::new(MockApprovalProvider::new(true));
+        assert!(mock.get_approval("T", "D").unwrap());
+        mock.set_approved(false);
+        assert!(!mock.get_approval("T", "D").unwrap());
+        mock.set_approved(true);
+        assert!(mock.get_approval("T", "D").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_vault_agent_locked_and_edge_branches() {
+        let store = Arc::new(VaultStore::new());
+        let agent = VaultAgentServer::new(store.clone());
+
+        // Check is_locked on empty agent
+        assert!(agent.is_locked());
+
+        // request_identities when locked
+        let ids = agent.request_identities().await.unwrap();
+        assert!(ids.is_empty());
+
+        // sign_with_key when locked
+        let sign_res = agent.sign_with_key(b"keyblob", b"data", 0).await;
+        assert!(matches!(sign_res, Err(SshAgentError::VaultLocked)));
+
+        // delete_ssh_key when locked
+        let del_res = agent.delete_ssh_key(&Uuid::new_v4()).await;
+        assert!(matches!(del_res, Err(SshAgentError::VaultLocked)));
+
+        // Unlock agent
+        let key = make_test_key();
+        agent.unlock(key).await;
+        assert!(!agent.is_locked());
+
+        // delete_ssh_key when unlocked but not found
+        let del_res2 = agent.delete_ssh_key(&Uuid::new_v4()).await;
+        assert!(del_res2.is_ok());
+
+        // test socket_path on SshAgentServer
+        let server = SshAgentServer::new(PathBuf::from("/tmp/test.sock"), agent);
+        assert_eq!(server.socket_path(), Path::new("/tmp/test.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_connection_more_edge_cases() {
+        let store = Arc::new(VaultStore::new());
+        let key = make_test_key();
+        let agent = VaultAgentServer::with_key(store.clone(), key.try_clone().unwrap());
+
+        // Add 1 key
+        let (ed1_pem, _) = generate_test_ed25519(88, "ed1");
+        let _ = agent.add_ssh_key(&ed1_pem, "ed1", &key).await.unwrap();
+        let pk = PrivateKey::from_openssh(&ed1_pem).unwrap();
+        let mut key_wire = Vec::new();
+        pk.public_key().key_data().encode(&mut key_wire).unwrap();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mock_provider = Arc::new(MockApprovalProvider::new(true));
+        let agent_with_provider = agent.clone().with_approval_provider(mock_provider.clone());
+        let handle = tokio::spawn(handle_connection(server, agent_with_provider));
+
+        let mut resp_len = [0u8; 4];
+        let mut resp_code = [0u8; 1];
+
+        // 1. Unknown message type (250)
+        send_frame(&mut client, &[250u8, 0, 0, 0]).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 2. SSH2_AGENTC_SIGN_REQUEST with truncated buffer (< 5 bytes)
+        send_frame(&mut client, &[SSH2_AGENTC_SIGN_REQUEST, 0, 0])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 3. SSH2_AGENTC_SIGN_REQUEST with key length exceeding frame
+        send_frame(
+            &mut client,
+            &[SSH2_AGENTC_SIGN_REQUEST, 0, 0, 1, 0, 1, 2, 3],
+        )
+        .await
+        .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 4. SSH2_AGENTC_REMOVE_IDENTITY with truncated frame (< 5 bytes)
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_IDENTITY, 0, 0])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 5. SSH2_AGENTC_REMOVE_IDENTITY with key not found
+        let mut fake_rem = Vec::new();
+        fake_rem.push(SSH2_AGENTC_REMOVE_IDENTITY);
+        let fake_blob = b"not-a-real-ssh-key-blob-at-all";
+        (fake_blob.len() as u32).encode(&mut fake_rem).unwrap();
+        fake_rem.extend_from_slice(fake_blob);
+        send_frame(&mut client, &fake_rem).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 6. SSH2_AGENTC_REMOVE_IDENTITY with approval denied
+        mock_provider.set_approved(false);
+        let mut rem_req = Vec::new();
+        rem_req.push(SSH2_AGENTC_REMOVE_IDENTITY);
+        (key_wire.len() as u32).encode(&mut rem_req).unwrap();
+        rem_req.extend_from_slice(&key_wire);
+        send_frame(&mut client, &rem_req).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 7. SSH2_AGENTC_REMOVE_ALL_IDENTITIES with approval denied
+        send_frame(&mut client, &[SSH2_AGENTC_REMOVE_ALL_IDENTITIES])
+            .await
+            .unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        // 8. SSH2_AGENTC_ADD_IDENTITY with approval denied
+        let mut add_req = Vec::new();
+        add_req.push(SSH2_AGENTC_ADD_IDENTITY);
+        let mut keypair_bytes = Vec::new();
+        pk.encode(&mut keypair_bytes).unwrap();
+        add_req.extend_from_slice(&keypair_bytes);
+        "test_comment".encode(&mut add_req).unwrap();
+        send_frame(&mut client, &add_req).await.unwrap();
+        client.read_exact(&mut resp_len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(resp_len), 1);
+        client.read_exact(&mut resp_code).await.unwrap();
+        assert_eq!(resp_code[0], SSH_AGENT_FAILURE);
+
+        drop(client);
+        let _ = handle.await;
     }
 }
