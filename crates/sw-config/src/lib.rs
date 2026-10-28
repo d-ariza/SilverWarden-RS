@@ -335,6 +335,37 @@ impl ConfigFile {
         }
         Self::default()
     }
+
+    /// Sets identity, api, and notifications URLs derived from a base server URL.
+    pub fn set_server(&mut self, server: &str) {
+        let (identity, api, notif) = derive_server_urls(server);
+        self.identity_url = identity;
+        self.api_url = api;
+        self.notifications_url = notif;
+    }
+}
+
+/// Derives identity, api, and notifications URLs from a base server URL.
+///
+/// Prevents duplicating `/identity`, `/api`, or `/notifications` if already present.
+pub fn derive_server_urls(server: &str) -> (String, String, String) {
+    let base = server.trim().trim_end_matches('/');
+    let identity_url = if base.ends_with("/identity") {
+        base.to_string()
+    } else {
+        format!("{base}/identity")
+    };
+    let api_url = if base.ends_with("/api") {
+        base.to_string()
+    } else {
+        format!("{base}/api")
+    };
+    let notifications_url = if base.ends_with("/notifications") {
+        base.to_string()
+    } else {
+        format!("{base}/notifications")
+    };
+    (identity_url, api_url, notifications_url)
 }
 
 /// Representation of the decrypted OAuth login token payload
@@ -1225,5 +1256,34 @@ mod tests {
         let err = ConfigError::InvalidPin;
         let debug_err = format!("{err:?}");
         assert!(debug_err.contains("InvalidPin"));
+    }
+
+    #[test]
+    fn test_derive_server_urls_and_set_server() {
+        let (id, api, notif) = derive_server_urls("http://localhost:8080");
+        assert_eq!(id, "http://localhost:8080/identity");
+        assert_eq!(api, "http://localhost:8080/api");
+        assert_eq!(notif, "http://localhost:8080/notifications");
+
+        // Trailing slash
+        let (id2, api2, notif2) = derive_server_urls("http://localhost:8080/");
+        assert_eq!(id2, "http://localhost:8080/identity");
+        assert_eq!(api2, "http://localhost:8080/api");
+        assert_eq!(notif2, "http://localhost:8080/notifications");
+
+        // Already has /identity or /api
+        let (id3, api3, notif3) = derive_server_urls("http://localhost:8080/identity");
+        assert_eq!(id3, "http://localhost:8080/identity");
+        assert_eq!(api3, "http://localhost:8080/identity/api");
+        assert_eq!(notif3, "http://localhost:8080/identity/notifications");
+
+        let mut cfg = ConfigFile::default();
+        cfg.set_server("https://vaultwarden.local:8443");
+        assert_eq!(cfg.identity_url, "https://vaultwarden.local:8443/identity");
+        assert_eq!(cfg.api_url, "https://vaultwarden.local:8443/api");
+        assert_eq!(
+            cfg.notifications_url,
+            "https://vaultwarden.local:8443/notifications"
+        );
     }
 }

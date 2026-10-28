@@ -538,6 +538,12 @@ async fn handle_set_session(
 ) -> Result<serde_json::Value, String> {
     if let Some(token_val) = payload.get("token") {
         if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
+            if let Some(ident) = payload.get("identity_url").and_then(|v| v.as_str()) {
+                state.config.identity_url = ident.to_string();
+            }
+            if let Some(api) = payload.get("api_url").and_then(|v| v.as_str()) {
+                state.config.api_url = api.to_string();
+            }
             let identity_url = state.config.identity_url.clone();
             let api_url = state.config.api_url.clone();
             let client = Arc::new(sw_bitwarden_api::AuthenticatedClient::from_token(

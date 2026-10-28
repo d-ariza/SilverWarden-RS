@@ -89,6 +89,10 @@ pub enum Commands {
         /// Master password (interactive prompt if not provided)
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Base server URL (e.g. http://localhost:8080)
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Force vault synchronization with server
     Sync,
@@ -105,11 +109,30 @@ pub enum Commands {
         #[command(subcommand)]
         ssh_command: SshCommands,
     },
+    /// View or configure server URLs
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
     /// Migrate existing Goldwarden configuration and vault from Go installation
     Migrate {
         #[arg(long, default_value = "~/.config/goldwarden/goldwarden.json")]
         source: String,
     },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum ConfigCommands {
+    /// Show current configuration URLs and login status
+    Get,
+    /// Set base server URL (derives identity, api, and notifications URLs)
+    SetServer { url: String },
+    /// Set identity URL manually
+    SetIdentity { url: String },
+    /// Set API URL manually
+    SetApi { url: String },
+    /// Set notifications URL manually
+    SetNotifications { url: String },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
@@ -405,7 +428,11 @@ where
                 Ok("PIN actualizado exitosamente.".to_string())
             }
         },
-        Commands::Login { email, password } => {
+        Commands::Login {
+            email,
+            password,
+            server,
+        } => {
             let email_val = match email {
                 Some(e) => e.clone(),
                 None => prompt_fn("Introduce tu email de Bitwarden: ")?,
@@ -422,6 +449,15 @@ where
             } else {
                 sw_config::ConfigFile::default()
             };
+
+            if let Some(srv) = server {
+                if srv.trim().is_empty() {
+                    return Err(CliError::Other(
+                        "La URL del servidor no puede estar vacía.".to_string(),
+                    ));
+                }
+                config.set_server(srv);
+            }
 
             let client = sw_bitwarden_api::AuthenticatedClient::from_token(
                 &config.identity_url,
@@ -466,7 +502,9 @@ where
                     "SetSession",
                     serde_json::json!({
                         "token": token,
-                        "user_symmetric_key": b64_sym_key
+                        "user_symmetric_key": b64_sym_key,
+                        "identity_url": config.identity_url,
+                        "api_url": config.api_url,
                     }),
                 )
                 .await;
@@ -605,6 +643,79 @@ where
                 Ok(format!("Registrando clave SSH {key_id}"))
             }
         },
+        Commands::Config { action } => {
+            let config_path = resolve_config_path(cli.config.clone())?;
+            let mut config = if config_path.exists() {
+                sw_config::ConfigFile::load_from_file(&config_path)
+                    .map_err(|e| CliError::Config(e.to_string()))?
+            } else {
+                sw_config::ConfigFile::default()
+            };
+
+            match action {
+                ConfigCommands::Get => {
+                    let status_login = if config.is_logged_in() { "Sí" } else { "No" };
+                    Ok(format!(
+                        "Configuración actual:\n  Identity URL:      {}\n  API URL:           {}\n  Notifications URL: {}\n  Sesión iniciada:   {}",
+                        config.identity_url,
+                        config.api_url,
+                        config.notifications_url,
+                        status_login
+                    ))
+                }
+                ConfigCommands::SetServer { url } => {
+                    if url.trim().is_empty() {
+                        return Err(CliError::Other(
+                            "La URL del servidor no puede estar vacía.".to_string(),
+                        ));
+                    }
+                    config.set_server(url);
+                    config
+                        .save_to_file(&config_path)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    Ok(format!(
+                        "Servidor configurado a {url}.\n  Identity URL:      {}\n  API URL:           {}\n  Notifications URL: {}",
+                        config.identity_url, config.api_url, config.notifications_url
+                    ))
+                }
+                ConfigCommands::SetIdentity { url } => {
+                    if url.trim().is_empty() {
+                        return Err(CliError::Other(
+                            "La URL de identity no puede estar vacía.".to_string(),
+                        ));
+                    }
+                    config.identity_url = url.clone();
+                    config
+                        .save_to_file(&config_path)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    Ok(format!("Identity URL actualizada a {url}."))
+                }
+                ConfigCommands::SetApi { url } => {
+                    if url.trim().is_empty() {
+                        return Err(CliError::Other(
+                            "La URL de API no puede estar vacía.".to_string(),
+                        ));
+                    }
+                    config.api_url = url.clone();
+                    config
+                        .save_to_file(&config_path)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    Ok(format!("API URL actualizada a {url}."))
+                }
+                ConfigCommands::SetNotifications { url } => {
+                    if url.trim().is_empty() {
+                        return Err(CliError::Other(
+                            "La URL de notifications no puede estar vacía.".to_string(),
+                        ));
+                    }
+                    config.notifications_url = url.clone();
+                    config
+                        .save_to_file(&config_path)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    Ok(format!("Notifications URL actualizada a {url}."))
+                }
+            }
+        }
         Commands::Migrate { source: _ } => {
             sw_config::run_migration().map_err(|e| CliError::Config(e.to_string()))
         }
@@ -776,6 +887,104 @@ mod tests {
             Commands::Login {
                 email: Some("test@test.com".to_string()),
                 password: Some("mypass".to_string()),
+                server: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_login_with_server() {
+        let cli = Cli::try_parse_from([
+            "silverwarden",
+            "login",
+            "--email",
+            "user@vaultwarden.local",
+            "--server",
+            "http://localhost:8080",
+        ])
+        .expect("Should parse login with server");
+        assert_eq!(
+            cli.command,
+            Commands::Login {
+                email: Some("user@vaultwarden.local".to_string()),
+                password: None,
+                server: Some("http://localhost:8080".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_config_subcommands() {
+        let cli_get = Cli::try_parse_from(["silverwarden", "config", "get"])
+            .expect("Should parse config get");
+        assert_eq!(
+            cli_get.command,
+            Commands::Config {
+                action: ConfigCommands::Get
+            }
+        );
+
+        let cli_set_srv = Cli::try_parse_from([
+            "silverwarden",
+            "config",
+            "set-server",
+            "http://localhost:8080",
+        ])
+        .expect("Should parse config set-server");
+        assert_eq!(
+            cli_set_srv.command,
+            Commands::Config {
+                action: ConfigCommands::SetServer {
+                    url: "http://localhost:8080".to_string()
+                }
+            }
+        );
+
+        let cli_set_id = Cli::try_parse_from([
+            "silverwarden",
+            "config",
+            "set-identity",
+            "https://id.bitwarden.com",
+        ])
+        .expect("Should parse config set-identity");
+        assert_eq!(
+            cli_set_id.command,
+            Commands::Config {
+                action: ConfigCommands::SetIdentity {
+                    url: "https://id.bitwarden.com".to_string()
+                }
+            }
+        );
+
+        let cli_set_api = Cli::try_parse_from([
+            "silverwarden",
+            "config",
+            "set-api",
+            "https://api.bitwarden.com",
+        ])
+        .expect("Should parse config set-api");
+        assert_eq!(
+            cli_set_api.command,
+            Commands::Config {
+                action: ConfigCommands::SetApi {
+                    url: "https://api.bitwarden.com".to_string()
+                }
+            }
+        );
+
+        let cli_set_notif = Cli::try_parse_from([
+            "silverwarden",
+            "config",
+            "set-notifications",
+            "https://notifications.bitwarden.com",
+        ])
+        .expect("Should parse config set-notifications");
+        assert_eq!(
+            cli_set_notif.command,
+            Commands::Config {
+                action: ConfigCommands::SetNotifications {
+                    url: "https://notifications.bitwarden.com".to_string()
+                }
             }
         );
     }
@@ -1206,6 +1415,7 @@ mod tests {
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
+                server: None,
             },
         };
 
@@ -1616,6 +1826,7 @@ mod tests {
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
+                server: None,
             },
         };
 
@@ -1670,6 +1881,7 @@ mod tests {
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
+                server: None,
             },
         };
 
@@ -1772,5 +1984,189 @@ mod tests {
             err.to_string(),
             "No se encontró ningún acceso con el nombre 'NonExistent'"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cli_config_commands_flow() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("silverwarden.json");
+
+        // 1. Initial config get (returns default URLs and not logged in)
+        let cli_get = Cli {
+            socket: None,
+            config: Some(config_path.clone()),
+            command: Commands::Config {
+                action: ConfigCommands::Get,
+            },
+        };
+        let out_get = handle_command(&cli_get, |_| unreachable!()).await.unwrap();
+        assert!(out_get.contains("Identity URL:      https://identity.bitwarden.com"));
+        assert!(out_get.contains("Sesión iniciada:   No"));
+
+        // 2. Set server URL
+        let cli_set_server = Cli {
+            socket: None,
+            config: Some(config_path.clone()),
+            command: Commands::Config {
+                action: ConfigCommands::SetServer {
+                    url: "http://localhost:8080".to_string(),
+                },
+            },
+        };
+        let out_srv = handle_command(&cli_set_server, |_| unreachable!())
+            .await
+            .unwrap();
+        assert!(out_srv.contains("Servidor configurado a http://localhost:8080."));
+        assert!(out_srv.contains("Identity URL:      http://localhost:8080/identity"));
+        assert!(out_srv.contains("API URL:           http://localhost:8080/api"));
+        assert!(out_srv.contains("Notifications URL: http://localhost:8080/notifications"));
+
+        // 3. Verify get reflects the server URLs
+        let out_get2 = handle_command(&cli_get, |_| unreachable!()).await.unwrap();
+        assert!(out_get2.contains("Identity URL:      http://localhost:8080/identity"));
+        assert!(out_get2.contains("API URL:           http://localhost:8080/api"));
+
+        // 4. Set individual URLs
+        let cli_set_id = Cli {
+            socket: None,
+            config: Some(config_path.clone()),
+            command: Commands::Config {
+                action: ConfigCommands::SetIdentity {
+                    url: "https://id.custom.com".to_string(),
+                },
+            },
+        };
+        handle_command(&cli_set_id, |_| unreachable!())
+            .await
+            .unwrap();
+
+        let cli_set_api = Cli {
+            socket: None,
+            config: Some(config_path.clone()),
+            command: Commands::Config {
+                action: ConfigCommands::SetApi {
+                    url: "https://api.custom.com".to_string(),
+                },
+            },
+        };
+        handle_command(&cli_set_api, |_| unreachable!())
+            .await
+            .unwrap();
+
+        let cli_set_notif = Cli {
+            socket: None,
+            config: Some(config_path.clone()),
+            command: Commands::Config {
+                action: ConfigCommands::SetNotifications {
+                    url: "https://notif.custom.com".to_string(),
+                },
+            },
+        };
+        handle_command(&cli_set_notif, |_| unreachable!())
+            .await
+            .unwrap();
+
+        // 5. Verify get reflects individual changes
+        let out_get3 = handle_command(&cli_get, |_| unreachable!()).await.unwrap();
+        assert!(out_get3.contains("Identity URL:      https://id.custom.com"));
+        assert!(out_get3.contains("API URL:           https://api.custom.com"));
+        assert!(out_get3.contains("Notifications URL: https://notif.custom.com"));
+
+        // 6. Validation error on empty URLs
+        let cli_empty_srv = Cli {
+            socket: None,
+            config: Some(config_path),
+            command: Commands::Config {
+                action: ConfigCommands::SetServer {
+                    url: "   ".to_string(),
+                },
+            },
+        };
+        let err = handle_command(&cli_empty_srv, |_| unreachable!())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "La URL del servidor no puede estar vacía.");
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_with_server_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "vaultwarden_user@example.com";
+        let password = "super_vaultwarden_password";
+
+        // Prelogin endpoint (derived as {base_url}/api/accounts/prelogin or /accounts/prelogin)
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [42u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        // Token endpoint on {base_url}/identity/connect/token
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_vw_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_vw_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: Some(base_url.clone()),
+            },
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            result.is_ok(),
+            "Login with --server should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify config file was updated with derived server URLs
+        let saved_config = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
+        assert_eq!(saved_config.identity_url, format!("{base_url}/identity"));
+        assert_eq!(saved_config.api_url, format!("{base_url}/api"));
+        assert_eq!(
+            saved_config.notifications_url,
+            format!("{base_url}/notifications")
+        );
+        assert!(saved_config.is_logged_in());
     }
 }

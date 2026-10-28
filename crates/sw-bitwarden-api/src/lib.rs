@@ -222,16 +222,23 @@ impl AuthenticatedClient {
         &self.api_url
     }
 
-    /// Resolves an absolute or relative API URL.
+    /// Resolves an absolute or relative API URL without duplicating `/api`.
     pub fn resolve_api_url(&self, endpoint: &str) -> String {
         if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint.to_string()
         } else {
-            format!(
-                "{}/{}",
-                self.api_url.trim_end_matches('/'),
-                endpoint.trim_start_matches('/')
-            )
+            let base = self.api_url.trim_end_matches('/');
+            let ep = endpoint.trim_start_matches('/');
+            if base.ends_with("/api") && (ep == "api" || ep.starts_with("api/")) {
+                let rest = ep.strip_prefix("api/").unwrap_or("");
+                if rest.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}/{rest}")
+                }
+            } else {
+                format!("{base}/{ep}")
+            }
         }
     }
 
@@ -383,10 +390,12 @@ impl AuthenticatedClient {
 
     /// Queries the prelogin endpoint to obtain the account's KDF configuration.
     pub async fn prelogin(&self, email: &str) -> Result<sw_crypto::KdfConfig, ApiError> {
-        let url = format!(
-            "{}/api/accounts/prelogin",
-            self.api_url.trim_end_matches('/')
-        );
+        let api_base = self.api_url.trim_end_matches('/');
+        let url = if api_base.ends_with("/api") {
+            format!("{api_base}/accounts/prelogin")
+        } else {
+            format!("{api_base}/api/accounts/prelogin")
+        };
         let mut resp = self
             .client
             .post(&url)
@@ -400,10 +409,8 @@ impl AuthenticatedClient {
 
         // Fallback for self-hosted / identity endpoint mount
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            let alt_url = format!(
-                "{}/accounts/prelogin",
-                self.identity_url.trim_end_matches('/')
-            );
+            let identity_base = self.identity_url.trim_end_matches('/');
+            let alt_url = format!("{identity_base}/accounts/prelogin");
             resp = self
                 .client
                 .post(&alt_url)
@@ -1498,7 +1505,7 @@ mod tests {
         let client = AuthenticatedClient::from_token(
             "https://identity.bitwarden.com",
             "https://api.bitwarden.com",
-            token,
+            token.clone(),
         );
 
         assert_eq!(client.identity_url(), "https://identity.bitwarden.com");
@@ -1522,6 +1529,25 @@ mod tests {
         assert_eq!(
             client.resolve_api_url("http://insecure.com/api/test"),
             "http://insecure.com/api/test"
+        );
+
+        // Self-hosted / Vaultwarden style: base ends with /api
+        let self_hosted = AuthenticatedClient::from_token(
+            "http://localhost:8080/identity",
+            "http://localhost:8080/api",
+            token,
+        );
+        assert_eq!(
+            self_hosted.resolve_api_url("/sync"),
+            "http://localhost:8080/api/sync"
+        );
+        assert_eq!(
+            self_hosted.resolve_api_url("/api/sync"),
+            "http://localhost:8080/api/sync"
+        );
+        assert_eq!(
+            self_hosted.resolve_api_url("api/sync"),
+            "http://localhost:8080/api/sync"
         );
 
         // RequestBody empty & From
