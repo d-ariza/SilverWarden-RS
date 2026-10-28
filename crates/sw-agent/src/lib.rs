@@ -45,6 +45,7 @@ pub struct AgentState {
     pub has_pin: bool,
     pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub vault_agent: Option<Arc<VaultAgentServer>>,
+    pub config_directory: Option<PathBuf>,
 }
 
 impl AgentState {
@@ -57,6 +58,37 @@ impl AgentState {
             has_pin,
             shutdown_sender: None,
             vault_agent: None,
+            config_directory: None,
+        }
+    }
+
+    /// Sets an injectable configuration directory for saving and loading config.
+    pub fn with_config_directory(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config_directory = Some(dir.into());
+        self
+    }
+
+    /// Returns the target path for saving/loading configuration.
+    /// In test mode (`#[cfg(test)]`), this NEVER touches `$HOME` unless `config_directory` was explicitly set.
+    pub fn config_path(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.config_directory {
+            if dir.ends_with("goldwarden.json") {
+                Some(dir.clone())
+            } else {
+                Some(dir.join("goldwarden.json"))
+            }
+        } else {
+            #[cfg(test)]
+            {
+                // In test builds, NEVER write to or touch the user's real $HOME directory
+                None
+            }
+            #[cfg(not(test))]
+            {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| sw_config::get_new_config_path(Path::new(&home)))
+            }
         }
     }
 
@@ -68,17 +100,27 @@ impl AgentState {
 
     /// Loads the configuration file from ~/.config/goldwarden/goldwarden.json or defaults.
     pub fn load_or_default() -> Self {
-        if let Ok(home) = std::env::var("HOME") {
-            let path = sw_config::get_new_config_path(Path::new(&home));
+        Self::load_or_default_from(None)
+    }
+
+    /// Loads the configuration from an optional directory, or defaults.
+    pub fn load_or_default_from(config_dir: Option<PathBuf>) -> Self {
+        let mut state = Self::new(ConfigFile::default());
+        if let Some(dir) = config_dir {
+            state.config_directory = Some(dir);
+        }
+        if let Some(path) = state.config_path() {
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(cfg) = serde_json::from_str::<ConfigFile>(&content) {
-                        return Self::new(cfg);
+                        state.config = cfg;
+                        state.has_pin = !state.config.config_key_hash.is_empty();
+                        return state;
                     }
                 }
             }
         }
-        Self::new(ConfigFile::default())
+        state
     }
 }
 
@@ -378,8 +420,7 @@ pub fn default_registry() -> ActionsRegistry {
             state.config.config_key_hash = sw_config::hash_config_key(&key);
             state.has_pin = true;
 
-            if let Ok(home) = std::env::var("HOME") {
-                let path = sw_config::get_new_config_path(Path::new(&home));
+            if let Some(path) = state.config_path() {
                 let _ = save_config_file(&state.config, &path);
             }
 
@@ -410,8 +451,7 @@ pub fn default_registry() -> ActionsRegistry {
                 .update_pin_with_params(old_pin, new_pin, AGENT_KDF_MEMORY_KIB)
                 .map_err(|e| format!("Error al actualizar PIN: {e}"))?;
 
-            if let Ok(home) = std::env::var("HOME") {
-                let path = sw_config::get_new_config_path(Path::new(&home));
+            if let Some(path) = state.config_path() {
                 let _ = save_config_file(&state.config, &path);
             }
 
@@ -556,11 +596,18 @@ impl Default for AgentDaemon {
     }
 }
 
+/// Returns the socket path `~/.silverwarden.sock` for a specific home or falling back to the current user's `$HOME`.
+pub fn socket_path_from_home(home: Option<&str>) -> Result<PathBuf, AgentError> {
+    let home = home
+        .map(String::from)
+        .or_else(|| std::env::var("HOME").ok())
+        .ok_or_else(|| AgentError::Other("HOME no definido".into()))?;
+    Ok(PathBuf::from(home).join(".silverwarden.sock"))
+}
+
 /// Returns the default socket path `~/.silverwarden.sock` for the current user.
 pub fn default_socket_path() -> Result<PathBuf, AgentError> {
-    let home =
-        std::env::var("HOME").map_err(|e| AgentError::Other(format!("HOME no definido: {e}")))?;
-    Ok(PathBuf::from(home).join(".silverwarden.sock"))
+    socket_path_from_home(None)
 }
 
 /// Checks if a socket file exists. If another process is actively listening, returns `SocketAlreadyInUse`.
@@ -684,7 +731,8 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = AgentDaemon::with_state(AgentState::new(config));
+        let daemon =
+            AgentDaemon::with_state(AgentState::new(config).with_config_directory(temp_dir.path()));
         let daemon_clone = daemon.clone();
         let agent_socket = socket_path.clone();
 
@@ -756,7 +804,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_actions_registry_direct() {
-        let mut state = AgentState::default();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut state = AgentState::default().with_config_directory(temp_dir.path());
         assert!(!state.has_pin);
 
         let registry = default_registry();
@@ -915,12 +964,8 @@ mod tests {
         let path = default_socket_path().expect("Default socket path succeeds");
         assert!(path.to_string_lossy().contains(".silverwarden.sock"));
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::remove_var("HOME");
-        assert!(default_socket_path().is_err());
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        }
+        let custom = socket_path_from_home(Some("/custom/home")).unwrap();
+        assert_eq!(custom, PathBuf::from("/custom/home/.silverwarden.sock"));
     }
 
     #[test]
@@ -1389,7 +1434,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_state_load_or_default_and_save_config() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config_file = temp_dir.path().join(".config/goldwarden/goldwarden.json");
+        let config_file = temp_dir.path().join("goldwarden.json");
 
         let config = ConfigFile {
             device_uuid: "test-device-uuid-123".into(),
@@ -1398,39 +1443,30 @@ mod tests {
         save_config_file(&config, &config_file).expect("Failed to save config");
         assert!(config_file.exists());
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_dir.path());
-        let loaded_state = AgentState::load_or_default();
+        let loaded_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
         assert_eq!(loaded_state.config.device_uuid, "test-device-uuid-123");
 
         // Test with invalid json in config file
         std::fs::write(&config_file, b"not json").unwrap();
-        let fallback_state = AgentState::load_or_default();
+        let fallback_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
         assert_ne!(fallback_state.config.device_uuid, "test-device-uuid-123");
 
         // Test when config path is a directory (read_to_string fails)
         let _ = std::fs::remove_file(&config_file);
         std::fs::create_dir(&config_file).unwrap();
-        let dir_fallback = AgentState::load_or_default();
+        let dir_fallback = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
         assert_ne!(dir_fallback.config.device_uuid, "test-device-uuid-123");
         let _ = std::fs::remove_dir(&config_file);
 
         // Test with empty dir where config doesn't exist
         let empty_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", empty_dir.path());
-        let empty_fallback = AgentState::load_or_default();
+        let empty_fallback = AgentState::load_or_default_from(Some(empty_dir.path().to_path_buf()));
         assert!(!empty_fallback.config.device_uuid.is_empty());
         assert_ne!(empty_fallback.config.device_uuid, "test-device-uuid-123");
 
-        // Test when HOME is not set
-        std::env::remove_var("HOME");
+        // Test when config_dir is None (load_or_default)
         let no_home_fallback = AgentState::load_or_default();
         assert!(!no_home_fallback.config.device_uuid.is_empty());
-        assert_ne!(no_home_fallback.config.device_uuid, "test-device-uuid-123");
-
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        }
 
         // Test save_config_file with relative path without parent
         let rel_path = Path::new("temp_test_local_cfg.json");
@@ -1543,7 +1579,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_edge_cases_and_validations() {
-        let mut state = AgentState::default();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut state = AgentState::default().with_config_directory(temp_dir.path());
         let registry = default_registry();
         let ctx = CallingContext {
             username: "tester".into(),
@@ -2020,11 +2057,9 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Error al verificar PIN"));
 
-        // PinSet with HOME configured saving config
-        let old_home = std::env::var("HOME").ok();
+        // PinSet with config_directory saving config
         let home_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home_dir.path());
-        let mut home_state = AgentState::default();
+        let mut home_state = AgentState::default().with_config_directory(home_dir.path());
         let pin_set_home = default_reg
             .execute(
                 "PinSet",
@@ -2035,6 +2070,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pin_set_home["status"], "pin_set");
+        assert!(home_dir.path().join("goldwarden.json").exists());
 
         // PinSet when already set
         assert!(default_reg
@@ -2047,7 +2083,7 @@ mod tests {
             .await
             .is_err());
 
-        // PinUpdate with HOME saving config
+        // PinUpdate with config_directory saving config
         let pin_update_home = default_reg
             .execute(
                 "PinUpdate",
@@ -2069,10 +2105,6 @@ mod tests {
             )
             .await
             .is_err());
-
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        }
 
         // save_config_file error with non-writable path
         let bad_path = Path::new("/proc/invalid_dir/goldwarden.json");
@@ -2280,5 +2312,68 @@ mod tests {
             )
             .await;
         assert_eq!(err_resp.action, "Error");
+    }
+
+    #[tokio::test]
+    async fn test_regression_home_config_untouched() {
+        let real_config_path = std::env::var("HOME")
+            .ok()
+            .map(|h| sw_config::get_new_config_path(Path::new(&h)));
+
+        let before_content = real_config_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok());
+
+        // Run full PinSet and PinUpdate flow without config_directory set
+        let registry = default_registry();
+        let mut state = AgentState::default();
+        let ctx = CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        };
+
+        // PinSet must succeed without writing to real $HOME
+        let pin_set = registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "regression_pin_123" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pin_set["status"], "pin_set");
+
+        // PinUpdate must succeed without writing to real $HOME
+        let pin_upd = registry
+            .execute(
+                "PinUpdate",
+                &mut state,
+                &ctx,
+                &serde_json::json!({
+                    "old_pin": "regression_pin_123",
+                    "new_pin": "regression_pin_456"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pin_upd["status"], "pin_updated");
+
+        // Verify that real ~/.config/goldwarden/goldwarden.json was NOT modified
+        let after_content = real_config_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok());
+
+        assert_eq!(
+            before_content, after_content,
+            "Regression: PinSet or PinUpdate wrote to real ~/.config/goldwarden/goldwarden.json!"
+        );
     }
 }
