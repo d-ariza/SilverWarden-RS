@@ -292,6 +292,9 @@ async fn handle_sync(state: &mut AgentState) -> Result<serde_json::Value, String
             Ok(sync_data) => {
                 agent.vault().load_sync_data(sync_data).await;
             }
+            Err(sw_bitwarden_api::ApiError::RateLimitExceeded) => {
+                return Err("El servidor ha bloqueado temporalmente tu IP por demasiados intentos de login. Espera unos minutos o cambia de red (por ejemplo, usa datos móviles).".to_string());
+            }
             Err(e) => return Err(format!("Error al sincronizar con el servidor: {e}")),
         }
     }
@@ -389,18 +392,32 @@ async fn handle_create_login(
     if state.is_locked {
         return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
     }
-    let name = payload
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| "El payload debe ser un objeto JSON".to_string())?;
+
+    let name = obj
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Campo 'name' requerido".to_string())?;
-    let username = payload
+    let username = obj
         .get("username")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Campo 'username' requerido".to_string())?;
-    let password = payload
+    let password = obj
         .get("password")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Campo 'password' requerido".to_string())?;
+
+    if name.trim().is_empty() {
+        return Err("El campo 'name' no puede estar vacío".to_string());
+    }
+    if username.trim().is_empty() {
+        return Err("El campo 'username' no puede estar vacío".to_string());
+    }
+    if password.trim().is_empty() {
+        return Err("El campo 'password' no puede estar vacío".to_string());
+    }
 
     let agent = state
         .vault_agent

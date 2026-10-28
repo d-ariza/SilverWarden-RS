@@ -59,7 +59,9 @@ fn test_cli_status_no_agent() {
     cmd.args(["--socket", non_existent.to_str().unwrap(), "status"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("El archivo de socket no existe"));
+        .stderr(predicate::str::contains(
+            "El agente no está corriendo o el socket no existe. Ejecuta 'silverwarden agent start'.",
+        ));
 }
 
 #[test]
@@ -131,7 +133,7 @@ fn test_cli_unlock_agent_error() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("Error del agente: PIN incorrecto"));
+    .stderr(predicate::str::contains("PIN incorrecto"));
 
     handle.join().unwrap();
 }

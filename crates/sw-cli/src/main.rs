@@ -9,10 +9,14 @@ pub const CLI_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB_TEST;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CliError {
-    #[error("El archivo de socket no existe: {0}")]
+    #[error(
+        "El agente no está corriendo o el socket no existe. Ejecuta 'silverwarden agent start'."
+    )]
     SocketNotFound(PathBuf),
 
-    #[error("No se pudo conectar al socket del agente en {0}: {1}")]
+    #[error(
+        "El agente no está corriendo o el socket no existe. Ejecuta 'silverwarden agent start'."
+    )]
     ConnectionFailed(PathBuf, String),
 
     #[error("Error al enviar mensaje al agente: {0}")]
@@ -21,7 +25,7 @@ pub enum CliError {
     #[error("Error al recibir respuesta del agente: {0}")]
     ReceiveFailed(String),
 
-    #[error("Error del agente: {0}")]
+    #[error("{0}")]
     AgentError(String),
 
     #[error("Error de E/S o terminal: {0}")]
@@ -30,7 +34,7 @@ pub enum CliError {
     #[error("Error de configuración: {0}")]
     Config(String),
 
-    #[error("Error: {0}")]
+    #[error("{0}")]
     Other(String),
 }
 
@@ -530,6 +534,11 @@ where
                 Ok(out.trim_end().to_string())
             }
             Some(LoginsCommands::Get { name }) => {
+                if name.trim().is_empty() {
+                    return Err(CliError::Other(
+                        "El nombre no puede estar vacío.".to_string(),
+                    ));
+                }
                 let resp = send_command(
                     &socket_path,
                     "GetLogin",
@@ -553,6 +562,11 @@ where
                 username,
                 password,
             }) => {
+                if name.trim().is_empty() {
+                    return Err(CliError::Other(
+                        "El nombre no puede estar vacío.".to_string(),
+                    ));
+                }
                 send_command(
                     &socket_path,
                     "CreateLogin",
@@ -566,6 +580,11 @@ where
                 Ok(format!("Acceso '{name}' creado exitosamente."))
             }
             Some(LoginsCommands::Delete { name }) => {
+                if name.trim().is_empty() {
+                    return Err(CliError::Other(
+                        "El nombre no puede estar vacío.".to_string(),
+                    ));
+                }
                 send_command(
                     &socket_path,
                     "DeleteLogin",
@@ -577,7 +596,14 @@ where
         },
         Commands::Ssh { ssh_command } => match ssh_command {
             SshCommands::List => Ok("Listando claves SSH registradas...".to_string()),
-            SshCommands::Add { key_id } => Ok(format!("Registrando clave SSH {key_id}")),
+            SshCommands::Add { key_id } => {
+                if key_id.trim().is_empty() {
+                    return Err(CliError::Other(
+                        "El nombre de la clave SSH no puede estar vacío.".to_string(),
+                    ));
+                }
+                Ok(format!("Registrando clave SSH {key_id}"))
+            }
         },
         Commands::Migrate { source: _ } => {
             sw_config::run_migration().map_err(|e| CliError::Config(e.to_string()))
@@ -1441,28 +1467,27 @@ mod tests {
         let p = PathBuf::from("/tmp/test.sock");
         assert!(CliError::SocketNotFound(p.clone())
             .to_string()
-            .contains("no existe"));
+            .contains("El agente no está corriendo o el socket no existe"));
         assert!(CliError::ConnectionFailed(p, "conn err".into())
             .to_string()
-            .contains("No se pudo conectar"));
+            .contains("El agente no está corriendo o el socket no existe"));
         assert!(CliError::SendFailed("send err".into())
             .to_string()
             .contains("Error al enviar"));
         assert!(CliError::ReceiveFailed("recv err".into())
             .to_string()
             .contains("Error al recibir"));
-        assert!(CliError::AgentError("agent err".into())
-            .to_string()
-            .contains("Error del agente"));
+        assert_eq!(
+            CliError::AgentError("agent err".into()).to_string(),
+            "agent err"
+        );
         assert!(CliError::Io("io err".into())
             .to_string()
             .contains("Error de E/S"));
         assert!(CliError::Config("cfg err".into())
             .to_string()
             .contains("Error de configuración"));
-        assert!(CliError::Other("other err".into())
-            .to_string()
-            .contains("Error: other err"));
+        assert_eq!(CliError::Other("other err".into()).to_string(), "other err");
     }
 
     #[tokio::test]
@@ -1547,5 +1572,205 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_login_rate_limit_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "ratelimit@example.com";
+        let password = "super_master_password";
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+            },
+        };
+
+        let err = handle_command(&cli, |_| unreachable!()).await.unwrap_err();
+        assert!(err.to_string().contains(
+            "El servidor ha bloqueado temporalmente tu IP por demasiados intentos de login"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_login_invalid_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "invalid@example.com";
+        let password = "wrong_password";
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid username or password."
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+            },
+        };
+
+        let err = handle_command(&cli, |_| unreachable!()).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Credenciales inválidas. Comprueba tu correo y contraseña maestra."));
+    }
+
+    #[tokio::test]
+    async fn test_unlock_wrong_pin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("unlock_wrong_pin.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                assert_eq!(req.action, "Unlock");
+                assert_eq!(req.payload["pin"], "999999");
+                let resp = IpcMessage::new("Error", serde_json::json!("PIN incorrecto"));
+                sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+            }
+        });
+
+        let cli = test_cli(
+            Some(socket_path),
+            Commands::Unlock {
+                pin: Some("999999".into()),
+            },
+        );
+
+        let err = handle_command(&cli, |_| unreachable!()).await.unwrap_err();
+        assert_eq!(err, CliError::AgentError("PIN incorrecto".to_string()));
+        assert_eq!(err.to_string(), "PIN incorrecto");
+    }
+
+    #[tokio::test]
+    async fn test_create_empty_name_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dummy_socket = temp_dir.path().join("dummy.sock");
+
+        let cli = test_cli(
+            Some(dummy_socket),
+            Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "   ".into(),
+                    username: "user".into(),
+                    password: "pass".into(),
+                }),
+                filter: None,
+            },
+        );
+
+        let err = handle_command(&cli, |_| unreachable!()).await.unwrap_err();
+        assert_eq!(
+            err,
+            CliError::Other("El nombre no puede estar vacío.".to_string())
+        );
+        assert_eq!(err.to_string(), "El nombre no puede estar vacío.");
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("delete_nonexistent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                assert_eq!(req.action, "DeleteLogin");
+                assert_eq!(req.payload["name"], "NonExistent");
+                let resp = IpcMessage::new(
+                    "Error",
+                    serde_json::json!("No se encontró ningún acceso con el nombre 'NonExistent'"),
+                );
+                sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+            }
+        });
+
+        let cli = test_cli(
+            Some(socket_path),
+            Commands::Logins {
+                action: Some(LoginsCommands::Delete {
+                    name: "NonExistent".into(),
+                }),
+                filter: None,
+            },
+        );
+
+        let err = handle_command(&cli, |_| unreachable!()).await.unwrap_err();
+        assert_eq!(
+            err,
+            CliError::AgentError(
+                "No se encontró ningún acceso con el nombre 'NonExistent'".to_string()
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "No se encontró ningún acceso con el nombre 'NonExistent'"
+        );
     }
 }

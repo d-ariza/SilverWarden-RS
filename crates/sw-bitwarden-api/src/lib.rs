@@ -63,6 +63,12 @@ pub enum ApiError {
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 
+    #[error("El servidor ha bloqueado temporalmente tu IP por demasiados intentos de login. Espera unos minutos o cambia de red (por ejemplo, usa datos móviles).")]
+    RateLimitExceeded,
+
+    #[error("Credenciales inválidas. Comprueba tu correo y contraseña maestra.")]
+    InvalidCredentials,
+
     #[error("Server error ({status}): {message}")]
     Status {
         status: reqwest::StatusCode,
@@ -464,6 +470,10 @@ impl AuthenticatedClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
 
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ApiError::RateLimitExceeded);
+            }
+
             if (status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::BAD_REQUEST)
                 && (body.contains("TwoFactor") || body.contains("twoFactor"))
@@ -476,6 +486,10 @@ impl AuthenticatedClient {
                         message: body,
                     });
                 }
+            }
+
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(ApiError::InvalidCredentials);
             }
 
             return Err(ApiError::Auth(format!(
@@ -547,6 +561,14 @@ impl AuthenticatedClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ApiError::RateLimitExceeded);
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(ApiError::InvalidCredentials);
+            }
+
             return Err(ApiError::Status {
                 status,
                 message: body,
@@ -1192,6 +1214,52 @@ mod tests {
             .await;
 
         assert!(matches!(res, Err(ApiError::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn test_login_with_password_error_429() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Rate limit exceeded"))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login_with_password("user@example.com", "any_hash", "device-uuid-123")
+            .await;
+
+        match res {
+            Err(ApiError::RateLimitExceeded) => {}
+            other => panic!("Expected ApiError::RateLimitExceeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_login_with_password_error_401() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login_with_password("user@example.com", "bad_hash", "device-uuid-123")
+            .await;
+
+        match res {
+            Err(ApiError::InvalidCredentials) => {}
+            other => panic!("Expected ApiError::InvalidCredentials, got {:?}", other),
+        }
     }
 
     #[tokio::test]
