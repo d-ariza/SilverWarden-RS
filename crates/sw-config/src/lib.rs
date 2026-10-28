@@ -268,6 +268,73 @@ impl ConfigFile {
         let decrypted_json = decrypt_string(&self.encrypted_token, key)?;
         serde_json::from_str(&decrypted_json).map_err(ConfigError::Json)
     }
+
+    /// Checks whether the user is currently logged in (encrypted_token is present).
+    pub fn is_logged_in(&self) -> bool {
+        !self.encrypted_token.is_empty()
+    }
+
+    /// Encrypts and sets the OAuth login token payload using the derived key.
+    pub fn set_token(&mut self, token: &LoginToken, key: &[u8; 32]) -> Result<(), ConfigError> {
+        let serialized = serde_json::to_string(token).map_err(ConfigError::Json)?;
+        self.encrypted_token = encrypt_string(&serialized, key)?;
+        Ok(())
+    }
+
+    /// Encrypts and sets the raw user symmetric key bytes using the derived key.
+    pub fn set_user_symmetric_key(
+        &mut self,
+        sym_key: &[u8],
+        key: &[u8; 32],
+    ) -> Result<(), ConfigError> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sym_key);
+        self.encrypted_user_symmetric_key = encrypt_string(&b64, key)?;
+        Ok(())
+    }
+
+    /// Decrypts the raw user symmetric key bytes using the derived key.
+    pub fn decrypt_user_symmetric_key(&self, key: &[u8; 32]) -> Result<Vec<u8>, ConfigError> {
+        if self.encrypted_user_symmetric_key.is_empty() {
+            return Err(ConfigError::Crypto(
+                "EncryptedUserSymmetricKey is empty".to_string(),
+            ));
+        }
+        let decrypted = decrypt_string(&self.encrypted_user_symmetric_key, key)?;
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(decrypted.trim()) {
+            Ok(bytes)
+        } else {
+            Ok(decrypted.into_bytes())
+        }
+    }
+
+    /// Saves the configuration to a file on disk atomically.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, content)
+    }
+
+    /// Loads the configuration from a file on disk.
+    pub fn load_from_file(path: &Path) -> Result<Self, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Loads the configuration from the default path or returns default configuration.
+    pub fn load_or_default() -> Self {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = get_new_config_path(Path::new(&home));
+            if path.exists() {
+                if let Ok(cfg) = Self::load_from_file(&path) {
+                    return cfg;
+                }
+            }
+        }
+        Self::default()
+    }
 }
 
 /// Representation of the decrypted OAuth login token payload

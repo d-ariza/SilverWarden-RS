@@ -46,6 +46,7 @@ pub struct AgentState {
     pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub vault_agent: Option<Arc<VaultAgentServer>>,
     pub config_directory: Option<PathBuf>,
+    pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
 }
 
 impl AgentState {
@@ -59,7 +60,14 @@ impl AgentState {
             shutdown_sender: None,
             vault_agent: None,
             config_directory: None,
+            api_client: None,
         }
+    }
+
+    /// Sets an authenticated API client in state.
+    pub fn with_api_client(mut self, client: Arc<sw_bitwarden_api::AuthenticatedClient>) -> Self {
+        self.api_client = Some(client);
+        self
     }
 
     /// Sets an injectable configuration directory for saving and loading config.
@@ -263,6 +271,279 @@ async fn handle_delete_ssh_key(
         "status": "deleted",
         "id": id.to_string(),
     }))
+}
+
+async fn handle_sync(state: &mut AgentState) -> Result<serde_json::Value, String> {
+    if state.is_locked {
+        return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
+    }
+    if !state.config.is_logged_in() {
+        return Err("No hay sesión iniciada. Ejecuta 'silverwarden login' primero.".to_string());
+    }
+
+    let agent = state
+        .vault_agent
+        .as_ref()
+        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+
+    let client = state.api_client.as_ref().or_else(|| agent.api_client());
+    if let Some(c) = client {
+        match c.sync().await {
+            Ok(sync_data) => {
+                agent.vault().load_sync_data(sync_data).await;
+            }
+            Err(e) => return Err(format!("Error al sincronizar con el servidor: {e}")),
+        }
+    }
+
+    let logins = agent
+        .vault()
+        .all()
+        .await
+        .into_iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+        .count();
+
+    Ok(serde_json::json!({
+        "status": "synced",
+        "logins": logins,
+    }))
+}
+
+async fn handle_list_logins(state: &AgentState) -> Result<serde_json::Value, String> {
+    if state.is_locked {
+        return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
+    }
+    let agent = state
+        .vault_agent
+        .as_ref()
+        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Bóveda bloqueada".to_string())?;
+
+    let all = agent.vault().all().await;
+    let mut list = Vec::new();
+    for c in all {
+        if c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none() {
+            if let Ok(dec) = sw_vault::VaultStore::decrypt_cipher(&c, &sym_key) {
+                list.push(serde_json::json!({
+                    "id": dec.id,
+                    "name": dec.name,
+                    "username": dec.username.unwrap_or_default(),
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!(list))
+}
+
+async fn handle_get_login(
+    state: &AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if state.is_locked {
+        return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
+    }
+    let target_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.as_str())
+        .ok_or_else(|| "Campo 'name' requerido".to_string())?;
+
+    let agent = state
+        .vault_agent
+        .as_ref()
+        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Bóveda bloqueada".to_string())?;
+
+    let all = agent.vault().all().await;
+    for c in all {
+        if c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none() {
+            if let Ok(dec) = sw_vault::VaultStore::decrypt_cipher(&c, &sym_key) {
+                if dec.name.eq_ignore_ascii_case(target_name) {
+                    return Ok(serde_json::json!({
+                        "id": dec.id,
+                        "name": dec.name,
+                        "username": dec.username.unwrap_or_default(),
+                        "password": dec.password.unwrap_or_default(),
+                        "totp": dec.totp.unwrap_or_default(),
+                    }));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "No se encontró ningún acceso con el nombre '{target_name}'"
+    ))
+}
+
+async fn handle_create_login(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if state.is_locked {
+        return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
+    }
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Campo 'name' requerido".to_string())?;
+    let username = payload
+        .get("username")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Campo 'username' requerido".to_string())?;
+    let password = payload
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Campo 'password' requerido".to_string())?;
+
+    let agent = state
+        .vault_agent
+        .as_ref()
+        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Bóveda bloqueada".to_string())?;
+
+    let cipher_id = uuid::Uuid::new_v4();
+    let enc_name = sw_vault::encrypt_with(
+        name.as_bytes(),
+        sw_vault::EncStringType::AesCbc256HmacSha256B64,
+        &sym_key,
+    )
+    .map_err(|e| format!("Error al cifrar nombre: {e}"))?;
+    let enc_user = sw_vault::encrypt_with(
+        username.as_bytes(),
+        sw_vault::EncStringType::AesCbc256HmacSha256B64,
+        &sym_key,
+    )
+    .map_err(|e| format!("Error al cifrar usuario: {e}"))?;
+    let enc_pass = sw_vault::encrypt_with(
+        password.as_bytes(),
+        sw_vault::EncStringType::AesCbc256HmacSha256B64,
+        &sym_key,
+    )
+    .map_err(|e| format!("Error al cifrar contraseña: {e}"))?;
+
+    let cipher = sw_vault::Cipher {
+        id: Some(cipher_id),
+        r#type: sw_vault::CipherType::Login,
+        name: enc_name,
+        login: Some(sw_vault::LoginCipher {
+            username: Some(enc_user),
+            password: Some(enc_pass),
+            uri: None,
+            uris: vec![],
+            totp: None,
+        }),
+        ..Default::default()
+    };
+
+    let client = state.api_client.as_ref().or_else(|| agent.api_client());
+    if let Some(c) = client {
+        if let Err(e) = c.post_cipher(&cipher).await {
+            tracing::warn!("Failed to post cipher to server: {e}");
+        }
+    }
+
+    agent.vault().insert(cipher).await;
+
+    Ok(serde_json::json!({
+        "status": "created",
+        "id": cipher_id,
+        "name": name,
+    }))
+}
+
+async fn handle_delete_login(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if state.is_locked {
+        return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
+    }
+    let target_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.as_str())
+        .ok_or_else(|| "Campo 'name' requerido".to_string())?;
+
+    let agent = state
+        .vault_agent
+        .as_ref()
+        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let sym_key = agent
+        .get_symmetric_key()
+        .await
+        .ok_or_else(|| "Bóveda bloqueada".to_string())?;
+
+    let all = agent.vault().all().await;
+    let mut to_delete = None;
+    for c in all {
+        if c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none() {
+            if let Ok(dec) = sw_vault::VaultStore::decrypt_cipher(&c, &sym_key) {
+                if dec.name.eq_ignore_ascii_case(target_name) {
+                    to_delete = Some((c.id, dec.name));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (id_opt, found_name) = to_delete
+        .ok_or_else(|| format!("No se encontró ningún acceso con el nombre '{target_name}'"))?;
+
+    if let Some(id) = id_opt {
+        let client = state.api_client.as_ref().or_else(|| agent.api_client());
+        if let Some(c) = client {
+            if let Err(e) = c.delete_cipher(&id).await {
+                tracing::warn!("Failed to delete cipher from server: {e}");
+            }
+        }
+        agent.vault().delete(&id).await;
+    }
+
+    Ok(serde_json::json!({
+        "status": "deleted",
+        "name": found_name,
+    }))
+}
+
+async fn handle_set_session(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if let Some(token_val) = payload.get("token") {
+        if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
+            let identity_url = state.config.identity_url.clone();
+            let api_url = state.config.api_url.clone();
+            let client = Arc::new(sw_bitwarden_api::AuthenticatedClient::from_token(
+                identity_url,
+                api_url,
+                token.clone(),
+            ));
+            state.api_client = Some(client);
+        }
+    }
+
+    if let Some(sym_key_b64) = payload.get("user_symmetric_key").and_then(|v| v.as_str()) {
+        use base64::Engine;
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(sym_key_b64.trim()) {
+            if let Ok(sym_key) = sw_crypto::SymmetricKey::from_bytes(&bytes) {
+                if let Some(agent) = &state.vault_agent {
+                    agent.unlock(sym_key).await;
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({ "status": "session_saved" }))
 }
 
 impl ActionsRegistry {
@@ -533,6 +814,42 @@ pub fn default_registry() -> ActionsRegistry {
             let agent = agent.ok_or_else(|| "Vault agent no configurado".to_string())?;
             handle_delete_ssh_key(&agent, &payload).await
         })
+    });
+
+    // Sync
+    registry.register_async("Sync", |state, _ctx, _payload| Box::pin(handle_sync(state)));
+
+    // ListLogins
+    registry.register_async("ListLogins", |state, _ctx, _payload| {
+        Box::pin(handle_list_logins(state))
+    });
+
+    // GetLogin
+    registry.register_async("GetLogin", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_get_login(state, &p).await })
+    });
+
+    // CreateLogin
+    registry.register_async("CreateLogin", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_create_login(state, &p).await })
+    });
+
+    // DeleteLogin
+    registry.register_async("DeleteLogin", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_delete_login(state, &p).await })
+    });
+
+    // SetSession / Login
+    registry.register_async("SetSession", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_set_session(state, &p).await })
+    });
+    registry.register_async("Login", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_set_session(state, &p).await })
     });
 
     registry

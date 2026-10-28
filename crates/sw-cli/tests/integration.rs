@@ -207,19 +207,17 @@ fn test_cli_pin_update_with_mock_agent() {
 
 #[test]
 fn test_cli_local_commands() {
-    // Sync
-    let mut cmd = Command::cargo_bin("silverwarden").unwrap();
-    cmd.arg("sync")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Sincronizando bóveda..."));
+    let temp_home = tempdir().unwrap();
 
-    // Logins
+    // Sync without login must fail with clear error
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
-    cmd.arg("logins")
+    cmd.env("HOME", temp_home.path().to_str().unwrap())
+        .arg("sync")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Listando accesos guardados..."));
+        .failure()
+        .stderr(predicate::str::contains(
+            "No hay sesión iniciada. Ejecuta 'silverwarden login' primero.",
+        ));
 
     // SSH List
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();

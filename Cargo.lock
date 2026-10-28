@@ -5621,9 +5621,11 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "sw-agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "russh",
  "serde",
  "serde_json",
+ "sw-bitwarden-api",
  "sw-config",
  "sw-crypto",
  "sw-ipc",
@@ -5689,19 +5691,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64 0.22.1",
  "clap",
  "predicates",
  "rpassword",
  "serde_json",
  "sw-agent",
+ "sw-bitwarden-api",
  "sw-config",
+ "sw-crypto",
  "sw-ipc",
  "sw-ssh-agent",
+ "sw-vault",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

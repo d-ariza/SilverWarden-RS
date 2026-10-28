@@ -2,6 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use sw_ipc::IpcMessage;
 
+#[cfg(not(test))]
+pub const CLI_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB;
+#[cfg(test)]
+pub const CLI_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB_TEST;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CliError {
     #[error("El archivo de socket no existe: {0}")]
@@ -42,6 +47,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
+    /// Custom path to the SilverWarden configuration file
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -67,10 +76,23 @@ pub enum Commands {
         #[command(subcommand)]
         action: PinCommands,
     },
+    /// Login to Bitwarden server
+    Login {
+        /// Bitwarden account email
+        #[arg(short, long)]
+        email: Option<String>,
+
+        /// Master password (interactive prompt if not provided)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
     /// Force vault synchronization with server
     Sync,
     /// Query or list logins from vault
     Logins {
+        #[command(subcommand)]
+        action: Option<LoginsCommands>,
+
         #[arg(short, long)]
         filter: Option<String>,
     },
@@ -83,6 +105,34 @@ pub enum Commands {
     Migrate {
         #[arg(long, default_value = "~/.config/goldwarden/goldwarden.json")]
         source: String,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum LoginsCommands {
+    /// List all logins in vault
+    List,
+    /// Get details for a specific login
+    Get {
+        /// Name of the login
+        name: String,
+    },
+    /// Create a new login entry
+    Create {
+        /// Login entry name
+        #[arg(short, long)]
+        name: String,
+        /// Login username
+        #[arg(short, long)]
+        username: String,
+        /// Login password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Delete a login entry
+    Delete {
+        /// Name of the login to delete
+        name: String,
     },
 }
 
@@ -193,6 +243,19 @@ pub fn check_goldwarden_go_conflict() -> bool {
         }
     }
     false
+}
+
+/// Resolves the configuration file path, supporting custom flag or SILVERWARDEN_CONFIG_PATH override.
+pub fn resolve_config_path(custom: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(p) = custom {
+        return Ok(p);
+    }
+    if let Ok(path) = std::env::var("SILVERWARDEN_CONFIG_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|e| CliError::Config(format!("No se pudo determinar $HOME: {e}")))?;
+    Ok(sw_config::get_new_config_path(Path::new(&home)))
 }
 
 /// Executes a CLI command, returning human-readable output or an error.
@@ -338,8 +401,180 @@ where
                 Ok("PIN actualizado exitosamente.".to_string())
             }
         },
-        Commands::Sync => Ok("Sincronizando bóveda...".to_string()),
-        Commands::Logins { filter: _ } => Ok("Listando accesos guardados...".to_string()),
+        Commands::Login { email, password } => {
+            let email_val = match email {
+                Some(e) => e.clone(),
+                None => prompt_fn("Introduce tu email de Bitwarden: ")?,
+            };
+            let password_val = match password {
+                Some(p) => p.clone(),
+                None => prompt_fn("Introduce tu contraseña maestra: ")?,
+            };
+
+            let config_path = resolve_config_path(cli.config.clone())?;
+            let mut config = if config_path.exists() {
+                sw_config::ConfigFile::load_from_file(&config_path)
+                    .map_err(|e| CliError::Config(e.to_string()))?
+            } else {
+                sw_config::ConfigFile::default()
+            };
+
+            let client = sw_bitwarden_api::AuthenticatedClient::from_token(
+                &config.identity_url,
+                &config.api_url,
+                Default::default(),
+            );
+            let (token, user_symmetric_key) = client
+                .login(&email_val, &password_val, &config.device_uuid)
+                .await
+                .map_err(|e| CliError::Other(e.to_string()))?;
+
+            let config_key = if config.config_key_hash.is_empty() {
+                sw_config::derive_config_key_with_params(
+                    "",
+                    &config.device_uuid,
+                    CLI_KDF_MEMORY_KIB,
+                )
+                .map_err(|e| CliError::Config(e.to_string()))?
+            } else {
+                let pin = prompt_fn("Introduce tu PIN de SilverWarden para guardar la sesión: ")?;
+                config
+                    .unlock_with_params(&pin, CLI_KDF_MEMORY_KIB)
+                    .map_err(|e| CliError::Config(format!("PIN incorrecto: {e}")))?
+            };
+
+            config
+                .set_token(&token, &config_key)
+                .map_err(|e| CliError::Config(e.to_string()))?;
+            config
+                .set_user_symmetric_key(&user_symmetric_key, &config_key)
+                .map_err(|e| CliError::Config(e.to_string()))?;
+            config
+                .save_to_file(&config_path)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+
+            if socket_path.exists() {
+                use base64::Engine;
+                let b64_sym_key =
+                    base64::engine::general_purpose::STANDARD.encode(&user_symmetric_key);
+                let _ = send_command(
+                    &socket_path,
+                    "SetSession",
+                    serde_json::json!({
+                        "token": token,
+                        "user_symmetric_key": b64_sym_key
+                    }),
+                )
+                .await;
+            }
+
+            Ok(format!("Sesión iniciada con éxito para {email_val}."))
+        }
+        Commands::Sync => {
+            let config_path = resolve_config_path(cli.config.clone())?;
+            let config = if config_path.exists() {
+                sw_config::ConfigFile::load_from_file(&config_path)
+                    .map_err(|e| CliError::Config(e.to_string()))?
+            } else {
+                sw_config::ConfigFile::default()
+            };
+
+            if !config.is_logged_in() {
+                return Err(CliError::Other(
+                    "No hay sesión iniciada. Ejecuta 'silverwarden login' primero.".to_string(),
+                ));
+            }
+
+            let resp = send_command(&socket_path, "Sync", serde_json::json!({})).await?;
+            let logins = resp
+                .payload
+                .get("logins")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Ok(format!(
+                "Sincronización completada ({logins} logins descargados)."
+            ))
+        }
+        Commands::Logins { action, filter } => match action {
+            None | Some(LoginsCommands::List) => {
+                let resp = send_command(&socket_path, "ListLogins", serde_json::json!({})).await?;
+                let items = resp.payload.as_array().cloned().unwrap_or_default();
+                let filter_str = filter.as_deref().unwrap_or("").to_lowercase();
+                let filtered: Vec<_> = items
+                    .into_iter()
+                    .filter(|item| {
+                        if filter_str.is_empty() {
+                            return true;
+                        }
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let username = item.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                        name.to_lowercase().contains(&filter_str)
+                            || username.to_lowercase().contains(&filter_str)
+                    })
+                    .collect();
+
+                if filtered.is_empty() {
+                    return Ok("No se encontraron accesos guardados.".to_string());
+                }
+
+                let mut out = format!("{:<30} | {}\n", "Nombre", "Usuario");
+                out.push_str(&format!(
+                    "{:-<30}-+------------------------------------\n",
+                    ""
+                ));
+                for item in filtered {
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let username = item.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                    out.push_str(&format!("{:<30} | {}\n", name, username));
+                }
+                Ok(out.trim_end().to_string())
+            }
+            Some(LoginsCommands::Get { name }) => {
+                let resp = send_command(
+                    &socket_path,
+                    "GetLogin",
+                    serde_json::json!({ "name": name }),
+                )
+                .await?;
+                let password = resp
+                    .payload
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let totp = resp
+                    .payload
+                    .get("totp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(format!("Contraseña: {password}\nTOTP: {totp}"))
+            }
+            Some(LoginsCommands::Create {
+                name,
+                username,
+                password,
+            }) => {
+                send_command(
+                    &socket_path,
+                    "CreateLogin",
+                    serde_json::json!({
+                        "name": name,
+                        "username": username,
+                        "password": password
+                    }),
+                )
+                .await?;
+                Ok(format!("Acceso '{name}' creado exitosamente."))
+            }
+            Some(LoginsCommands::Delete { name }) => {
+                send_command(
+                    &socket_path,
+                    "DeleteLogin",
+                    serde_json::json!({ "name": name }),
+                )
+                .await?;
+                Ok(format!("Acceso '{name}' eliminado exitosamente."))
+            }
+        },
         Commands::Ssh { ssh_command } => match ssh_command {
             SshCommands::List => Ok("Listando claves SSH registradas...".to_string()),
             SshCommands::Add { key_id } => Ok(format!("Registrando clave SSH {key_id}")),
@@ -499,6 +734,96 @@ mod tests {
         assert_eq!(cli.command, Commands::Status);
     }
 
+    #[test]
+    fn test_cli_parse_login() {
+        let cli = Cli::try_parse_from([
+            "silverwarden",
+            "login",
+            "--email",
+            "test@test.com",
+            "--password",
+            "mypass",
+        ])
+        .expect("Should parse login");
+        assert_eq!(
+            cli.command,
+            Commands::Login {
+                email: Some("test@test.com".to_string()),
+                password: Some("mypass".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_logins_list() {
+        let cli = Cli::try_parse_from(["silverwarden", "logins", "list"])
+            .expect("Should parse logins list");
+        assert_eq!(
+            cli.command,
+            Commands::Logins {
+                action: Some(LoginsCommands::List),
+                filter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_logins_get() {
+        let cli = Cli::try_parse_from(["silverwarden", "logins", "get", "MyLogin"])
+            .expect("Should parse logins get");
+        assert_eq!(
+            cli.command,
+            Commands::Logins {
+                action: Some(LoginsCommands::Get {
+                    name: "MyLogin".to_string()
+                }),
+                filter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_logins_create() {
+        let cli = Cli::try_parse_from([
+            "silverwarden",
+            "logins",
+            "create",
+            "--name",
+            "MyLogin",
+            "--username",
+            "myuser",
+            "--password",
+            "mypassword",
+        ])
+        .expect("Should parse logins create");
+        assert_eq!(
+            cli.command,
+            Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "MyLogin".to_string(),
+                    username: "myuser".to_string(),
+                    password: "mypassword".to_string(),
+                }),
+                filter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_logins_delete() {
+        let cli = Cli::try_parse_from(["silverwarden", "logins", "delete", "MyLogin"])
+            .expect("Should parse logins delete");
+        assert_eq!(
+            cli.command,
+            Commands::Logins {
+                action: Some(LoginsCommands::Delete {
+                    name: "MyLogin".to_string()
+                }),
+                filter: None,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn test_send_command_socket_not_found() {
         let non_existent = PathBuf::from("/tmp/non_existent_silverwarden_socket_12345.sock");
@@ -577,6 +902,14 @@ mod tests {
         assert_eq!(msg.payload["locked"], false);
     }
 
+    fn test_cli(socket: Option<PathBuf>, command: Commands) -> Cli {
+        Cli {
+            socket,
+            config: None,
+            command,
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_command_status_and_status_locked() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -599,10 +932,7 @@ mod tests {
             }
         });
 
-        let cli = Cli {
-            socket: Some(socket_path),
-            command: Commands::Status,
-        };
+        let cli = test_cli(Some(socket_path), Commands::Status);
 
         let output = handle_command(&cli, |_| Ok("unused".into())).await.unwrap();
         assert!(output.contains("Bloqueado:        Sí"));
@@ -626,20 +956,17 @@ mod tests {
         });
 
         // 1. With --pin flag
-        let cli_flag = Cli {
-            socket: Some(socket_path.clone()),
-            command: Commands::Unlock {
+        let cli_flag = test_cli(
+            Some(socket_path.clone()),
+            Commands::Unlock {
                 pin: Some("secret123".into()),
             },
-        };
+        );
         let out_flag = handle_command(&cli_flag, |_| unreachable!()).await.unwrap();
         assert!(out_flag.contains("Bóveda desbloqueada con éxito."));
 
         // 2. Interactive prompt
-        let cli_prompt = Cli {
-            socket: Some(socket_path),
-            command: Commands::Unlock { pin: None },
-        };
+        let cli_prompt = test_cli(Some(socket_path), Commands::Unlock { pin: None });
         let out_prompt = handle_command(&cli_prompt, |msg| {
             assert!(msg.contains("PIN"));
             Ok("prompted_secret".into())
@@ -664,10 +991,7 @@ mod tests {
             }
         });
 
-        let cli = Cli {
-            socket: Some(socket_path),
-            command: Commands::Lock,
-        };
+        let cli = test_cli(Some(socket_path), Commands::Lock);
         let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
         assert!(output.contains("Bóveda bloqueada"));
     }
@@ -698,39 +1022,39 @@ mod tests {
         });
 
         // PinSet flag
-        let cli_set = Cli {
-            socket: Some(socket_path.clone()),
-            command: Commands::Pin {
+        let cli_set = test_cli(
+            Some(socket_path.clone()),
+            Commands::Pin {
                 action: PinCommands::Set {
                     pin: Some("pin_123".into()),
                 },
             },
-        };
+        );
         let out_set = handle_command(&cli_set, |_| unreachable!()).await.unwrap();
         assert!(out_set.contains("PIN configurado exitosamente."));
 
         // PinSet interactive
-        let cli_set_interactive = Cli {
-            socket: Some(socket_path.clone()),
-            command: Commands::Pin {
+        let cli_set_interactive = test_cli(
+            Some(socket_path.clone()),
+            Commands::Pin {
                 action: PinCommands::Set { pin: None },
             },
-        };
+        );
         let out_set_interactive = handle_command(&cli_set_interactive, |_| Ok("pin_inter".into()))
             .await
             .unwrap();
         assert!(out_set_interactive.contains("PIN configurado exitosamente."));
 
         // PinUpdate flags
-        let cli_update = Cli {
-            socket: Some(socket_path.clone()),
-            command: Commands::Pin {
+        let cli_update = test_cli(
+            Some(socket_path.clone()),
+            Commands::Pin {
                 action: PinCommands::Update {
                     old_pin: Some("old".into()),
                     new_pin: Some("new".into()),
                 },
             },
-        };
+        );
         let out_update = handle_command(&cli_update, |_| unreachable!())
             .await
             .unwrap();
@@ -738,15 +1062,15 @@ mod tests {
 
         // PinUpdate interactive
         let mut prompts = vec!["new_inter", "old_inter"];
-        let cli_update_interactive = Cli {
-            socket: Some(socket_path),
-            command: Commands::Pin {
+        let cli_update_interactive = test_cli(
+            Some(socket_path),
+            Commands::Pin {
                 action: PinCommands::Update {
                     old_pin: None,
                     new_pin: None,
                 },
             },
-        };
+        );
         let out_update_interactive = handle_command(&cli_update_interactive, |_| {
             Ok(prompts.pop().unwrap().to_string())
         })
@@ -759,51 +1083,331 @@ mod tests {
     async fn test_handle_command_local_subcommands() {
         let dummy_socket = PathBuf::from("/tmp/dummy.sock");
 
-        // Sync
-        let cli_sync = Cli {
-            socket: Some(dummy_socket.clone()),
-            command: Commands::Sync,
-        };
-        assert!(handle_command(&cli_sync, |_| unreachable!())
-            .await
-            .unwrap()
-            .contains("Sincronizando"));
-
-        // Logins
-        let cli_logins = Cli {
-            socket: Some(dummy_socket.clone()),
-            command: Commands::Logins { filter: None },
-        };
-        assert!(handle_command(&cli_logins, |_| unreachable!())
-            .await
-            .unwrap()
-            .contains("Listando accesos"));
-
         // SSH List
-        let cli_ssh_list = Cli {
-            socket: Some(dummy_socket.clone()),
-            command: Commands::Ssh {
+        let cli_ssh_list = test_cli(
+            Some(dummy_socket.clone()),
+            Commands::Ssh {
                 ssh_command: SshCommands::List,
             },
-        };
+        );
         assert!(handle_command(&cli_ssh_list, |_| unreachable!())
             .await
             .unwrap()
             .contains("Listando claves SSH"));
 
         // SSH Add
-        let cli_ssh_add = Cli {
-            socket: Some(dummy_socket),
-            command: Commands::Ssh {
+        let cli_ssh_add = test_cli(
+            Some(dummy_socket),
+            Commands::Ssh {
                 ssh_command: SshCommands::Add {
                     key_id: "id_ed25519".into(),
                 },
             },
-        };
+        );
         assert!(handle_command(&cli_ssh_add, |_| unreachable!())
             .await
             .unwrap()
             .contains("Registrando clave SSH id_ed25519"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "test@example.com";
+        let password = "super_master_password";
+
+        // Prelogin endpoint returns KdfInformation
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Derive expected encKey
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        // Token endpoint
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_token_abc123",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh_token_xyz",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+        std::env::set_var("SILVERWARDEN_CONFIG_PATH", &config_file_path);
+
+        // Pre-create initial config pointing to mock server
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+            },
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            result.is_ok(),
+            "Login command should succeed: {:?}",
+            result.err()
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("Sesión iniciada con éxito"));
+
+        // Verify config on disk
+        let saved_cfg = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
+        assert!(saved_cfg.is_logged_in());
+        assert!(!saved_cfg.encrypted_token.is_empty());
+        assert!(!saved_cfg.encrypted_user_symmetric_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_without_login_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let empty_cfg = sw_config::ConfigFile::default();
+        empty_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            command: Commands::Sync,
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        match result {
+            Err(CliError::Other(msg)) => {
+                assert_eq!(
+                    msg,
+                    "No hay sesión iniciada. Ejecuta 'silverwarden login' primero."
+                );
+            }
+            other => panic!("Expected CliError::Other, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("sync_success.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                assert_eq!(req.action, "Sync");
+                let resp = IpcMessage::new(
+                    "Ok",
+                    serde_json::json!({
+                        "status": "synced",
+                        "logins": 5
+                    }),
+                );
+                sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+            }
+        });
+
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let logged_in_cfg = sw_config::ConfigFile {
+            encrypted_token: "some_encrypted_token".to_string(),
+            ..Default::default()
+        };
+        logged_in_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: Some(config_file_path),
+            command: Commands::Sync,
+        };
+
+        let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
+        assert!(output.contains("Sincronización completada (5 logins descargados)."));
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_list() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("logins_list.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                assert_eq!(req.action, "ListLogins");
+                let resp = IpcMessage::new(
+                    "Ok",
+                    serde_json::json!([
+                        { "id": "111", "name": "GitHub", "username": "octocat" },
+                        { "id": "222", "name": "Google", "username": "admin@gmail.com" }
+                    ]),
+                );
+                sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+            }
+        });
+
+        let cli = test_cli(
+            Some(socket_path),
+            Commands::Logins {
+                action: Some(LoginsCommands::List),
+                filter: None,
+            },
+        );
+
+        let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
+        assert!(output.contains("Nombre"));
+        assert!(output.contains("Usuario"));
+        assert!(output.contains("GitHub"));
+        assert!(output.contains("octocat"));
+        assert!(output.contains("Google"));
+        assert!(output.contains("admin@gmail.com"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("logins_create.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                assert_eq!(req.action, "CreateLogin");
+                assert_eq!(req.payload["name"], "AWS Console");
+                assert_eq!(req.payload["username"], "root");
+                assert_eq!(req.payload["password"], "hunter2");
+                let resp = IpcMessage::new(
+                    "Ok",
+                    serde_json::json!({
+                        "status": "created",
+                        "id": "uuid-1234",
+                        "name": "AWS Console"
+                    }),
+                );
+                sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+            }
+        });
+
+        let cli = test_cli(
+            Some(socket_path),
+            Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "AWS Console".into(),
+                    username: "root".into(),
+                    password: "hunter2".into(),
+                }),
+                filter: None,
+            },
+        );
+
+        let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
+        assert!(output.contains("Acceso 'AWS Console' creado exitosamente."));
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_get_and_delete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("logins_get_delete.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let req = sw_ipc::read_message(&mut stream).await.unwrap();
+                match req.action.as_str() {
+                    "GetLogin" => {
+                        assert_eq!(req.payload["name"], "GitHub");
+                        let resp = IpcMessage::new(
+                            "Ok",
+                            serde_json::json!({
+                                "name": "GitHub",
+                                "username": "octocat",
+                                "password": "supersecretpass",
+                                "totp": "123456"
+                            }),
+                        );
+                        sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+                    }
+                    "DeleteLogin" => {
+                        assert_eq!(req.payload["name"], "GitHub");
+                        let resp = IpcMessage::new(
+                            "Ok",
+                            serde_json::json!({
+                                "status": "deleted",
+                                "name": "GitHub"
+                            }),
+                        );
+                        sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+                    }
+                    other => panic!("Unexpected action {other}"),
+                }
+            }
+        });
+
+        // GetLogin
+        let cli_get = test_cli(
+            Some(socket_path.clone()),
+            Commands::Logins {
+                action: Some(LoginsCommands::Get {
+                    name: "GitHub".into(),
+                }),
+                filter: None,
+            },
+        );
+        let out_get = handle_command(&cli_get, |_| unreachable!()).await.unwrap();
+        assert!(out_get.contains("Contraseña: supersecretpass"));
+        assert!(out_get.contains("TOTP: 123456"));
+
+        // DeleteLogin
+        let cli_del = test_cli(
+            Some(socket_path),
+            Commands::Logins {
+                action: Some(LoginsCommands::Delete {
+                    name: "GitHub".into(),
+                }),
+                filter: None,
+            },
+        );
+        let out_del = handle_command(&cli_del, |_| unreachable!()).await.unwrap();
+        assert!(out_del.contains("Acceso 'GitHub' eliminado exitosamente."));
     }
 
     #[test]
@@ -867,12 +1471,12 @@ mod tests {
         let main_sock = temp_dir.path().join(".silverwarden.sock");
         let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
 
-        let cli = Cli {
-            socket: Some(main_sock.clone()),
-            command: Commands::Agent {
+        let cli = test_cli(
+            Some(main_sock.clone()),
+            Commands::Agent {
                 action: AgentCommands::Start { no_ssh: false },
             },
-        };
+        );
 
         let handle = tokio::spawn(async move {
             let _ = handle_command(&cli, |_| Ok(String::new())).await;
@@ -914,12 +1518,12 @@ mod tests {
         let main_sock = temp_dir.path().join(".silverwarden.sock");
         let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
 
-        let cli = Cli {
-            socket: Some(main_sock.clone()),
-            command: Commands::Agent {
+        let cli = test_cli(
+            Some(main_sock.clone()),
+            Commands::Agent {
                 action: AgentCommands::Start { no_ssh: true },
             },
-        };
+        );
 
         let handle = tokio::spawn(async move {
             let _ = handle_command(&cli, |_| Ok(String::new())).await;

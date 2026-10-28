@@ -153,6 +153,15 @@ pub struct AuthenticatedClient {
     api_url: String,
 }
 
+impl std::fmt::Debug for AuthenticatedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedClient")
+            .field("identity_url", &self.identity_url)
+            .field("api_url", &self.api_url)
+            .finish()
+    }
+}
+
 impl AuthenticatedClient {
     /// Creates a new `AuthenticatedClient` with the given endpoints and shared `LoginToken`.
     pub fn new(
