@@ -13,6 +13,7 @@ path = "src/main.rs"
 sw-ipc = { workspace = true }
 sw-config = { workspace = true }
 sw-agent = { workspace = true }
+sw-ssh-agent = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

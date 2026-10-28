@@ -357,29 +357,55 @@ pub fn default_registry() -> ActionsRegistry {
     );
 
     // Unlock: recibe { pin }, verifica contra sw-config, actualiza estado, crea sesión Pin
-    registry.register(
+    registry.register_async(
         "Unlock",
         |state: &mut AgentState, ctx: &CallingContext, payload: &serde_json::Value| {
             #[rustfmt::skip]
             let pin = match payload {
-                serde_json::Value::Object(map) => map.get("pin").and_then(|v| v.as_str()).ok_or_else(|| "Campo 'pin' requerido en payload".to_string())?,
-                serde_json::Value::String(s) => s.as_str(),
-                _ => return Err("Payload inválido para Unlock: se esperaba objeto con 'pin' o string".to_string()),
+                serde_json::Value::Object(map) => match map.get("pin").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => return Box::pin(async { Err("Campo 'pin' requerido en payload".to_string()) }),
+                },
+                serde_json::Value::String(s) => s.clone(),
+                _ => return Box::pin(async { Err("Payload inválido para Unlock: se esperaba objeto con 'pin' o string".to_string()) }),
             };
 
             if !state.has_pin {
-                return Err("No hay PIN configurado en el agente".to_string());
+                return Box::pin(async { Err("No hay PIN configurado en el agente".to_string()) });
             }
 
-            match state.config.verify_pin_with_params(pin, AGENT_KDF_MEMORY_KIB) {
+            match state.config.verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB) {
                 Ok(true) => {
                     state.is_locked = false;
                     state.sessions.create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
                     state.sessions.create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
-                    Ok(serde_json::json!({ "status": "unlocked" }))
+                    let va = state.vault_agent.clone();
+                    let enc_sym = state.config.encrypted_user_symmetric_key.clone();
+                    let key_res = sw_config::derive_config_key_with_params(&pin, &state.config.device_uuid, AGENT_KDF_MEMORY_KIB);
+                    Box::pin(async move {
+                        if let Some(agent) = va {
+                            if let Ok(key) = key_res {
+                                let sym_key = if !enc_sym.is_empty() {
+                                    if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &key) {
+                                        sw_crypto::SymmetricKey::from_bytes(dec.as_bytes())
+                                            .or_else(|_| sw_crypto::SymmetricKey::from_parts(&key, &key))
+                                    } else {
+                                        sw_crypto::SymmetricKey::from_parts(&key, &key)
+                                    }
+                                } else {
+                                    sw_crypto::SymmetricKey::from_parts(&key, &key)
+                                };
+
+                                if let Ok(sk) = sym_key {
+                                    agent.unlock(sk).await;
+                                }
+                            }
+                        }
+                        Ok(serde_json::json!({ "status": "unlocked" }))
+                    })
                 }
-                Ok(false) => Err("PIN incorrecto".to_string()),
-                Err(e) => Err(format!("Error al verificar PIN: {e}")),
+                Ok(false) => Box::pin(async { Err("PIN incorrecto".to_string()) }),
+                Err(e) => Box::pin(async move { Err(format!("Error al verificar PIN: {e}")) }),
             }
         },
     );
@@ -528,7 +554,8 @@ pub struct AgentDaemon {
 
 impl AgentDaemon {
     pub fn new() -> Self {
-        Self::with_state(AgentState::load_or_default())
+        let va = sw_ssh_agent::shared_vault_agent();
+        Self::with_vault_agent(AgentState::load_or_default(), va)
     }
 
     pub fn with_state(state: AgentState) -> Self {

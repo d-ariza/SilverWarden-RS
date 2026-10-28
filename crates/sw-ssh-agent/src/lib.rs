@@ -89,6 +89,9 @@ pub enum SshAgentError {
 
     #[error("Agent failure")]
     AgentFailure,
+
+    #[error("Error: {0}")]
+    Other(String),
 }
 
 /// Public summary of an SSH key stored in the vault.
@@ -332,6 +335,12 @@ impl std::fmt::Debug for VaultAgentServer {
             )
             .field("has_api_client", &self.api_client.is_some())
             .finish()
+    }
+}
+
+impl Default for VaultAgentServer {
+    fn default() -> Self {
+        Self::new(Arc::new(VaultStore::new()))
     }
 }
 
@@ -624,6 +633,10 @@ impl VaultAgentServer {
         name: &str,
         user_symmetric_key: &SymmetricKey,
     ) -> Result<PublicKey, SshAgentError> {
+        if self.is_locked() {
+            return Err(SshAgentError::VaultLocked);
+        }
+
         let priv_key = PrivateKey::from_openssh(private_key_pem)
             .map_err(|e| SshAgentError::KeyError(format!("Failed to parse private key: {e}")))?;
 
@@ -912,6 +925,39 @@ impl SshAgentServer {
     ) -> Result<(), SshAgentError> {
         serve_with_shutdown(&self.socket_path, self.agent.clone(), shutdown_rx).await
     }
+
+    /// Creates an SSH agent server bound to the shared singleton `VaultAgentServer`.
+    pub fn for_shared_agent(socket_path: impl Into<PathBuf>) -> Self {
+        Self::new(socket_path, (*shared_vault_agent()).clone())
+    }
+}
+
+static SHARED_VAULT_AGENT: std::sync::OnceLock<Arc<VaultAgentServer>> = std::sync::OnceLock::new();
+
+/// Returns a shared, singleton `VaultAgentServer` instance.
+pub fn shared_vault_agent() -> Arc<VaultAgentServer> {
+    SHARED_VAULT_AGENT
+        .get_or_init(|| {
+            let vault = Arc::new(VaultStore::new());
+            Arc::new(VaultAgentServer::new(vault))
+        })
+        .clone()
+}
+
+/// Returns the default SSH agent socket path `~/.silverwarden-ssh-agent.sock` for a specific home or falling back to `$HOME`.
+pub fn default_ssh_agent_socket_path_from_home(
+    home: Option<&str>,
+) -> Result<PathBuf, SshAgentError> {
+    let home = home
+        .map(String::from)
+        .or_else(|| std::env::var("HOME").ok())
+        .ok_or_else(|| SshAgentError::Other("HOME no definido".into()))?;
+    Ok(PathBuf::from(home).join(".silverwarden-ssh-agent.sock"))
+}
+
+/// Returns the default SSH agent socket path `~/.silverwarden-ssh-agent.sock` for the current user.
+pub fn default_ssh_agent_socket_path() -> Result<PathBuf, SshAgentError> {
+    default_ssh_agent_socket_path_from_home(None)
 }
 
 /// Cleans orphan socket if exists, binds `UnixListener` with permissions 0600,

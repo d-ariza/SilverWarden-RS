@@ -5696,6 +5696,7 @@ dependencies = [
  "sw-agent",
  "sw-config",
  "sw-ipc",
+ "sw-ssh-agent",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -89,7 +89,11 @@ pub enum Commands {
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum AgentCommands {
     /// Start the agent daemon in the foreground
-    Start,
+    Start {
+        /// Do not start the SSH agent server
+        #[arg(long)]
+        no_ssh: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
@@ -165,6 +169,20 @@ pub fn resolve_socket_path(custom: Option<PathBuf>) -> Result<PathBuf, CliError>
     }
 }
 
+/// Resolves the SSH agent socket path, respecting custom paths or default `~/.silverwarden-ssh-agent.sock`.
+pub fn resolve_ssh_socket_path(main_socket: &Path) -> PathBuf {
+    if let Some(parent) = main_socket.parent() {
+        let is_home = std::env::var("HOME")
+            .map(|h| PathBuf::from(h) == parent)
+            .unwrap_or(false);
+        if !is_home {
+            return parent.join(".silverwarden-ssh-agent.sock");
+        }
+    }
+    sw_ssh_agent::default_ssh_agent_socket_path()
+        .unwrap_or_else(|_| PathBuf::from(".silverwarden-ssh-agent.sock"))
+}
+
 /// Emits a warning if a running Goldwarden Go instance socket is detected.
 pub fn check_goldwarden_go_conflict() -> bool {
     if let Ok(home) = std::env::var("HOME") {
@@ -186,14 +204,58 @@ where
 
     match &cli.command {
         Commands::Agent { action } => match action {
-            AgentCommands::Start => {
+            AgentCommands::Start { no_ssh } => {
                 println!(
                     "Iniciando el agente SilverWarden en {}...",
                     socket_path.display()
                 );
-                sw_agent::run_agent(&socket_path)
-                    .await
-                    .map_err(|e| CliError::Other(e.to_string()))?;
+                let ssh_socket_path = resolve_ssh_socket_path(&socket_path);
+
+                let agent_sock = socket_path.clone();
+                let agent_handle =
+                    tokio::spawn(async move { sw_agent::run_agent(&agent_sock).await });
+
+                let ssh_handle = if !*no_ssh {
+                    println!(
+                        "Iniciando el servidor SSH agent en {}...",
+                        ssh_socket_path.display()
+                    );
+                    let ssh_sock = ssh_socket_path.clone();
+                    let ssh_server = sw_ssh_agent::SshAgentServer::for_shared_agent(&ssh_sock);
+                    Some(tokio::spawn(async move { ssh_server.serve().await }))
+                } else {
+                    None
+                };
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("Señal de parada recibida (Ctrl+C). Deteniendo servicios...");
+                    }
+                    res = agent_handle => {
+                        if let Ok(Err(e)) = res {
+                            eprintln!("Error en el daemon principal: {e}");
+                        }
+                    }
+                    res = async {
+                        if let Some(h) = ssh_handle {
+                            h.await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if let Ok(Err(e)) = res {
+                            eprintln!("Error en el servidor SSH agent: {e}");
+                        }
+                    }
+                }
+
+                if socket_path.exists() {
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+                if !*no_ssh && ssh_socket_path.exists() {
+                    let _ = std::fs::remove_file(&ssh_socket_path);
+                }
+
                 Ok(format!("Agente finalizado en {}", socket_path.display()))
             }
         },
@@ -338,7 +400,19 @@ mod tests {
         assert_eq!(
             cli.command,
             Commands::Agent {
-                action: AgentCommands::Start
+                action: AgentCommands::Start { no_ssh: false },
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_agent_start_no_ssh() {
+        let cli = Cli::try_parse_from(["silverwarden", "agent", "start", "--no-ssh"])
+            .expect("Should parse agent start --no-ssh");
+        assert_eq!(
+            cli.command,
+            Commands::Agent {
+                action: AgentCommands::Start { no_ssh: true },
             }
         );
     }
@@ -785,5 +859,89 @@ mod tests {
         assert!(CliError::Other("other err".into())
             .to_string()
             .contains("Error: other err"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_start_launches_both_sockets() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+        let main_sock = temp_dir.path().join(".silverwarden.sock");
+        let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
+
+        let cli = Cli {
+            socket: Some(main_sock.clone()),
+            command: Commands::Agent {
+                action: AgentCommands::Start { no_ssh: false },
+            },
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = handle_command(&cli, |_| Ok(String::new())).await;
+        });
+
+        // Wait up to 5 seconds for both sockets to appear
+        let mut both_exist = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if main_sock.exists() && ssh_sock.exists() {
+                both_exist = true;
+                break;
+            }
+        }
+        assert!(both_exist, "Both sockets should exist after agent start");
+
+        // Verify ssh-add -L against the SSH agent socket responds with "no identities" (exit code 1)
+        let output = tokio::process::Command::new("ssh-add")
+            .arg("-L")
+            .env("SSH_AUTH_SOCK", &ssh_sock)
+            .output()
+            .await
+            .expect("Failed to execute ssh-add");
+
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stderr.contains("The agent has no identities.")
+                || stdout.contains("The agent has no identities.")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_agent_start_no_ssh() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+        let main_sock = temp_dir.path().join(".silverwarden.sock");
+        let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
+
+        let cli = Cli {
+            socket: Some(main_sock.clone()),
+            command: Commands::Agent {
+                action: AgentCommands::Start { no_ssh: true },
+            },
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = handle_command(&cli, |_| Ok(String::new())).await;
+        });
+
+        // Wait up to 2 seconds for main socket to appear
+        let mut main_exists = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if main_sock.exists() {
+                main_exists = true;
+                break;
+            }
+        }
+        assert!(main_exists, "Main socket should exist");
+        // SSH socket should NOT exist
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !ssh_sock.exists(),
+            "SSH socket should NOT exist with --no-ssh"
+        );
+
+        handle.abort();
     }
 }
