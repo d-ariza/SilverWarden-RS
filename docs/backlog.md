@@ -737,7 +737,7 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Cierre:** suite de interop completada y aprobada; evidencia registrada.
 
-**Depende de:** SW-040, SW-041, SW-042, SW-043, SW-044, SW-045 · **Estado:** Pendiente
+**Depende de:** SW-040, SW-041, SW-042, SW-043, SW-044, SW-045 · **Estado:** Completado (2026-10-27)
 
 ---
 
@@ -746,11 +746,103 @@ Una historia pasa a `Hecho` solo cuando:
 Estos milestones **no** forman parte del cierre del MVP. Se listan para no perderlos.
 
 ### M6 — Seguridad de sesión y sistema (P1)
-- [SW-050] PIN + pincache en agente
-- [SW-051] Biometría polkit (trait `Biometrics`)
-- [SW-052] Lock por inactividad
-- [SW-053] Notificaciones (portal libportal)
-- [SW-054] Setup systemd + verificación polkit
+
+---
+
+### [SW-050] PIN + pincache en agente
+
+**Historia:** Como usuario, quiero que el agente recuerde mi PIN en memoria durante una ventana de tiempo configurable para no tener que ingresarlo repetidamente en cada acción.
+
+**Implementación / Tests:**
+- Módulo `PinCache` en `sw-agent` con expiración automática (TTL por defecto: 300 segundos).
+- Almacenamiento seguro en memoria con `zeroize` al expirar o resetear.
+- Integración en las acciones IPC del agente (`Unlock`, `PinSet`, `PinUpdate`).
+- Purgado inmediato del PIN al invocar `Lock`.
+
+**Criterios de aceptación:**
+- Operaciones subsiguientes no solicitan PIN si el TTL sigue activo.
+- Al expirar el TTL, se exige el PIN nuevamente.
+- `Lock` limpia la clave en caché inmediatamente.
+- Cobertura de tests unitarios ≥85%.
+
+**Depende de:** M5 cerrado · **Estado:** Pendiente
+
+---
+
+### [SW-051] Biometría polkit (trait `Biometrics`)
+
+**Historia:** Como usuario en Linux, quiero poder desbloquear el vault o autorizar firmas usando biometría/huella digital vía Polkit para mayor comodidad.
+
+**Implementación / Tests:**
+- Definir trait `Biometrics` con método `authenticate(&self, reason: &str) -> Result<bool, BiometricsError>`.
+- Implementación Polkit para Linux sobre D-Bus / `sw-systemauth`.
+- Stubs de plataforma para macOS y Windows.
+- Fallback automático a diálogo de PIN si la autenticación biométrica falla o no está disponible.
+
+**Criterios de aceptación:**
+- Autenticación Polkit exitosa desbloquea el vault.
+- Si el usuario cancela o no hay lector, fallback elegante a PIN.
+- Tests con mock del servicio Polkit.
+- Cobertura ≥85%.
+
+**Depende de:** SW-050 · **Estado:** Pendiente
+
+---
+
+### [SW-052] Lock por inactividad
+
+**Historia:** Como usuario, quiero que el vault se bloquee automáticamente si dejo mi equipo desatendido o si entra en suspensión para proteger mis secretos.
+
+**Implementación / Tests:**
+- Módulo `MonitorIdle` en el daemon que escucha señales D-Bus de `systemd-logind` (`PrepareForSleep`, `Lock`).
+- Temporizador de inactividad que monitorea el tiempo transcurrido desde la última petición IPC.
+- Disparo de bloqueo inmediato: purga de claves en memoria, reseteo de `SessionStore` y de `PinCache`.
+
+**Criterios de aceptación:**
+- El vault se bloquea automáticamente al suspender o bloquear la sesión de usuario.
+- El vault se bloquea tras $N$ minutos de inactividad configurables.
+- Tests unitarios con simulación de señales D-Bus.
+- Cobertura ≥85%.
+
+**Depende de:** SW-050 · **Estado:** Pendiente
+
+---
+
+### [SW-053] Notificaciones (portal / D-Bus)
+
+**Historia:** Como usuario, quiero recibir notificaciones de escritorio cuando se firmen solicitudes SSH o se bloquee el vault para estar al tanto de la actividad de seguridad.
+
+**Implementación / Tests:**
+- Implementar trait `Notifier` en el crate `sw-notify`.
+- Backend XDG Desktop Portal (`org.freedesktop.portal.Notification`) y fallback a D-Bus Notifications (`org.freedesktop.Notifications`).
+- Stubs para macOS y Windows.
+- Disparo de notificación en operaciones de firma SSH exitosas y eventos de bloqueo del vault.
+
+**Criterios de aceptación:**
+- Notificación visible en el entorno de escritorio tras firma exitosa.
+- Degradación elegante si no hay servicio de notificaciones activo (sin romper operaciones).
+- Tests unitarios con mock del bus de notificaciones.
+- Cobertura ≥85%.
+
+**Depende de:** SW-040, SW-052 · **Estado:** Pendiente
+
+---
+
+### [SW-054] Setup systemd + verificación polkit
+
+**Historia:** Como usuario, quiero que el agente arranque automáticamente como servicio de usuario de systemd para que esté siempre disponible sin intervención manual.
+
+**Implementación / Tests:**
+- Archivo de servicio `silverwarden.service` para `systemd --user`.
+- Comando CLI `silverwarden setup-systemd` para generar, instalar y habilitar la unidad.
+- Validación de permisos del socket Unix y verificación de reglas Polkit sin requerir root.
+
+**Criterios de aceptación:**
+- Archivo `silverwarden.service` válido según `systemd-analyze verify`.
+- Instalación y arranque exitoso en el entorno de usuario.
+- Cobertura de tests del comando de setup CLI y generación de archivos.
+
+**Depende de:** SW-050, SW-051 · **Estado:** Pendiente
 
 ### M7 — GUI Tauri (P1)
 - [SW-060] Scaffold Tauri v2 + Svelte 5 + TS

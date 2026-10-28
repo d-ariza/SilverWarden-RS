@@ -209,3 +209,74 @@ Nota sobre sockets:
 - [x] Estrategia de entrega/migración aceptada.
 - [x] Backlog priorizado aceptado.
 - [x] Arquitectura GUI (Opción A: cliente IPC del agente) aprobada.
+
+---
+
+## 9. Plan de M6 — Seguridad de sesión y sistema
+
+### 9.1 Objetivo del Milestone
+Completar e integrar las capacidades de seguridad de sesión en el agente daemon (`sw-agent`), incluyendo cacheo seguro de PIN en memoria, desbloqueo biométrico con Polkit en Linux, monitor de bloqueo automático por inactividad o suspensión del sistema, emisión de notificaciones de escritorio para acciones críticas, y servicio `systemd` para ejecución en segundo plano al login del usuario.
+
+### 9.2 Dependencias
+- **M5 cerrado:** Servidor SSH Agent, protocolos de aprobación y gestión de identidades verificados y aprobados con cobertura ≥85% en `sw-ssh-agent` y `sw-agent`.
+
+### 9.3 Decisiones Técnicas (D-M6-*)
+
+- **D-M6-1: Pincache en memoria.**
+  El PIN se almacena temporalmente en memoria protegida por un TTL configurable (por defecto 5 minutos). Durante la ventana activa de TTL, las solicitudes que requieren PIN pueden autenticarse automáticamente. Al expirar el temporizador o al bloquearse el vault manualmente, el PIN se purga inmediatamente de memoria (`zeroize`).
+
+- **D-M6-2: Biometría abstracta (`Biometrics`).**
+  Definición de un trait `Biometrics` desacoplado de la plataforma:
+  - Linux: Implementación mediante Polkit (`sw-systemauth` / D-Bus `org.freedesktop.PolicyKit1`).
+  - macOS: TouchID (stubs/post-MVP).
+  - Windows: Windows Hello (stubs/post-MVP).
+  Si el sistema carece de biometría o el usuario cancela, se produce un fallback elegante a PIN.
+
+- **D-M6-3: Lock por inactividad y suspensión (`MonitorIdle`).**
+  Supervisión de inactividad de sesión mediante D-Bus (`org.freedesktop.login1`). Si el usuario bloquea la pantalla, el sistema entra en suspensión (`PrepareForSleep`), o transcurre un período de inactividad de $N$ minutos configurable, el daemon bloquea el vault y purga las sesiones activas en `SessionStore`.
+
+- **D-M6-4: Notificaciones de escritorio (`Notifier`).**
+  Trait `Notifier` en el crate `sw-notify` con soporte dual para Linux:
+  1. XDG Desktop Portal (`org.freedesktop.portal.Notification`) para compatibilidad sandbox/Flatpak.
+  2. D-Bus Notifications estándar (`org.freedesktop.Notifications`).
+  Stubs para macOS/Windows. Notifica operaciones de firma SSH exitosas y eventos de bloqueo del vault.
+
+- **D-M6-5: Integración Systemd de usuario.**
+  Unidad de usuario `silverwarden.service` para `systemd --user` que levanta el agente daemon automáticamente tras el inicio de sesión gráfico. Integración sin requerir permisos root ni alterar el directorio global del sistema.
+
+### 9.4 Historias de Usuario y Criterios de Cierre
+
+#### [SW-050] PIN + Pincache en Agente
+- **Alcance:** Implementación de estructura `PinCache` con TTL configurable (default 300s) dentro de `AgentState`. Métodos para almacenar PIN, verificar validez, reiniciar TTL en uso y limpieza segura con `zeroize`.
+- **Criterios de cierre:**
+  - Caché de PIN con expiración automática validada por tests de tiempo.
+  - Limpieza forzada inmediata al invocar `Lock`.
+  - Cobertura ≥85% en las nuevas rutas de código.
+
+#### [SW-051] Biometría Polkit (Trait `Biometrics`)
+- **Alcance:** Definición del trait `Biometrics` y su implementación Polkit para Linux en `sw-systemauth`/`sw-agent`. Manejo de diálogos de autenticación del sistema y fallback a PIN.
+- **Criterios de cierre:**
+  - Trait `Biometrics` con método `authenticate(&self, reason: &str) -> Result<bool, BiometricsError>`.
+  - Implementación Polkit funcional en Linux con mocks para tests unitarios.
+  - Fallback a solicitud de PIN estándar si no hay lector o el usuario declina.
+
+#### [SW-052] Lock por Inactividad
+- **Alcance:** Módulo `MonitorIdle` en el daemon que escucha señales D-Bus de `systemd-logind` (`PrepareForSleep`, `Lock`) y temporizador de inactividad sin actividad IPC.
+- **Criterios de cierre:**
+  - Bloqueo automático del vault al recibir señal de suspensión o bloqueo de pantalla.
+  - Bloqueo tras $N$ minutos de inactividad configurables.
+  - Tests unitarios con bus D-Bus mockeado.
+
+#### [SW-053] Notificaciones (Portal / D-Bus)
+- **Alcance:** Implementación real en `sw-notify` utilizando XDG Desktop Portal y D-Bus Notifications.
+- **Criterios de cierre:**
+  - Envío de notificaciones al firmar con clave SSH o al bloquearse el vault.
+  - Fallback silencioso sin fallar la operación principal si el daemon de notificaciones no está disponible.
+  - Pruebas unitarias completas con mock del backend de notificaciones.
+
+#### [SW-054] Setup Systemd + Verificación Polkit
+- **Alcance:** Generación e instalación de la unidad `silverwarden.service` (`systemd --user`) y validación de reglas Polkit asociadas.
+- **Criterios de cierre:**
+  - Archivo `silverwarden.service` generado y validado con `systemd-analyze verify`.
+  - Comando CLI `silverwarden setup-systemd` (o equivalente) para habilitar el servicio.
+  - Documentación de instalación y verificación en Linux.
