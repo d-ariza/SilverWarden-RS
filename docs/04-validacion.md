@@ -223,3 +223,51 @@ M4 (Vault + API Bitwarden) cumple todos los criterios de cierre:
 
 **Siguiente milestone:** M5 — SSH Agent.
 
+---
+
+## 9. Validación de M5 — Agente SSH
+
+### 9.1 Identificación
+- **Fecha:** 2026-10-27
+- **Commit:** `a612b7c`
+- **Rama:** `develop`
+- **Alcance:** SW-040 a SW-046 (Cierre de Milestone 5 — SSH Agent).
+
+### 9.2 Matriz de Controles
+
+| Control | Herramienta | Resultado | Estado |
+|---|---|---|---|
+| Compilación limpia | `cargo build --workspace --exclude sw-gui` | 0 errores (dev profile) | ✅ Aprobado |
+| Tests unitarios/integración | `cargo test --workspace --exclude sw-gui` | 196 pasados, 0 fallos, 0 filtrados | ✅ Aprobado |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings | ✅ Aprobado |
+| Formato de código | `cargo fmt --all -- --check` | 0 diffs de formato | ✅ Aprobado |
+| Auditoría de dependencias | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) | ✅ Aprobado |
+| Cobertura M5 | `cargo llvm-cov` | `sw-ssh-agent`: 94.51% / `sw-agent`: 98.93% | ✅ Aprobado |
+
+### 9.3 Cobertura por crate (M5 y crates relacionados)
+
+| Crate | Líneas | Regiones | Funciones | Estado (Umbral ≥85%) |
+|---|---|---|---|---|
+| `sw-ssh-agent` | 94.51% | 94.79% | 85.00% | ✅ Aprobado |
+| `sw-agent` | 98.93% | 98.44% | 94.94% | ✅ Aprobado |
+| `sw-vault` | 96.85% | 96.48% | 94.81% | ✅ Aprobado |
+| `sw-config` | 97.52% | 96.31% | 89.39% | ✅ Aprobado |
+| **Total evaluado** | **96.45%** | **96.14%** | **90.33%** | ✅ **Aprobado** |
+
+### 9.4 Resumen de historias completadas (M5)
+
+| Historia | Título | Estado | Detalle |
+|---|---|---|---|
+| **SW-040** | Servidor SSH agent en socket Unix | ✅ | Servidor compatible con protocolo SSH agent sobre `russh`, soporte de framing y ciclo de vida de conexión. |
+| **SW-041** | `List`: exportar claves del vault como identidades SSH | ✅ | Extrae y lista claves públicas Ed25519, RSA y ECDSA del vault hacia clientes OpenSSH (`ssh-add -L`). |
+| **SW-042** | `Sign`: firmar con claves Ed25519 y RSA del vault | ✅ | Firma criptográfica con Ed25519, RSA (`rsa-sha2-256`, `rsa-sha2-512`, `ssh-rsa`) y ECDSA (NIST P-256). |
+| **SW-043** | Aprobación con pinentry y sesión | ✅ | Integración con `pinentry` y caché de sesión (60 min) en `sw-systemauth`; bypass aislado en `#[cfg(test)]`. |
+| **SW-044** | `Add` y `Remove` en protocolo SSH | ✅ | Implementación completa de `ADD_IDENTITY`, `ADD_ID_CONSTRAINED` (lifetime), `REMOVE_IDENTITY` y `REMOVE_ALL_IDENTITIES`. |
+| **SW-045** | Acciones IPC para gestión SSH | ✅ | Acciones IPC para UI/CLI: `ListSSHKeys`, `ImportSSHKey`, `NewSSHKey` y `DeleteSSHKey`. |
+| **SW-046** | Interoperabilidad y regresión | ✅ | Validación e2e con OpenSSH real (`ssh-keygen -Y`, `git commit -S`), casos límite documentados en `docs/interop-ssh-agent.md`. |
+
+### 9.5 Conclusión
+**Estado: ✅ M5 APROBADO.**
+Todos los controles de calidad satisfacen los criterios de aceptación y cobertura fijados para el cierre del Milestone 5.
+
+
