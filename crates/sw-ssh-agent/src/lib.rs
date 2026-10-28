@@ -32,6 +32,7 @@ pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 pub const SSHSIG_GIT_MAGIC: &[u8] = b"SSHSIG\x00\x00\x00\x03git";
 
+#[cfg(any(test, debug_assertions))]
 const TEST_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
 NhAAAAAwEAAQAAAQEA6HNXGgWxM+VCFHvJptz8GHPlOrgN8uybPY6o4u4IaC0PUKL/oUSC\n\
