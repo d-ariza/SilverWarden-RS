@@ -544,13 +544,22 @@ async fn handle_set_session(
             if let Some(api) = payload.get("api_url").and_then(|v| v.as_str()) {
                 state.config.api_url = api.to_string();
             }
+            if let Some(insecure) = payload
+                .get("danger_accept_invalid_certs")
+                .and_then(|v| v.as_bool())
+            {
+                state.config.danger_accept_invalid_certs = insecure;
+            }
             let identity_url = state.config.identity_url.clone();
             let api_url = state.config.api_url.clone();
-            let client = Arc::new(sw_bitwarden_api::AuthenticatedClient::from_token(
-                identity_url,
-                api_url,
-                token.clone(),
-            ));
+            let client = Arc::new(
+                sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                    identity_url,
+                    api_url,
+                    token.clone(),
+                    state.config.danger_accept_invalid_certs,
+                ),
+            );
             state.api_client = Some(client);
         }
     }

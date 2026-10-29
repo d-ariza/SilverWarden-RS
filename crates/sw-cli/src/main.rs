@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Accept invalid/self-signed SSL/TLS certificates (insecure)
+    #[arg(long, global = true, alias = "danger-accept-invalid-certs")]
+    pub insecure: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -459,10 +463,16 @@ where
                 config.set_server(srv);
             }
 
-            let client = sw_bitwarden_api::AuthenticatedClient::from_token(
+            let insecure = cli.insecure || config.danger_accept_invalid_certs;
+            if cli.insecure {
+                config.danger_accept_invalid_certs = true;
+            }
+
+            let client = sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
                 &config.identity_url,
                 &config.api_url,
                 Default::default(),
+                insecure,
             );
             let (token, user_symmetric_key) = client
                 .login(&email_val, &password_val, &config.device_uuid)
@@ -505,6 +515,7 @@ where
                         "user_symmetric_key": b64_sym_key,
                         "identity_url": config.identity_url,
                         "api_url": config.api_url,
+                        "danger_accept_invalid_certs": config.danger_accept_invalid_certs,
                     }),
                 )
                 .await;
@@ -655,11 +666,17 @@ where
             match action {
                 ConfigCommands::Get => {
                     let status_login = if config.is_logged_in() { "Sí" } else { "No" };
+                    let status_insecure = if config.danger_accept_invalid_certs {
+                        "Sí"
+                    } else {
+                        "No"
+                    };
                     Ok(format!(
-                        "Configuración actual:\n  Identity URL:      {}\n  API URL:           {}\n  Notifications URL: {}\n  Sesión iniciada:   {}",
+                        "Configuración actual:\n  Identity URL:      {}\n  API URL:           {}\n  Notifications URL: {}\n  Aceptar certs inv: {}\n  Sesión iniciada:   {}",
                         config.identity_url,
                         config.api_url,
                         config.notifications_url,
+                        status_insecure,
                         status_login
                     ))
                 }
@@ -670,6 +687,9 @@ where
                         ));
                     }
                     config.set_server(url);
+                    if cli.insecure {
+                        config.danger_accept_invalid_certs = true;
+                    }
                     config
                         .save_to_file(&config_path)
                         .map_err(|e| CliError::Io(e.to_string()))?;
@@ -1141,6 +1161,7 @@ mod tests {
         Cli {
             socket,
             config: None,
+            insecure: false,
             command,
         }
     }
@@ -1412,6 +1433,7 @@ mod tests {
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path.clone()),
+            insecure: false,
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
@@ -1446,6 +1468,7 @@ mod tests {
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path),
+            insecure: false,
             command: Commands::Sync,
         };
 
@@ -1493,6 +1516,7 @@ mod tests {
         let cli = Cli {
             socket: Some(socket_path),
             config: Some(config_file_path),
+            insecure: false,
             command: Commands::Sync,
         };
 
@@ -1823,6 +1847,7 @@ mod tests {
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path),
+            insecure: false,
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
@@ -1878,6 +1903,7 @@ mod tests {
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path),
+            insecure: false,
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
@@ -1995,6 +2021,7 @@ mod tests {
         let cli_get = Cli {
             socket: None,
             config: Some(config_path.clone()),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::Get,
             },
@@ -2007,6 +2034,7 @@ mod tests {
         let cli_set_server = Cli {
             socket: None,
             config: Some(config_path.clone()),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::SetServer {
                     url: "http://localhost:8080".to_string(),
@@ -2030,6 +2058,7 @@ mod tests {
         let cli_set_id = Cli {
             socket: None,
             config: Some(config_path.clone()),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::SetIdentity {
                     url: "https://id.custom.com".to_string(),
@@ -2043,6 +2072,7 @@ mod tests {
         let cli_set_api = Cli {
             socket: None,
             config: Some(config_path.clone()),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::SetApi {
                     url: "https://api.custom.com".to_string(),
@@ -2056,6 +2086,7 @@ mod tests {
         let cli_set_notif = Cli {
             socket: None,
             config: Some(config_path.clone()),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::SetNotifications {
                     url: "https://notif.custom.com".to_string(),
@@ -2076,6 +2107,7 @@ mod tests {
         let cli_empty_srv = Cli {
             socket: None,
             config: Some(config_path),
+            insecure: false,
             command: Commands::Config {
                 action: ConfigCommands::SetServer {
                     url: "   ".to_string(),
@@ -2145,6 +2177,7 @@ mod tests {
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path.clone()),
+            insecure: false,
             command: Commands::Login {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
@@ -2168,5 +2201,103 @@ mod tests {
             format!("{base_url}/notifications")
         );
         assert!(saved_config.is_logged_in());
+    }
+
+    #[test]
+    fn test_cli_parse_insecure_flags() {
+        let cli1 = Cli::try_parse_from(["silverwarden", "--insecure", "status"])
+            .expect("Should parse --insecure before subcommand");
+        assert!(cli1.insecure);
+        assert_eq!(cli1.command, Commands::Status);
+
+        let cli2 = Cli::try_parse_from(["silverwarden", "status", "--insecure"])
+            .expect("Should parse --insecure after subcommand");
+        assert!(cli2.insecure);
+
+        let cli3 = Cli::try_parse_from(["silverwarden", "login", "--danger-accept-invalid-certs"])
+            .expect("Should parse alias --danger-accept-invalid-certs");
+        assert!(cli3.insecure);
+
+        let cli_default = Cli::try_parse_from(["silverwarden", "status"])
+            .expect("Should parse status without insecure");
+        assert!(!cli_default.insecure);
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_with_insecure_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "insecure_user@example.com";
+        let password = "super_insecure_password";
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [99u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_insecure_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_insecure_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
+            danger_accept_invalid_certs: false,
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: true,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+            },
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        assert!(result.is_ok(), "Login with --insecure should succeed");
+
+        let saved = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
+        assert!(saved.danger_accept_invalid_certs);
     }
 }

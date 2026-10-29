@@ -169,13 +169,32 @@ impl std::fmt::Debug for AuthenticatedClient {
 }
 
 impl AuthenticatedClient {
+    /// Builds a `reqwest::Client` with optional acceptance of invalid / self-signed TLS certificates.
+    pub fn build_http_client(danger_accept_invalid_certs: bool) -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(danger_accept_invalid_certs)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
     /// Creates a new `AuthenticatedClient` with the given endpoints and shared `LoginToken`.
     pub fn new(
         identity_url: impl Into<String>,
         api_url: impl Into<String>,
         token: Arc<Mutex<LoginToken>>,
     ) -> Self {
-        Self::with_client(reqwest::Client::new(), identity_url, api_url, token)
+        Self::new_with_options(identity_url, api_url, token, false)
+    }
+
+    /// Creates a new `AuthenticatedClient` with options (e.g. accepting self-signed / invalid certs).
+    pub fn new_with_options(
+        identity_url: impl Into<String>,
+        api_url: impl Into<String>,
+        token: Arc<Mutex<LoginToken>>,
+        danger_accept_invalid_certs: bool,
+    ) -> Self {
+        let client = Self::build_http_client(danger_accept_invalid_certs);
+        Self::with_client(client, identity_url, api_url, token)
     }
 
     /// Creates a new `AuthenticatedClient` from a concrete `LoginToken` value.
@@ -184,7 +203,22 @@ impl AuthenticatedClient {
         api_url: impl Into<String>,
         token: LoginToken,
     ) -> Self {
-        Self::new(identity_url, api_url, Arc::new(Mutex::new(token)))
+        Self::from_token_with_options(identity_url, api_url, token, false)
+    }
+
+    /// Creates a new `AuthenticatedClient` from a concrete `LoginToken` value with options.
+    pub fn from_token_with_options(
+        identity_url: impl Into<String>,
+        api_url: impl Into<String>,
+        token: LoginToken,
+        danger_accept_invalid_certs: bool,
+    ) -> Self {
+        Self::new_with_options(
+            identity_url,
+            api_url,
+            Arc::new(Mutex::new(token)),
+            danger_accept_invalid_certs,
+        )
     }
 
     /// Creates an `AuthenticatedClient` with a custom `reqwest::Client`.
@@ -2230,5 +2264,74 @@ mod tests {
         assert_eq!(updated.id, Some(test_id));
 
         delete_cipher(&client, &test_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_danger_accept_invalid_certs() {
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert_bytes = include_bytes!("../tests/fixtures/test_cert.der");
+        let key_bytes = include_bytes!("../tests/fixtures/test_key.der");
+
+        let cert_der = CertificateDer::from(cert_bytes.as_slice());
+        let key_der = PrivateKeyDer::try_from(key_bytes.as_slice()).unwrap();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls_stream) = acceptor.accept(stream).await {
+                        let mut buf = [0u8; 1024];
+                        let _ = tls_stream.read(&mut buf).await;
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                        let _ = tls_stream.write_all(response).await;
+                        let _ = tls_stream.flush().await;
+                    }
+                });
+            }
+        });
+
+        let target_url = format!("https://localhost:{port}/api/accounts/prelogin");
+
+        // 1. Without flag (danger_accept_invalid_certs = false): Must reject invalid certificate
+        let client_secure = AuthenticatedClient::from_token_with_options(
+            &target_url,
+            &target_url,
+            LoginToken::default(),
+            false,
+        );
+        let secure_res = client_secure.http_client().get(&target_url).send().await;
+        assert!(
+            secure_res.is_err(),
+            "Default client should reject self-signed/invalid certificate"
+        );
+
+        // 2. With flag (danger_accept_invalid_certs = true): Must accept certificate
+        let client_insecure = AuthenticatedClient::from_token_with_options(
+            &target_url,
+            &target_url,
+            LoginToken::default(),
+            true,
+        );
+        let insecure_res = client_insecure.http_client().get(&target_url).send().await;
+        assert!(
+            insecure_res.is_ok(),
+            "Client with danger_accept_invalid_certs=true should accept self-signed certificate: {:?}",
+            insecure_res.err()
+        );
+        let resp = insecure_res.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
     }
 }

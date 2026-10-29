@@ -180,6 +180,12 @@ pub struct ConfigFile {
     pub encrypted_user_symmetric_key: String,
     pub encrypted_master_password_hash: String,
     pub encrypted_master_key: String,
+    #[serde(
+        rename = "DangerAcceptInvalidCerts",
+        alias = "danger_accept_invalid_certs",
+        default
+    )]
+    pub danger_accept_invalid_certs: bool,
 }
 
 impl Default for ConfigFile {
@@ -197,6 +203,7 @@ impl Default for ConfigFile {
             encrypted_user_symmetric_key: String::new(),
             encrypted_master_password_hash: String::new(),
             encrypted_master_key: String::new(),
+            danger_accept_invalid_certs: false,
         }
     }
 }
