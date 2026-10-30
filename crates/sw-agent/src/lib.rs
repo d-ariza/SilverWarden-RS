@@ -273,11 +273,79 @@ async fn handle_delete_ssh_key(
     }))
 }
 
-async fn handle_sync(state: &mut AgentState) -> Result<serde_json::Value, String> {
+async fn handle_sync(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     if state.is_locked {
         return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
     }
-    if !state.config.is_logged_in() {
+
+    // 1. Sync config fields from payload if provided
+    if let Some(map) = payload.as_object() {
+        if let Some(enc_tok) = map.get("encrypted_token").and_then(|v| v.as_str()) {
+            if !enc_tok.is_empty() {
+                state.config.encrypted_token = enc_tok.to_string();
+            }
+        }
+        if let Some(enc_sym) = map
+            .get("encrypted_user_symmetric_key")
+            .and_then(|v| v.as_str())
+        {
+            if !enc_sym.is_empty() {
+                state.config.encrypted_user_symmetric_key = enc_sym.to_string();
+            }
+        }
+        if let Some(id_url) = map.get("identity_url").and_then(|v| v.as_str()) {
+            state.config.identity_url = id_url.to_string();
+        }
+        if let Some(api_url) = map.get("api_url").and_then(|v| v.as_str()) {
+            state.config.api_url = api_url.to_string();
+        }
+        if let Some(insecure) = map
+            .get("danger_accept_invalid_certs")
+            .and_then(|v| v.as_bool())
+        {
+            state.config.danger_accept_invalid_certs = insecure;
+        }
+        if let Some(token_val) = map.get("token") {
+            if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
+                let client = Arc::new(
+                    sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                        state.config.identity_url.clone(),
+                        state.config.api_url.clone(),
+                        token,
+                        state.config.danger_accept_invalid_certs,
+                    ),
+                );
+                state.api_client = Some(client);
+            }
+        }
+    }
+
+    // 2. If still not logged in according to state.config and api_client is missing, check disk config
+    if !state.config.is_logged_in() && state.api_client.is_none() {
+        if let Some(path) = state.config_path() {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(disk_cfg) = serde_json::from_str::<sw_config::ConfigFile>(&content) {
+                        if disk_cfg.is_logged_in() {
+                            state.config.encrypted_token = disk_cfg.encrypted_token;
+                            state.config.encrypted_user_symmetric_key =
+                                disk_cfg.encrypted_user_symmetric_key;
+                            state.config.identity_url = disk_cfg.identity_url;
+                            state.config.api_url = disk_cfg.api_url;
+                            state.config.notifications_url = disk_cfg.notifications_url;
+                            state.config.danger_accept_invalid_certs =
+                                disk_cfg.danger_accept_invalid_certs;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !state.config.is_logged_in() && state.api_client.is_none() {
         return Err("No hay sesión iniciada. Ejecuta 'silverwarden login' primero.".to_string());
     }
 
@@ -536,20 +604,38 @@ async fn handle_set_session(
     state: &mut AgentState,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if let Some(ident) = payload.get("identity_url").and_then(|v| v.as_str()) {
+        state.config.identity_url = ident.to_string();
+    }
+    if let Some(api) = payload.get("api_url").and_then(|v| v.as_str()) {
+        state.config.api_url = api.to_string();
+    }
+    if let Some(notif) = payload.get("notifications_url").and_then(|v| v.as_str()) {
+        state.config.notifications_url = notif.to_string();
+    }
+    if let Some(insecure) = payload
+        .get("danger_accept_invalid_certs")
+        .and_then(|v| v.as_bool())
+    {
+        state.config.danger_accept_invalid_certs = insecure;
+    }
+
+    if let Some(enc_tok) = payload.get("encrypted_token").and_then(|v| v.as_str()) {
+        if !enc_tok.is_empty() {
+            state.config.encrypted_token = enc_tok.to_string();
+        }
+    }
+    if let Some(enc_sym) = payload
+        .get("encrypted_user_symmetric_key")
+        .and_then(|v| v.as_str())
+    {
+        if !enc_sym.is_empty() {
+            state.config.encrypted_user_symmetric_key = enc_sym.to_string();
+        }
+    }
+
     if let Some(token_val) = payload.get("token") {
         if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
-            if let Some(ident) = payload.get("identity_url").and_then(|v| v.as_str()) {
-                state.config.identity_url = ident.to_string();
-            }
-            if let Some(api) = payload.get("api_url").and_then(|v| v.as_str()) {
-                state.config.api_url = api.to_string();
-            }
-            if let Some(insecure) = payload
-                .get("danger_accept_invalid_certs")
-                .and_then(|v| v.as_bool())
-            {
-                state.config.danger_accept_invalid_certs = insecure;
-            }
             let identity_url = state.config.identity_url.clone();
             let api_url = state.config.api_url.clone();
             let client = Arc::new(
@@ -573,6 +659,10 @@ async fn handle_set_session(
                 }
             }
         }
+    }
+
+    if let Some(path) = state.config_path() {
+        let _ = save_config_file(&state.config, &path);
     }
 
     Ok(serde_json::json!({ "status": "session_saved" }))
@@ -659,7 +749,7 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register(
         "Status",
         |state: &mut AgentState, _ctx: &CallingContext, _payload: &serde_json::Value| {
-            let logged_in = !state.config.encrypted_token.is_empty();
+            let logged_in = state.config.is_logged_in() || state.api_client.is_some();
             Ok(serde_json::json!({
                 "locked": state.is_locked,
                 "has_pin": state.has_pin,
@@ -683,43 +773,122 @@ pub fn default_registry() -> ActionsRegistry {
                 _ => return Box::pin(async { Err("Payload inválido para Unlock: se esperaba objeto con 'pin' o string".to_string()) }),
             };
 
+            // Sync from payload if present
+            if let Some(map) = payload.as_object() {
+                if let Some(enc_tok) = map.get("encrypted_token").and_then(|v| v.as_str()) {
+                    if !enc_tok.is_empty() {
+                        state.config.encrypted_token = enc_tok.to_string();
+                    }
+                }
+                if let Some(enc_sym) = map.get("encrypted_user_symmetric_key").and_then(|v| v.as_str()) {
+                    if !enc_sym.is_empty() {
+                        state.config.encrypted_user_symmetric_key = enc_sym.to_string();
+                    }
+                }
+            }
+
+            // Sync from config file on disk if available
+            if let Some(path) = state.config_path() {
+                if path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(disk_cfg) = serde_json::from_str::<ConfigFile>(&content) {
+                            if !disk_cfg.config_key_hash.is_empty() {
+                                state.config.config_key_hash = disk_cfg.config_key_hash;
+                                state.has_pin = true;
+                            }
+                            if !disk_cfg.encrypted_token.is_empty() {
+                                state.config.encrypted_token = disk_cfg.encrypted_token;
+                            }
+                            if !disk_cfg.encrypted_user_symmetric_key.is_empty() {
+                                state.config.encrypted_user_symmetric_key = disk_cfg.encrypted_user_symmetric_key;
+                            }
+                            state.config.identity_url = disk_cfg.identity_url;
+                            state.config.api_url = disk_cfg.api_url;
+                            state.config.notifications_url = disk_cfg.notifications_url;
+                            state.config.danger_accept_invalid_certs = disk_cfg.danger_accept_invalid_certs;
+                        }
+                    }
+                }
+            }
+
             if !state.has_pin {
                 return Box::pin(async { Err("No hay PIN configurado en el agente".to_string()) });
             }
 
-            match state.config.verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB) {
-                Ok(true) => {
-                    state.is_locked = false;
-                    state.sessions.create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
-                    state.sessions.create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
-                    let va = state.vault_agent.clone();
-                    let enc_sym = state.config.encrypted_user_symmetric_key.clone();
-                    let key_res = sw_config::derive_config_key_with_params(&pin, &state.config.device_uuid, AGENT_KDF_MEMORY_KIB);
-                    Box::pin(async move {
-                        if let Some(agent) = va {
-                            if let Ok(key) = key_res {
-                                let sym_key = if !enc_sym.is_empty() {
-                                    if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &key) {
-                                        sw_crypto::SymmetricKey::from_bytes(dec.as_bytes())
-                                            .or_else(|_| sw_crypto::SymmetricKey::from_parts(&key, &key))
-                                    } else {
-                                        sw_crypto::SymmetricKey::from_parts(&key, &key)
-                                    }
-                                } else {
-                                    sw_crypto::SymmetricKey::from_parts(&key, &key)
-                                };
-
-                                if let Ok(sk) = sym_key {
-                                    agent.unlock(sk).await;
-                                }
+            let (verified, memory_kib) =
+                match state.config.verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB) {
+                    Ok(true) => (true, AGENT_KDF_MEMORY_KIB),
+                    Ok(false) => {
+                        match state
+                            .config
+                            .verify_pin_with_params(&pin, sw_config::KDF_MEMORY_KIB_TEST)
+                        {
+                            Ok(true) => (true, sw_config::KDF_MEMORY_KIB_TEST),
+                            Ok(false) => (false, AGENT_KDF_MEMORY_KIB),
+                            Err(e) => {
+                                return Box::pin(async move {
+                                    Err(format!("Error al verificar PIN: {e}"))
+                                })
                             }
                         }
-                        Ok(serde_json::json!({ "status": "unlocked" }))
-                    })
-                }
-                Ok(false) => Box::pin(async { Err("PIN incorrecto".to_string()) }),
-                Err(e) => Box::pin(async move { Err(format!("Error al verificar PIN: {e}")) }),
+                    }
+                    Err(e) => {
+                        return Box::pin(async move { Err(format!("Error al verificar PIN: {e}")) })
+                    }
+                };
+
+            if !verified {
+                return Box::pin(async { Err("PIN incorrecto".to_string()) });
             }
+
+            state.is_locked = false;
+            state.sessions.create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
+            state.sessions.create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
+            let va = state.vault_agent.clone();
+            let enc_sym = state.config.encrypted_user_symmetric_key.clone();
+            let key_res = sw_config::derive_config_key_with_params(&pin, &state.config.device_uuid, memory_kib);
+
+            if let Ok(key) = &key_res {
+                if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
+                    if let Ok(token) = state.config.decrypt_token(key) {
+                        state.api_client = Some(Arc::new(
+                            sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                                state.config.identity_url.clone(),
+                                state.config.api_url.clone(),
+                                token,
+                                state.config.danger_accept_invalid_certs,
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            Box::pin(async move {
+                if let Some(agent) = va {
+                    if let Ok(key) = key_res {
+                        let sym_key = if !enc_sym.is_empty() {
+                            if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &key) {
+                                use base64::Engine;
+                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(dec.trim()) {
+                                    sw_crypto::SymmetricKey::from_bytes(&bytes)
+                                        .or_else(|_| sw_crypto::SymmetricKey::from_parts(&key, &key))
+                                } else {
+                                    sw_crypto::SymmetricKey::from_parts(&key, &key)
+                                }
+                            } else {
+                                sw_crypto::SymmetricKey::from_parts(&key, &key)
+                            }
+                        } else {
+                            sw_crypto::SymmetricKey::from_parts(&key, &key)
+                        };
+
+                        if let Ok(sk) = sym_key {
+                            agent.unlock(sk).await;
+                        }
+                    }
+                }
+                Ok(serde_json::json!({ "status": "unlocked" }))
+            })
         },
     );
 
@@ -849,7 +1018,10 @@ pub fn default_registry() -> ActionsRegistry {
     });
 
     // Sync
-    registry.register_async("Sync", |state, _ctx, _payload| Box::pin(handle_sync(state)));
+    registry.register_async("Sync", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_sync(state, &p).await })
+    });
 
     // ListLogins
     registry.register_async("ListLogins", |state, _ctx, _payload| {

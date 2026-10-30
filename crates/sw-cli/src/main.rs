@@ -513,12 +513,26 @@ where
                 Some(p) => p.clone(),
                 None => prompt_fn("Introduce el PIN de desbloqueo: ")?,
             };
-            send_command(
-                &socket_path,
-                "Unlock",
-                serde_json::json!({ "pin": pin_val }),
-            )
-            .await?;
+            let config_path = resolve_config_path(cli.config.clone())?;
+            let config = if config_path.exists() {
+                sw_config::ConfigFile::load_from_file(&config_path).ok()
+            } else {
+                None
+            };
+            let mut payload = serde_json::json!({ "pin": pin_val });
+            if let Some(cfg) = config {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert(
+                        "encrypted_token".into(),
+                        serde_json::Value::String(cfg.encrypted_token),
+                    );
+                    obj.insert(
+                        "encrypted_user_symmetric_key".into(),
+                        serde_json::Value::String(cfg.encrypted_user_symmetric_key),
+                    );
+                }
+            }
+            send_command(&socket_path, "Unlock", payload).await?;
             Ok("Bóveda desbloqueada con éxito.".to_string())
         }
         Commands::Lock => {
@@ -643,9 +657,12 @@ where
                     "SetSession",
                     serde_json::json!({
                         "token": token,
+                        "encrypted_token": config.encrypted_token,
+                        "encrypted_user_symmetric_key": config.encrypted_user_symmetric_key,
                         "user_symmetric_key": b64_sym_key,
                         "identity_url": active_identity_url,
                         "api_url": active_api_url,
+                        "notifications_url": config.notifications_url,
                         "danger_accept_invalid_certs": active_insecure,
                     }),
                 )
@@ -669,7 +686,16 @@ where
                 ));
             }
 
-            let resp = send_command(&socket_path, "Sync", serde_json::json!({})).await?;
+            let payload = serde_json::json!({
+                "encrypted_token": config.encrypted_token,
+                "encrypted_user_symmetric_key": config.encrypted_user_symmetric_key,
+                "identity_url": config.identity_url,
+                "api_url": config.api_url,
+                "notifications_url": config.notifications_url,
+                "danger_accept_invalid_certs": config.danger_accept_invalid_certs,
+            });
+
+            let resp = send_command(&socket_path, "Sync", payload).await?;
             let logins = resp
                 .payload
                 .get("logins")
@@ -2622,5 +2648,161 @@ mod tests {
         assert!(get_output.contains("Notifications URL: https://vault.company.lan/notifications"));
         assert!(get_output.contains("Aceptar certs inv: Sí"));
         assert!(get_output.contains("Sesión iniciada:   No"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_unlock_sync_integration_sequence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "integration_user@example.com";
+        let password = "super_integration_password";
+        let pin = "4321";
+
+        // 1. Mock endpoints
+        // Prelogin
+        Mock::given(method("POST"))
+            .and(path("/identity/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [88u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        // Connect token
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_seq_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_seq_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Sync
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profile": {},
+                "folders": [],
+                "collections": [],
+                "ciphers": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("seq_agent.sock");
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        // Pre-configure PIN in initial config
+        let mut initial_config = sw_config::ConfigFile::default();
+        let config_key = sw_config::derive_config_key_with_params(
+            pin,
+            &initial_config.device_uuid,
+            CLI_KDF_MEMORY_KIB,
+        )
+        .unwrap();
+        initial_config.config_key_hash = sw_config::hash_config_key(&config_key);
+        initial_config.save_to_file(&config_file_path).unwrap();
+
+        let agent_state = sw_agent::AgentState::new(initial_config.clone())
+            .with_config_directory(temp_dir.path().to_path_buf());
+        let va = sw_ssh_agent::shared_vault_agent();
+        let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let sock_clone = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = sw_agent::run_agent_daemon_with_shutdown(&sock_clone, daemon, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        // Wait until agent socket is ready
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        // --- Sequence Step 1: Login ---
+        let cli_login = Cli {
+            socket: Some(socket_path.clone()),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: Some(base_url.clone()),
+            },
+        };
+
+        let login_res = handle_command(&cli_login, |msg| {
+            if msg.contains("PIN") {
+                Ok(pin.to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await
+        .expect("Login step should succeed");
+        assert!(login_res.contains("Sesión iniciada con éxito"));
+
+        // --- Sequence Step 2: Unlock ---
+        let cli_unlock = Cli {
+            socket: Some(socket_path.clone()),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Unlock {
+                pin: Some(pin.to_string()),
+            },
+        };
+
+        let unlock_res = handle_command(&cli_unlock, |_| unreachable!())
+            .await
+            .expect("Unlock step should succeed");
+        assert!(unlock_res.contains("Bóveda desbloqueada con éxito"));
+
+        // --- Sequence Step 3: Sync ---
+        let cli_sync = Cli {
+            socket: Some(socket_path.clone()),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Sync,
+        };
+
+        let sync_res = handle_command(&cli_sync, |_| unreachable!())
+            .await
+            .expect("Sync step should succeed without state error");
+        assert!(sync_res.contains("Sincronización completada"));
+
+        let _ = shutdown_tx.send(());
     }
 }
