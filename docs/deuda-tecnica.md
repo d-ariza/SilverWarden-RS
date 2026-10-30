@@ -71,6 +71,27 @@
 - **Retoma:** M6/M7.
 - **Estado:** Abierta.
 
+### DT-14 — Comandos CLI para Notas, Tarjetas e Identidades
+- **Descripción:** El agente tiene el modelo (`sw-vault`) y la API (`sw-bitwarden-api`), pero el CLI no tiene subcomandos para crear/leer/borrar estos tipos.
+- **Impacto:** Medio (funcionalidades completas de bóveda desde terminal).
+- **Motivo:** Se priorizó el flujo crítico de Logins y Claves SSH.
+- **Retoma:** M7 (GUI) o post-MVP. Evidencia: `docs/api-fixtures.md`.
+- **Estado:** Abierta.
+
+### DT-15 — Validación de contraseñas contra Pwned Passwords
+- **Descripción:** La web de Bitwarden valida que las contraseñas no estén filtradas. silverWarden aún no lo hace.
+- **Impacto:** Bajo (seguridad preventiva opcional).
+- **Motivo:** No bloqueante para el funcionamiento del MVP.
+- **Retoma:** Post-MVP. Endpoint documentado en `docs/api-fixtures.md`.
+- **Estado:** Abierta.
+
+### DT-16 — Gestión de claves SSH legacy (SecureNote vs SSHKey)
+- **Descripción:** El servidor local usa `SSHKey` (tipo 5), pero Disroot usa `SecureNote`. El agente Rust maneja ambos, pero hay que verificar si Vaultwarden requiere el flag `EXPERIMENTAL_CLIENT_FEATURE_FLAGS=ssh-key-vault-item` para exponerlos correctamente a los clientes modernos.
+- **Impacto:** Medio (interoperabilidad entre distintos backends y clientes).
+- **Motivo:** Bitwarden oficial y Vaultwarden evolucionaron en el soporte nativo de tipo 5.
+- **Retoma:** M6/M7.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
