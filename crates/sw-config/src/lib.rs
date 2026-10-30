@@ -162,30 +162,96 @@ pub fn decrypt_string(b64: &str, key: &[u8; 32]) -> Result<String, ConfigError> 
         .map_err(|e| ConfigError::Crypto(format!("Plaintext is not valid UTF-8: {e}")))
 }
 
+/// Runtime configuration matching Goldwarden Go RuntimeConfig.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct RuntimeConfig {
+    pub auth_method: String,
+    pub do_not_persist_config: bool,
+    pub config_directory: String,
+    #[serde(rename = "DisableSSHAgent", alias = "DisableSshAgent")]
+    pub disable_ssh_agent: bool,
+    pub websocket_disabled: bool,
+    #[serde(rename = "DeviceUUID", alias = "DeviceUuid")]
+    pub device_uuid: String,
+    pub user: String,
+    pub password: String,
+    pub pin: String,
+    pub use_memguard: bool,
+    #[serde(rename = "SSHAgentSocketPath", alias = "SshAgentSocketPath")]
+    pub ssh_agent_socket_path: String,
+    pub goldwarden_socket_path: String,
+    pub daemon_auth_token: String,
+}
+
+/// Helper function to deserialize an optional or null struct as Default
+pub fn deserialize_opt_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    let opt = Option::<T>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// Representation of the configuration stored in ~/.config/goldwarden/goldwarden.json
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct ConfigFile {
+    #[serde(alias = "identityUrl")]
     pub identity_url: String,
+    #[serde(alias = "apiUrl")]
     pub api_url: String,
+    #[serde(alias = "notificationsUrl")]
     pub notifications_url: String,
+    #[serde(alias = "vaultUrl")]
     pub vault_url: String,
-    #[serde(rename = "EncryptedClientID", alias = "EncryptedClientId")]
+    #[serde(
+        rename = "EncryptedClientID",
+        alias = "EncryptedClientId",
+        alias = "encryptedClientId",
+        alias = "encrypted_client_id"
+    )]
     pub encrypted_client_id: String,
+    #[serde(alias = "encryptedClientSecret", alias = "encrypted_client_secret")]
     pub encrypted_client_secret: String,
-    #[serde(rename = "DeviceUUID", alias = "DeviceUuid")]
+    #[serde(
+        rename = "DeviceUUID",
+        alias = "DeviceUuid",
+        alias = "deviceUuid",
+        alias = "device_uuid"
+    )]
     pub device_uuid: String,
+    #[serde(alias = "configKeyHash", alias = "config_key_hash")]
     pub config_key_hash: String,
+    #[serde(alias = "encryptedToken", alias = "encrypted_token")]
     pub encrypted_token: String,
+    #[serde(
+        alias = "encryptedUserSymmetricKey",
+        alias = "encrypted_user_symmetric_key"
+    )]
     pub encrypted_user_symmetric_key: String,
+    #[serde(
+        alias = "encryptedMasterPasswordHash",
+        alias = "encrypted_master_password_hash"
+    )]
     pub encrypted_master_password_hash: String,
+    #[serde(alias = "encryptedMasterKey", alias = "encrypted_master_key")]
     pub encrypted_master_key: String,
     #[serde(
+        deserialize_with = "deserialize_opt_or_default",
+        alias = "runtimeConfig",
+        alias = "runtime_config"
+    )]
+    pub runtime_config: RuntimeConfig,
+    #[serde(
         rename = "DangerAcceptInvalidCerts",
-        alias = "danger_accept_invalid_certs",
-        default
+        alias = "dangerAcceptInvalidCerts",
+        alias = "danger_accept_invalid_certs"
     )]
     pub danger_accept_invalid_certs: bool,
+    #[serde(rename = "ServerUrl", alias = "serverUrl", alias = "server_url")]
+    pub server_url: String,
 }
 
 impl Default for ConfigFile {
@@ -203,7 +269,9 @@ impl Default for ConfigFile {
             encrypted_user_symmetric_key: String::new(),
             encrypted_master_password_hash: String::new(),
             encrypted_master_key: String::new(),
+            runtime_config: RuntimeConfig::default(),
             danger_accept_invalid_certs: false,
+            server_url: String::new(),
         }
     }
 }
@@ -345,6 +413,7 @@ impl ConfigFile {
 
     /// Sets identity, api, and notifications URLs derived from a base server URL.
     pub fn set_server(&mut self, server: &str) {
+        self.server_url = server.to_string();
         let (identity, api, notif) = derive_server_urls(server);
         self.identity_url = identity;
         self.api_url = api;
@@ -750,6 +819,9 @@ mod tests {
         assert!(serialized.contains("\"EncryptedUserSymmetricKey\":"));
         assert!(serialized.contains("\"EncryptedMasterPasswordHash\":"));
         assert!(serialized.contains("\"EncryptedMasterKey\":"));
+        assert!(serialized.contains("\"RuntimeConfig\":"));
+        assert!(serialized.contains("\"DangerAcceptInvalidCerts\":"));
+        assert!(serialized.contains("\"ServerUrl\":"));
 
         let deserialized: ConfigFile = serde_json::from_str(&serialized)
             .expect("Deserialization of serialized ConfigFile should succeed");
@@ -1286,11 +1358,125 @@ mod tests {
 
         let mut cfg = ConfigFile::default();
         cfg.set_server("https://vaultwarden.local:8443");
+        assert_eq!(cfg.server_url, "https://vaultwarden.local:8443");
         assert_eq!(cfg.identity_url, "https://vaultwarden.local:8443/identity");
         assert_eq!(cfg.api_url, "https://vaultwarden.local:8443/api");
         assert_eq!(
             cfg.notifications_url,
             "https://vaultwarden.local:8443/notifications"
         );
+    }
+
+    #[test]
+    fn test_config_file_all_15_fields_and_go_compat() {
+        let cfg = ConfigFile {
+            identity_url: "https://id.example.com".to_string(),
+            api_url: "https://api.example.com".to_string(),
+            notifications_url: "https://notif.example.com".to_string(),
+            vault_url: "https://vault.example.com".to_string(),
+            encrypted_client_id: "enc_id".to_string(),
+            encrypted_client_secret: "enc_secret".to_string(),
+            device_uuid: "custom-device-uuid".to_string(),
+            config_key_hash: "custom-key-hash".to_string(),
+            encrypted_token: "enc_token".to_string(),
+            encrypted_user_symmetric_key: "enc_sym".to_string(),
+            encrypted_master_password_hash: "enc_mph".to_string(),
+            encrypted_master_key: "enc_mk".to_string(),
+            runtime_config: RuntimeConfig {
+                auth_method: "password".to_string(),
+                do_not_persist_config: false,
+                config_directory: "/tmp/gw".to_string(),
+                disable_ssh_agent: true,
+                websocket_disabled: false,
+                device_uuid: "custom-device-uuid".to_string(),
+                user: "user@example.com".to_string(),
+                password: "mypassword".to_string(),
+                pin: "1234".to_string(),
+                use_memguard: true,
+                ssh_agent_socket_path: "/tmp/gw-ssh.sock".to_string(),
+                goldwarden_socket_path: "/tmp/gw.sock".to_string(),
+                daemon_auth_token: "token123".to_string(),
+            },
+            danger_accept_invalid_certs: true,
+            server_url: "https://vw.local".to_string(),
+        };
+
+        let json_value: serde_json::Value =
+            serde_json::to_value(&cfg).expect("Serialization to Value must succeed");
+        let map = json_value.as_object().expect("Must be a JSON object");
+
+        // Exactly 15 fields: 13 original Go fields + 2 new SilverWarden fields
+        assert_eq!(map.len(), 15);
+
+        let expected_keys = [
+            "IdentityUrl",
+            "ApiUrl",
+            "NotificationsUrl",
+            "VaultUrl",
+            "EncryptedClientID",
+            "EncryptedClientSecret",
+            "DeviceUUID",
+            "ConfigKeyHash",
+            "EncryptedToken",
+            "EncryptedUserSymmetricKey",
+            "EncryptedMasterPasswordHash",
+            "EncryptedMasterKey",
+            "RuntimeConfig",
+            "DangerAcceptInvalidCerts",
+            "ServerUrl",
+        ];
+
+        for key in expected_keys {
+            assert!(
+                map.contains_key(key),
+                "Missing expected PascalCase key in JSON: {key}"
+            );
+        }
+
+        // Check RuntimeConfig inner keys match Go names
+        let rt_map = map
+            .get("RuntimeConfig")
+            .unwrap()
+            .as_object()
+            .expect("RuntimeConfig must be object");
+        assert!(rt_map.contains_key("DisableSSHAgent"));
+        assert!(rt_map.contains_key("DeviceUUID"));
+        assert!(rt_map.contains_key("SSHAgentSocketPath"));
+
+        // Test reading from a Go sample without the 2 new fields or RuntimeConfig
+        let go_json = r#"{
+            "IdentityUrl": "https://vault.bitwarden.com/identity",
+            "ApiUrl": "https://api.bitwarden.com",
+            "NotificationsUrl": "https://notifications.bitwarden.com",
+            "VaultUrl": "https://vault.bitwarden.com",
+            "EncryptedClientID": "go_client_id",
+            "EncryptedClientSecret": "go_client_secret",
+            "DeviceUUID": "go-device-uuid-1234",
+            "ConfigKeyHash": "go_key_hash",
+            "EncryptedToken": "go_token",
+            "EncryptedUserSymmetricKey": "go_sym_key",
+            "EncryptedMasterPasswordHash": "go_mph",
+            "EncryptedMasterKey": "go_mk"
+        }"#;
+
+        let parsed_go: ConfigFile = serde_json::from_str(go_json).expect("Should parse Go json");
+        assert_eq!(parsed_go.encrypted_client_id, "go_client_id");
+        assert_eq!(parsed_go.encrypted_client_secret, "go_client_secret");
+        assert_eq!(parsed_go.device_uuid, "go-device-uuid-1234");
+        assert_eq!(parsed_go.config_key_hash, "go_key_hash");
+        assert_eq!(parsed_go.encrypted_token, "go_token");
+        assert_eq!(parsed_go.encrypted_user_symmetric_key, "go_sym_key");
+        assert_eq!(parsed_go.encrypted_master_password_hash, "go_mph");
+        assert_eq!(parsed_go.encrypted_master_key, "go_mk");
+        assert!(!parsed_go.danger_accept_invalid_certs);
+        assert_eq!(parsed_go.server_url, "");
+        assert_eq!(parsed_go.runtime_config, RuntimeConfig::default());
+
+        // Test file persistence roundtrip
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("goldwarden.json");
+        cfg.save_to_file(&file_path).expect("save_to_file");
+        let loaded = ConfigFile::load_from_file(&file_path).expect("load_from_file");
+        assert_eq!(cfg, loaded);
     }
 }
