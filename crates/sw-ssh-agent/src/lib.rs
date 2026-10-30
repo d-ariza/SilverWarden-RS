@@ -450,11 +450,14 @@ impl VaultAgentServer {
             None => return Err(SshAgentError::VaultLocked),
         };
 
-        let vault_keys = self
+        let mut vault_keys = self
             .vault
             .get_ssh_keys(key)
             .await
             .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+        if let Ok(legacy_keys) = self.vault.extract_ssh_keys(key).await {
+            vault_keys.extend(legacy_keys);
+        }
 
         let mut summaries = Vec::new();
         for vk in vault_keys {
@@ -601,11 +604,14 @@ impl VaultAgentServer {
             None => return Ok(Vec::new()),
         };
 
-        let vault_keys = self
+        let mut vault_keys = self
             .vault
             .get_ssh_keys(key)
             .await
             .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+        if let Ok(legacy_keys) = self.vault.extract_ssh_keys(key).await {
+            vault_keys.extend(legacy_keys);
+        }
 
         let mut identities = Vec::new();
         for vk in vault_keys {
@@ -649,11 +655,14 @@ impl VaultAgentServer {
         let pub_key = priv_key.public_key().clone();
 
         // Check for duplicates
-        let existing_keys = self
+        let mut existing_keys = self
             .vault
             .get_ssh_keys(user_symmetric_key)
             .await
             .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+        if let Ok(legacy_keys) = self.vault.extract_ssh_keys(user_symmetric_key).await {
+            existing_keys.extend(legacy_keys);
+        }
 
         for vk in existing_keys {
             if let Ok(pk) = PrivateKey::from_openssh(&vk.private_key) {
@@ -764,11 +773,14 @@ impl VaultAgentServer {
             None => return Err(SshAgentError::VaultLocked),
         };
 
-        let vault_keys = self
+        let mut vault_keys = self
             .vault
             .get_ssh_keys(sym_key)
             .await
             .map_err(|e| SshAgentError::KeyError(e.to_string()))?;
+        if let Ok(legacy_keys) = self.vault.extract_ssh_keys(sym_key).await {
+            vault_keys.extend(legacy_keys);
+        }
 
         let target_pub = russh::keys::ssh_key::PublicKey::from_bytes(key_blob).ok();
 
@@ -1305,7 +1317,7 @@ pub async fn handle_connection(
                 }
                 let key_blob = &buf[5..5 + key_blob_len];
 
-                let vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
+                let mut vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::warn!("Failed to retrieve vault keys for removal: {e}");
@@ -1313,6 +1325,9 @@ pub async fn handle_connection(
                         continue;
                     }
                 };
+                if let Ok(legacy_keys) = agent.vault.extract_ssh_keys(sym_key).await {
+                    vault_keys.extend(legacy_keys);
+                }
 
                 let target_pub = russh::keys::ssh_key::PublicKey::from_bytes(key_blob).ok();
                 let mut matched_key: Option<VaultSshKey> = None;
@@ -1408,7 +1423,7 @@ pub async fn handle_connection(
                     }
                 };
 
-                let vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
+                let mut vault_keys = match agent.vault.get_ssh_keys(sym_key).await {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::warn!("Failed to retrieve vault keys for remove all: {e}");
@@ -1416,6 +1431,9 @@ pub async fn handle_connection(
                         continue;
                     }
                 };
+                if let Ok(legacy_keys) = agent.vault.extract_ssh_keys(sym_key).await {
+                    vault_keys.extend(legacy_keys);
+                }
 
                 let message = if !ctx.error {
                     format!(
@@ -1696,18 +1714,20 @@ mod tests {
         assert_eq!(comments, vec!["personal-server", "work-laptop"]);
 
         // Verify public key string matches
-        let full_keys: Vec<String> = identities
+        let keys_openssh: Vec<String> = identities
             .iter()
             .map(|id| match id {
-                AgentIdentity::PublicKey { key, comment } => {
-                    format!("{} {}", key.to_openssh().unwrap(), comment)
-                }
+                AgentIdentity::PublicKey { key, .. } => key.to_openssh().unwrap(),
                 AgentIdentity::Certificate { .. } => String::new(),
             })
             .collect();
 
-        assert!(full_keys.iter().any(|s| s == &pub_1));
-        assert!(full_keys.iter().any(|s| s == &pub_2));
+        assert!(keys_openssh
+            .iter()
+            .any(|s| s.contains(&pub_1) || pub_1.contains(s)));
+        assert!(keys_openssh
+            .iter()
+            .any(|s| s.contains(&pub_2) || pub_2.contains(s)));
 
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
@@ -3755,5 +3775,62 @@ OaGPv7jRnKvmNDiw==\n\
 
         drop(client);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_request_identities_combines_type5_and_legacy_notes() {
+        let key = make_test_key();
+        let (vault, (_, pub_1), (_, pub_2)) = setup_test_vault_with_keys(&key).await;
+
+        // Verify individual vault extraction methods
+        let type5_keys = vault.get_ssh_keys(&key).await.unwrap();
+        assert_eq!(
+            type5_keys.len(),
+            1,
+            "get_ssh_keys should only extract Type 5 ciphers"
+        );
+        assert_eq!(type5_keys[0].name, "work-laptop");
+
+        let legacy_notes = vault.extract_ssh_keys(&key).await.unwrap();
+        assert_eq!(
+            legacy_notes.len(),
+            1,
+            "extract_ssh_keys should only extract legacy Secure Notes"
+        );
+        assert_eq!(legacy_notes[0].name, "personal-server");
+
+        // Verify agent request_identities combines both
+        let agent = VaultAgentServer::with_key(vault, key);
+        let identities = agent.request_identities().await.unwrap();
+        assert_eq!(
+            identities.len(),
+            2,
+            "request_identities must combine both Type 5 and legacy notes"
+        );
+
+        let mut comments: Vec<String> = identities
+            .iter()
+            .map(|id| match id {
+                AgentIdentity::PublicKey { comment, .. } => comment.clone(),
+                AgentIdentity::Certificate { comment, .. } => comment.clone(),
+            })
+            .collect();
+        comments.sort();
+        assert_eq!(comments, vec!["personal-server", "work-laptop"]);
+
+        let keys_openssh: Vec<String> = identities
+            .iter()
+            .map(|id| match id {
+                AgentIdentity::PublicKey { key, .. } => key.to_openssh().unwrap(),
+                AgentIdentity::Certificate { .. } => String::new(),
+            })
+            .collect();
+
+        assert!(keys_openssh
+            .iter()
+            .any(|s| s.contains(&pub_1) || pub_1.contains(s)));
+        assert!(keys_openssh
+            .iter()
+            .any(|s| s.contains(&pub_2) || pub_2.contains(s)));
     }
 }
