@@ -377,6 +377,12 @@ pub struct Cipher {
     pub folder_id: Option<Uuid>,
     #[serde(default)]
     pub organization_id: Option<Uuid>,
+    #[serde(
+        default,
+        rename = "encryptedFor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub encrypted_for: Option<Uuid>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub fields: Vec<Field>,
 

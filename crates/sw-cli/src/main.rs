@@ -2850,6 +2850,15 @@ mod tests {
         let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
         let va = Arc::new(sw_ssh_agent::VaultAgentServer::default());
         va.unlock(sym_key).await;
+        va.vault()
+            .load_sync_data(sw_vault::SyncData {
+                profile: sw_vault::Profile {
+                    id: Some(sw_vault::Uuid::new_v4()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
 
         let client = Arc::new(
             sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
@@ -2937,9 +2946,14 @@ mod tests {
             ..Default::default()
         };
 
-        // Mock success on POST /ciphers
+        let profile_id = sw_vault::Uuid::new_v4();
+
+        // Mock success on POST /ciphers requiring encryptedFor matching profile_id
         Mock::given(method("POST"))
             .and(path("/ciphers"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "\"encryptedFor\":\"{profile_id}\""
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(&returned_cipher))
             .mount(&mock_server)
             .await;
@@ -2950,6 +2964,15 @@ mod tests {
         let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
         let va = Arc::new(sw_ssh_agent::VaultAgentServer::default());
         va.unlock(sym_key).await;
+        va.vault()
+            .load_sync_data(sw_vault::SyncData {
+                profile: sw_vault::Profile {
+                    id: Some(profile_id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
 
         let client = Arc::new(
             sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
@@ -3013,6 +3036,76 @@ mod tests {
         let vault_items = va.vault().all().await;
         assert_eq!(vault_items.len(), 1);
         assert_eq!(vault_items[0].id, Some(returned_id));
+
+        // Verify wiremock received the POST request with encryptedFor
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req_body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("Valid JSON request body");
+        assert_eq!(req_body["encryptedFor"], profile_id.to_string());
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create_fails_when_profile_not_synced() {
+        use std::sync::Arc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("no_profile_create.sock");
+
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
+        let va = Arc::new(sw_ssh_agent::VaultAgentServer::default());
+        va.unlock(sym_key).await;
+        // Profile is not loaded into va.vault()
+
+        let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default())
+            .with_config_directory(temp_dir.path().to_path_buf());
+        agent_state.is_locked = false;
+
+        let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let sock_clone = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = sw_agent::run_agent_daemon_with_shutdown(&sock_clone, daemon, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "SiteWithoutProfile".into(),
+                    username: "user".into(),
+                    password: "pass".into(),
+                }),
+                filter: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            res.is_err(),
+            "Should return error when profile is not synced"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg
+                .contains("No se ha sincronizado el perfil. Ejecuta 'silverwarden sync' primero."),
+            "Expected profile sync error message, got: {err_msg}"
+        );
 
         let _ = shutdown_tx.send(());
     }

@@ -100,6 +100,26 @@ impl AgentState {
         }
     }
 
+    /// Returns the resolved vault path if available.
+    pub fn vault_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            self.config_directory
+                .as_ref()
+                .map(|dir| dir.join("vault.json"))
+        }
+        #[cfg(not(test))]
+        {
+            if let Some(dir) = &self.config_directory {
+                Some(dir.join("vault.json"))
+            } else {
+                sw_vault::VaultPaths::default_paths()
+                    .ok()
+                    .map(|p| p.vault_file())
+            }
+        }
+    }
+
     /// Sets the `VaultAgentServer` instance in state.
     pub fn with_vault_agent(mut self, agent: Arc<VaultAgentServer>) -> Self {
         self.vault_agent = Some(agent);
@@ -358,6 +378,9 @@ async fn handle_sync(
     if let Some(c) = client {
         match c.sync().await {
             Ok(sync_data) => {
+                if let Some(vp) = state.vault_path() {
+                    let _ = sw_vault::save_vault(&vp, &sync_data);
+                }
                 agent.vault().load_sync_data(sync_data).await;
             }
             Err(sw_bitwarden_api::ApiError::RateLimitExceeded) => {
@@ -491,6 +514,29 @@ async fn handle_create_login(
         .vault_agent
         .as_ref()
         .ok_or_else(|| "Vault agent no configurado".to_string())?;
+
+    let profile = agent.vault().profile().await;
+    let mut profile_id = profile.and_then(|p| p.id);
+    if profile_id.is_none() {
+        if let Some(vp) = state.vault_path() {
+            if vp.exists() {
+                if let Ok(disk_sync) = sw_vault::load_vault(&vp) {
+                    profile_id = disk_sync.profile.id;
+                    agent.vault().load_sync_data(disk_sync).await;
+                }
+            }
+        }
+    }
+
+    let profile_id = match profile_id {
+        Some(id) => id,
+        None => {
+            return Err(
+                "No se ha sincronizado el perfil. Ejecuta 'silverwarden sync' primero.".to_string(),
+            );
+        }
+    };
+
     let sym_key = agent
         .get_symmetric_key()
         .await
@@ -522,6 +568,7 @@ async fn handle_create_login(
         favorite: false,
         reprompt: 0,
         fields: vec![],
+        encrypted_for: Some(profile_id),
         login: Some(sw_vault::LoginCipher {
             username: Some(enc_user),
             password: Some(enc_pass),

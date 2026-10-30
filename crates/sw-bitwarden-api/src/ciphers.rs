@@ -247,4 +247,27 @@ mod tests {
         assert!(cipher.fields.is_empty());
         assert!(cipher.login.unwrap().uris.is_empty());
     }
+
+    #[test]
+    fn test_cipher_serialization_includes_encrypted_for() {
+        let profile_uuid = uuid::Uuid::new_v4();
+        let valid_enc: EncString = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ=="
+            .parse()
+            .expect("valid EncString");
+
+        let cipher = Cipher {
+            id: None,
+            r#type: CipherType::Login,
+            name: valid_enc,
+            encrypted_for: Some(profile_uuid),
+            ..Default::default()
+        };
+
+        let val = serde_json::to_value(&cipher).expect("serialization succeeds");
+        assert_eq!(
+            val.get("encryptedFor"),
+            Some(&json!(profile_uuid.to_string())),
+            "encryptedFor must be present when Some"
+        );
+    }
 }
