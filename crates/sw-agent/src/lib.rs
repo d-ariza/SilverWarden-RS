@@ -531,17 +531,25 @@ async fn handle_create_login(
     };
 
     let client = state.api_client.as_ref().or_else(|| agent.api_client());
-    if let Some(c) = client {
-        if let Err(e) = c.post_cipher(&cipher).await {
-            tracing::warn!("Failed to post cipher to server: {e}");
-        }
-    }
+    let client = client.ok_or_else(|| {
+        "No hay sesión iniciada en el servidor. Inicia sesión con 'silverwarden login' primero."
+            .to_string()
+    })?;
 
-    agent.vault().insert(cipher).await;
+    let created_cipher = client
+        .post_cipher(&cipher)
+        .await
+        .map_err(|e| format!("Error del servidor al crear acceso: {e}"))?;
+
+    let server_id = created_cipher
+        .id
+        .ok_or_else(|| "El servidor no devolvió un ID para el acceso creado".to_string())?;
+
+    agent.vault().insert(created_cipher).await;
 
     Ok(serde_json::json!({
         "status": "created",
-        "id": cipher_id,
+        "id": server_id.to_string(),
         "name": name,
     }))
 }

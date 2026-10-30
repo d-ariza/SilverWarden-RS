@@ -773,7 +773,7 @@ where
                         "El nombre no puede estar vacío.".to_string(),
                     ));
                 }
-                send_command(
+                let resp = send_command(
                     &socket_path,
                     "CreateLogin",
                     serde_json::json!({
@@ -783,6 +783,18 @@ where
                     }),
                 )
                 .await?;
+
+                if let Some(status) = resp.payload.get("status").and_then(|v| v.as_str()) {
+                    if status == "error" {
+                        let err_msg = resp
+                            .payload
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Error al crear el acceso");
+                        return Err(CliError::AgentError(err_msg.to_string()));
+                    }
+                }
+
                 Ok(format!("Acceso '{name}' creado exitosamente."))
             }
             Some(LoginsCommands::Delete { name }) => {
@@ -2802,6 +2814,205 @@ mod tests {
             .await
             .expect("Sync step should succeed without state error");
         assert!(sync_res.contains("Sincronización completada"));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create_server_failure_propagates_error() {
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock failure on POST /ciphers and /api/ciphers
+        Mock::given(method("POST"))
+            .and(path("/ciphers"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("Internal server error from Vaultwarden"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/ciphers"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("Internal server error from Vaultwarden"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("failing_create.sock");
+
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
+        let va = Arc::new(sw_ssh_agent::VaultAgentServer::default());
+        va.unlock(sym_key).await;
+
+        let client = Arc::new(
+            sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                mock_server.uri(),
+                mock_server.uri(),
+                sw_config::LoginToken::default(),
+                false,
+            ),
+        );
+
+        let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default())
+            .with_config_directory(temp_dir.path().to_path_buf());
+        agent_state.is_locked = false;
+        agent_state.api_client = Some(client);
+
+        let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let sock_clone = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = sw_agent::run_agent_daemon_with_shutdown(&sock_clone, daemon, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "FailingSite".into(),
+                    username: "admin".into(),
+                    password: "password123".into(),
+                }),
+                filter: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_err(), "Creation should fail when server returns 500");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Error del servidor al crear acceso"),
+            "Error message should mention server failure: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("500"),
+            "Error message should contain HTTP 500 status: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("creado exitosamente"),
+            "Error message must NOT say created successfully"
+        );
+
+        // Verify the item was NOT inserted into the local vault
+        let vault_items = va.vault().all().await;
+        assert!(
+            vault_items.is_empty(),
+            "Local vault must not contain the item when server rejects creation"
+        );
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create_server_success_inserts_item() {
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let returned_id = sw_vault::Uuid::new_v4();
+        let returned_cipher = sw_vault::Cipher {
+            id: Some(returned_id),
+            r#type: sw_vault::CipherType::Login,
+            ..Default::default()
+        };
+
+        // Mock success on POST /ciphers
+        Mock::given(method("POST"))
+            .and(path("/ciphers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&returned_cipher))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("success_create.sock");
+
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
+        let va = Arc::new(sw_ssh_agent::VaultAgentServer::default());
+        va.unlock(sym_key).await;
+
+        let client = Arc::new(
+            sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                mock_server.uri(),
+                mock_server.uri(),
+                sw_config::LoginToken::default(),
+                false,
+            ),
+        );
+
+        let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default())
+            .with_config_directory(temp_dir.path().to_path_buf());
+        agent_state.is_locked = false;
+        agent_state.api_client = Some(client);
+
+        let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let sock_clone = socket_path.clone();
+        tokio::spawn(async move {
+            let _ = sw_agent::run_agent_daemon_with_shutdown(&sock_clone, daemon, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "SuccessfulSite".into(),
+                    username: "admin".into(),
+                    password: "password123".into(),
+                }),
+                filter: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            res.is_ok(),
+            "Creation should succeed when server returns 200 with id: {:?}",
+            res.err()
+        );
+        let success_msg = res.unwrap();
+        assert!(
+            success_msg.contains("Acceso 'SuccessfulSite' creado exitosamente."),
+            "Success message should be displayed: {success_msg}"
+        );
+
+        // Verify the item was inserted into the local vault with the server ID
+        let vault_items = va.vault().all().await;
+        assert_eq!(vault_items.len(), 1);
+        assert_eq!(vault_items[0].id, Some(returned_id));
 
         let _ = shutdown_tx.send(());
     }
