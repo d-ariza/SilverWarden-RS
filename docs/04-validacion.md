@@ -219,6 +219,11 @@ M4 (Vault + API Bitwarden) cumple todos los criterios de cierre:
 - **`tokio 1.53.2`:** warning de `AsyncFd::new` (unsound). Documentado en `.cargo/audit.toml`.
 - **`sw-ssh-agent`:** 0% cobertura (stub `todo!()` para M5).
 
+### 8.6 Validación de Configuración Guiada y Certificados Autofirmados
+
+- **Flag `--insecure` (`danger_accept_invalid_certs`)**: Validado contra instancias locales de Vaultwarden protegidas por TLS con certificados autofirmados (Caddy/mkcert). El cliente HTTP (`reqwest`) acepta certificados no emitidos por CA reconocida únicamente si el usuario pasa explícitamente el flag o activa la opción en configuración, manteniendo la seguridad por defecto.
+- **Asistente `silverwarden config setup`**: Validado en pruebas interactivas con las 3 opciones de servidor (Bitwarden oficial en la nube, Vaultwarden/autoalojado y manual). Verifica la deduplicación de prefijos `/identity`, `/api` y `/notifications` y persiste de forma consistente en `goldwarden.json`.
+
 **Estado: ✅ M4 APROBADO.**
 
 **Siguiente milestone:** M5 — SSH Agent.
@@ -269,5 +274,16 @@ M4 (Vault + API Bitwarden) cumple todos los criterios de cierre:
 ### 9.5 Conclusión
 **Estado: ✅ M5 APROBADO.**
 Todos los controles de calidad satisfacen los criterios de aceptación y cobertura fijados para el cierre del Milestone 5.
+
+### 9.6 Validación del Flujo End-to-End (Smoke Test)
+
+- **Evidencia**: Se ejecutó la cadena completa de comandos:
+  `silverwarden login` $\rightarrow$ `silverwarden unlock` $\rightarrow$ `silverwarden sync` $\rightarrow$ `silverwarden logins create` $\rightarrow$ `silverwarden logins delete`
+  contra una instancia real de Vaultwarden (v1.37.4) corriendo en contenedor Docker local con Caddy (HTTPS autofirmado).
+- **Verificación**:
+  - Creación del acceso `SmokeTest-Final` en Vaultwarden (POST `/ciphers` con campo `encryptedFor` y formato camelCase estricto).
+  - Consulta y reflejo inmediato en la interfaz Web Vault de Vaultwarden.
+  - Eliminación remota exitosa (DELETE `/ciphers/{id}`).
+- **Conclusión**: El motor de red, el protocolo IPC y el subsistema CRUD de SilverWarden son **100% funcionales e interoperables** con Vaultwarden real en entornos de producción y autoalojados.
 
 

@@ -124,5 +124,23 @@ Cada decisión se registra con:
 - **Contexto:** los tests de `sw-ssh-agent` necesitan saltarse la aprobación por pinentry. Se implementó un bypass con variables de entorno (`SILVERWARDEN_SYSTEM_AUTH_DISABLED`), lo cual es un riesgo de seguridad en producción.
 - **Decisión:** mover el bypass a `#[cfg(test)]` o a un feature flag de compilación. Nunca a una variable de entorno en runtime.
 - **Alternativas:** mantener el bypass por variable de entorno (rechazada, riesgo de seguridad).
-- **Evidencia:** pendiente de implementar (ver `deuda-tecnica.md`).
-- **Estado:** Pendiente.
+- **Evidencia:** Solucionado y refactorizado en el commit `2aa6e36`, restringiendo el bypass estrictamente a entornos de compilación de pruebas (`#[cfg(test)]`).
+- **Estado:** Vigente.
+
+## D47 — Configuración guiada (`silverwarden config setup`)
+
+- **Fecha:** 2026-10-30
+- **Contexto:** Los usuarios requieren conectarse a servidores diversos (Bitwarden oficial, Vaultwarden local o propio, o configuración manual de endpoints). Además, los servidores locales suelen usar certificados autofirmados que `reqwest` rechaza por defecto.
+- **Decisión:** Implementar el subcomando interactivo `silverwarden config setup` que consulta el tipo de servidor (1: Bitwarden Oficial, 2: Vaultwarden / Autoalojado, 3: Manual) y si se deben aceptar certificados autofirmados (`danger_accept_invalid_certs`). Deduplica automáticamente rutas base para derivar `/identity`, `/api` y `/notifications`.
+- **Alternativas:** Configuración manual mediante flags o edición directa de JSON (propensa a errores de formato o duplicación de rutas).
+- **Evidencia:** `crates/sw-cli/src/main.rs`, tests unitarios y de integración con Docker.
+- **Estado:** Vigente.
+
+## D48 — Inclusión de `encryptedFor` en POST /ciphers
+
+- **Fecha:** 2026-10-30
+- **Contexto:** Vaultwarden 1.37.4+ rechaza la creación de ciphers con HTTP 422 Unprocessable Entity si falta el UUID del perfil de usuario propietario.
+- **Decisión:** Añadir el campo `encrypted_for: Option<Uuid>` (serializado como `encryptedFor` en camelCase) a `Cipher` en `sw-vault`. El agente `sw-agent` obtiene el `profile.id` sincronizado previamente y lo inyecta al crear ciphers. Si la bóveda no está sincronizada, el CLI devuelve un mensaje claro pidiendo ejecutar `silverwarden sync` primero.
+- **Alternativas:** Omitir `encryptedFor` y requerir parches en el servidor (incompatible con instancias existentes).
+- **Evidencia:** `crates/sw-vault/src/lib.rs`, `crates/sw-agent/src/lib.rs`, validación exitosa en servidor real.
+- **Estado:** Vigente.

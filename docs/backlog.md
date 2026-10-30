@@ -16,6 +16,7 @@ Una historia pasa a `Hecho` solo cuando:
 3. Hay evidencia registrada en `docs/03-ejecucion.md`: comandos ejecutados y su salida real.
 4. El usuario revisa y acepta el incremento.
 5. No se reporta como exitoso nada que no se haya ejecutado. `No ejecutado` ≠ `Aprobado`.
+6. **A partir de M6, ninguna historia se cierra sin tests unitarios y tests de casos borde (edge cases) documentados.**
 
 ---
 
@@ -845,11 +846,95 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 **Depende de:** SW-050, SW-051 · **Estado:** Pendiente
 
 ### M7 — GUI Tauri (P1)
-- [SW-060] Scaffold Tauri v2 + Svelte 5 + TS
-- [SW-061] Ventana login
-- [SW-062] Quickaccess
-- [SW-063] Settings
-- [SW-064] Diálogos pinentry/approval
+
+---
+
+### [SW-060] Scaffold Tauri v2 + Svelte 5 + TS
+
+**Historia:** Como desarrollador, quiero la estructura base de Tauri v2 con Svelte 5 y TypeScript en `crates/sw-gui`, configurada para comunicarse vía IPC con el agente `sw-agent`.
+
+**Implementación / Tests:**
+- Configuración de `tauri.conf.json` y permisos mínimos requeridos.
+- Setup de frontend con Svelte 5, Vite y TypeScript.
+- Comandos Tauri invocando el socket Unix del daemon (`Status`, `Lock`, etc.).
+- Detección de agente ausente con mensaje guiado: *"El agente no está disponible. Ejecuta `silverwarden agent start`"*.
+
+**Criterios de aceptación:**
+- La aplicación compila e inicializa la ventana principal mostrando el estado en tiempo real del agente (bloqueado/desbloqueado/desconectado).
+- Tests E2E básicos de ciclo de vida de ventana.
+
+**Depende de:** M5 cerrado · **Estado:** Pendiente
+
+---
+
+### [SW-061] Ventana de login y desbloqueo
+
+**Historia:** Como usuario, quiero autenticarme contra el servidor o desbloquear la bóveda con PIN desde una interfaz gráfica clara y moderna.
+
+**Implementación / Tests:**
+- Formularios Svelte para login (email, contraseña maestra, URL de servidor, soporte 2FA) y desbloqueo interactivo (PIN).
+- Comunicación con el agente mediante acciones IPC `Login`, `Unlock` y `PinSet`.
+- Manejo visual de errores (PIN erróneo, HTTP 429 rate limit, 2FA requerido).
+
+**Criterios de aceptación:**
+- Login exitoso guarda sesión y actualiza estado visual a desbloqueado.
+- Desbloqueo por PIN valida en memoria y actualiza la UI.
+- Notificaciones de error accionables sin bloqueos en la interfaz.
+
+**Depende de:** SW-060 · **Estado:** Pendiente
+
+---
+
+### [SW-062] Vista Quickaccess y búsqueda de logins
+
+**Historia:** Como usuario, quiero una vista rápida para buscar, filtrar y copiar credenciales de mis accesos guardados.
+
+**Implementación / Tests:**
+- Componente de lista reactiva con filtrado en tiempo real por subcadena en nombre y usuario.
+- Atajos de teclado para copiar usuario/contraseña al portapapeles con limpieza automática a los 30 segundos.
+- Acciones IPC consumidas: `ListLogins` y `GetLogin`.
+
+**Criterios de aceptación:**
+- Búsqueda instantánea fluida sin degradación de rendimiento.
+- Copia segura al portapapeles con borrado automático tras el temporizador.
+- La contraseña nunca se muestra en claro a menos que el usuario presione el botón explícito de revelar.
+
+**Depende de:** SW-061 · **Estado:** Pendiente
+
+---
+
+### [SW-063] Vista de configuración (Settings)
+
+**Historia:** Como usuario, quiero consultar y ajustar mis preferencias, endpoints de servidor, timeouts de sesión y ver el estado de sincronización.
+
+**Implementación / Tests:**
+- Panel de configuración con pestañas: Servidor (URLs, certificados autofirmados), Seguridad (timeouts de lock por inactividad, cambio de PIN) y Sincronización.
+- Botón de sincronización manual (`Sync`).
+- Persistencia vía IPC (`GetConfig`, `SetConfig`).
+
+**Criterios de aceptación:**
+- Muestra URLs activas y estado de sesión sin fugar secretos.
+- Permite forzar sincronización manual y reporta cantidad de elementos sincronizados.
+
+**Depende de:** SW-061 · **Estado:** Pendiente
+
+---
+
+### [SW-064] Diálogos de aprobación, pinentry y gestión de claves SSH (M7.5)
+
+**Historia:** Como usuario, quiero diálogos gráficos para autorizar solicitudes de firma SSH y una vista dedicada para gestionar mis claves SSH (listar, ver claves públicas e importar).
+
+**Implementación / Tests:**
+- Ventana modal emergente de confirmación de firma SSH mostrando el contexto de llamada (`CallingContext`: usuario, proceso y ancestros).
+- Vista dedicada "SSH Keys" (M7.5): lista identidades mediante `ListSSHKeys`, muestra fingerprints (SHA256 y MD5) y clave pública, e incluye diálogo de importación (`ImportSSHKey`).
+- **Regla estricta:** La clave privada jamás se expone ni se transfiere a la GUI en texto claro.
+
+**Criterios de aceptación:**
+- Diálogo modal de confirmación intercepta peticiones de firma SSH de forma segura.
+- Vista de claves SSH lista correctamente los elementos del vault con fingerprints idénticos a OpenSSH.
+- Cero fugas de claves privadas hacia el frontend web.
+
+**Depende de:** SW-062, SW-045 · **Estado:** Pendiente
 
 ### M8 — Autotipo + TOTP UI (P2)
 - [SW-070] TOTP

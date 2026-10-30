@@ -18,6 +18,7 @@
 | Post-MVP | Autotipo, TOTP UI, browser biometrics, Windows, empaquetado |
 | GUI | **No es "post-MVP"**. Es parte del MVP, como cliente IPC del agente (M7 se adelanta) |
 | M4 | **✅ Completado.** Vault + API Bitwarden (SW-030 a SW-036). FIDO2 se pospone |
+| D47 — Configuración guiada | **`silverwarden config setup`**. El CLI pregunta explícitamente si el servidor es Bitwarden Oficial, Vaultwarden o Manual, y si se debe aceptar el certificado autofirmado (`danger_accept_invalid_certs`). |
 | Arquitectura | **GUI = cliente IPC del agente**. Agente obligatorio |
 | Migración | Incluye config, vault, PIN y **claves SSH importadas** |
 | Coexistencia Go/Rust | **Importar una vez y seguir** (no bidireccional en caliente) |
@@ -126,6 +127,8 @@ Nota sobre sockets:
 | D44 | **Descifrado bajo demanda** | Descifrado masivo en memoria | El vault se guarda cifrado en disco (SW-032). En memoria, los ciphers se mantienen como `EncString` (cifrados). Se descifran solo cuando el usuario (o el agente SSH) los pide. La `user_symmetric_key` nunca se guarda en el `VaultStore`; se pasa como argumento a las funciones que descifran |
 | D45 | **Vista SSH Keys en la GUI** | Claves SSH solo por CLI | La GUI tiene una vista específica para claves SSH (M7.5). Permite listar, importar y ver la clave pública. Nunca muestra la clave privada |
 | D46 | **Gestor y ciclo de vida de claves SSH (M5)** | Manejo local en memoria | Las claves SSH se almacenan como Cipher tipo 2 (Secure Note) con campos personalizados (`ssh-key`, `public-key`, `private-key`). En reposo residen cifradas; el agente SSH solo descifra la clave privada en memoria bloqueada durante la firma (`sign_request`). Las operaciones `add_identity`/`remove_identity` y las acciones IPC de GUI (`ImportSSHKey`, `NewSSHKey`, `DeleteSSHKey`, `ListSSHKeys`) sincronizan contra el servidor Bitwarden (`POST`/`DELETE /ciphers`). |
+| D47 | **Configuración guiada (`silverwarden config setup`)** | Configuración manual de URLs | El CLI guía interactivamente al usuario preguntando si el servidor es Bitwarden Oficial, Vaultwarden o Manual, configurando endpoints (`/identity`, `/api`, `/notifications`) y si debe aceptar certificados autofirmados (`danger_accept_invalid_certs`). |
+| D48 | **Campo `encryptedFor` en POST /ciphers** | Omitir `encryptedFor` | Vaultwarden 1.37.4+ requiere que el POST /ciphers incluya el UUID del perfil (`encryptedFor`) para evitar el error 422 Unprocessable Entity. Implementado en el cliente Rust (`sw-vault` y `sw-agent`). |
 
 ---
 
@@ -159,7 +162,7 @@ Nota sobre sockets:
 - **Milestones del proyecto:**
   - **M1–M3:** ✅ **Completados.** (Criptografía, config/migración y agente/IPC/CLI).
   - **M4:** ✅ **Completado.** (SW-030 a SW-036 cerradas y validadas; FIDO2 pospuesto).
-  - **M5:** ⏳ **En curso.** (SSH agent con `russh`: SW-040 a SW-046 en 4 fases ordenadas). Base de agente, IPC y vault lista.
+  - **M5:** ✅ **Completado.** (SSH agent con `russh`: SW-040 a SW-046 cerradas y validadas; interop real con OpenSSH y Git).
   - **M7 (GUI):** ⏳ **Pendiente.** **Se adelanta** para que la GUI esté disponible cuanto antes (no es post-MVP). Orden: Scaffold + Status → Login/Unlock → Quickaccess → Settings → SSH Keys → Pinentry/Approval.
   - **M6, M8–M10:** Post-MVP.
 - **Repo:** rama `silverwarden-rs` en el repo Go local; se migra a repo propio en M10.
@@ -204,7 +207,7 @@ Nota sobre sockets:
 
 - [x] Arquitectura de crates aprobada (M1–M3 implementados).
 - [x] Decisiones D-1 a D-10 aceptadas.
-- [x] Decisiones D30–D45 aceptadas (ver sección 3).
+- [x] Decisiones D30–D48 aceptadas (ver sección 3).
 - [x] Controles y umbrales de validación aceptados.
 - [x] Estrategia de entrega/migración aceptada.
 - [x] Backlog priorizado aceptado.

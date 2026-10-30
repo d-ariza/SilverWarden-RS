@@ -57,6 +57,20 @@
 - **Retoma:** M6.
 - **Estado:** Abierta.
 
+### DT-12 — Comando `silverwarden ssh import/add` en el CLI
+- **Descripción:** El agente tiene la lógica IPC implementada (`ImportSSHKey`, `NewSSHKey`), pero el CLI (`sw-cli`) no expone el subcomando para que el usuario pueda importar claves SSH directamente desde la terminal (actualmente solo se puede vía IPC/GUI o `ssh-add`).
+- **Impacto:** Bajo (usabilidad de terminal; viable vía `ssh-add` estándar).
+- **Motivo:** Prioridad enfocada en paridad del daemon SSH y soporte para GUI en M5.
+- **Retoma:** M7 o post-MVP.
+- **Estado:** Abierta.
+
+### DT-13 — Normalizar las claves SSH en Vaultwarden
+- **Descripción:** En Vaultwarden local funcionó con claves de tipo `SSHKey` (tipo 5), pero en instancias como Disroot se guardaron históricamente como `SecureNote`. El agente Rust debe manejar ambos formatos, pero Vaultwarden cuenta con una bandera experimental (`EXPERIMENTAL_CLIENT_FEATURE_FLAGS`) que podríamos necesitar activar para clientes modernos.
+- **Impacto:** Medio (compatibilidad entre distintos backends y versiones de Vaultwarden).
+- **Motivo:** Asegurar interoperabilidad tanto con vaults legados como con implementaciones modernas.
+- **Retoma:** M6/M7.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)

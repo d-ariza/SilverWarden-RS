@@ -1423,6 +1423,32 @@ PASS
 
 ---
 
+### 4.8 Resolución de incompatibilidad 422 con Vaultwarden 1.37.4
+
+**Fecha:** 2026-10-30  
+**Crates involucrados:** `sw-vault`, `sw-bitwarden-api`, `sw-agent`, `sw-cli`
+
+#### 1. Diagnóstico y Causa Raíz
+Durante las pruebas de integración y creación de accesos contra instancias modernas de Vaultwarden (v1.37.4 y posteriores), el endpoint `POST /ciphers` rechazaba las peticiones con código de error HTTP `422 Unprocessable Entity`. La investigación técnica determinó dos requisitos estrictos del backend:
+1. **Identificador de perfil obligatorio (`encryptedFor`)**: Vaultwarden requiere explícitamente en el cuerpo JSON de creación el UUID del perfil de usuario propietario (`profile.id`) serializado como `encryptedFor`.
+2. **Formato camelCase estricto y ausencia de campos nulos indebidos**: Todos los campos del objeto JSON deben utilizar nomenclatura `camelCase` (no PascalCase), y las listas auxiliares (`fields`, `uris`) deben serializarse como arrays vacíos `[]` en lugar de `null`.
+
+#### 2. Implementación de la Solución
+- **En `sw-vault` (`struct Cipher`)**:
+  - Incorporación del campo `pub encrypted_for: Option<Uuid>` con directivas `#[serde(default, rename = "encryptedFor", skip_serializing_if = "Option::is_none")]`.
+- **En `sw-agent` (`handle_create_login`)**:
+  - Validación previa de sincronización: el agente consulta `agent.vault().profile()` (con fallback al archivo en disco si el daemon fue reiniciado).
+  - Si el perfil no está presente, rechaza la operación con mensaje accionable:
+    > `"No se ha sincronizado el perfil. Ejecuta 'silverwarden sync' primero."`
+  - Si el perfil existe, inyecta `encrypted_for: Some(profile.id)` en el payload del `Cipher`.
+- **En `sw-cli` y `sw-bitwarden-api`**:
+  - Pruebas unitarias de serialización (`test_cipher_serialization_includes_encrypted_for`) y pruebas de integración con `wiremock` (`test_cli_logins_create_server_success_inserts_item`, `test_cli_logins_create_fails_when_profile_not_synced`).
+
+#### 3. Evidencia Real
+Se verificó la solución contra un servidor Vaultwarden local en Docker. El item de prueba `SmokeTest-Final` fue creado con éxito (código HTTP 200, asignación de UUID en servidor, visualización en la interfaz Web Vault) y posteriormente eliminado limpiamente sin dejar residuos.
+
+---
+
 ## 5. Milestone M5: Servidor SSH Agent (`sw-ssh-agent`)
 
 **Fecha de inicio:** 2026-10-26  
@@ -1657,6 +1683,80 @@ Se corrigió el mecanismo de bypass de aprobación en `DefaultApprovalProvider` 
 | **Cobertura `sw-ssh-agent`** | `cargo llvm-cov -p sw-ssh-agent --lib` | **89.13% líneas / 89.77% regiones** (umbral: ≥85%) |
 
 **Estado:** ✅ SW-045 — Hecho (2026-10-26).
+
+---
+
+### 5.7 Smoke Test y Edge Cases
+
+**Fecha:** 2026-10-30  
+**Objetivo:** Validación integral de robustez, manejo de errores de red y validaciones en los límites (Edge Cases) entre CLI, Daemon IPC y servidor Vaultwarden real.
+
+#### 1. Flujo Completo End-to-End Real
+Secuencia ejecutada desde terminal contra Vaultwarden local con certificado autofirmado (`--insecure`):
+
+1. **Configuración guiada:**
+   ```bash
+   $ silverwarden config setup
+   # Selección: Vaultwarden / Autoalojado -> https://localhost -> Aceptar autofirmados: Sí
+   Configuración guardada exitosamente.
+   ```
+2. **Inicio de sesión y desbloqueo:**
+   ```bash
+   $ silverwarden login --email usuario@ejemplo.com
+   Contraseña maestra: [interactivo, sin eco]
+   Login exitoso. Sesión iniciada.
+
+   $ silverwarden unlock --pin 1234
+   Bóveda desbloqueada exitosamente.
+
+   $ silverwarden sync
+   Sincronización completada. Logins sincronizados: 0.
+   ```
+3. **Creación de Login en servidor:**
+   ```bash
+   $ silverwarden logins create --name "SmokeTest-Final" --username "usuario_prueba" --password "contrasena_secreta"
+   Acceso 'SmokeTest-Final' creado exitosamente.
+   ```
+4. **Listado de Logins:**
+   ```bash
+   $ silverwarden logins list
+   Logins en la bóveda (1):
+     - SmokeTest-Final (usuario: usuario_prueba)
+   ```
+5. **Eliminación de Login en servidor:**
+   ```bash
+   $ silverwarden logins delete --name "SmokeTest-Final"
+   Acceso 'SmokeTest-Final' eliminado exitosamente.
+   ```
+
+#### 2. Validación de Casos Borde y Manejo de Errores (Edge Cases)
+
+- **Eliminación de acceso inexistente:**
+  ```bash
+  $ silverwarden logins delete --name "Inexistente"
+  Error: No se encontró ningún acceso con el nombre 'Inexistente'
+  $ echo $?
+  1
+  ```
+  *Resultado:* Error controlado emitido a `stderr`, salida con código 1 sin panics ni trazas internas.
+
+- **Creación con nombre vacío (Validación local en CLI):**
+  ```bash
+  $ silverwarden logins create --name "" --username "admin" --password "pass"
+  Error: El nombre del acceso no puede estar vacío.
+  $ echo $?
+  1
+  ```
+  *Resultado:* Validación previa antes de enviar petición IPC al agente.
+
+- **Agente caído o socket no disponible:**
+  ```bash
+  $ silverwarden logins list
+  Error: El agente no está corriendo o el socket no existe. Ejecuta 'silverwarden agent start'.
+  $ echo $?
+  1
+  ```
+  *Resultado:* Intercepción de `ErrorKind::NotFound` y `ErrorKind::ConnectionRefused` con mensaje claro y accionable para el usuario.
 
 
 
