@@ -496,7 +496,6 @@ async fn handle_create_login(
         .await
         .ok_or_else(|| "Bóveda bloqueada".to_string())?;
 
-    let cipher_id = uuid::Uuid::new_v4();
     let enc_name = sw_vault::encrypt_with(
         name.as_bytes(),
         sw_vault::EncStringType::AesCbc256HmacSha256B64,
@@ -517,9 +516,12 @@ async fn handle_create_login(
     .map_err(|e| format!("Error al cifrar contraseña: {e}"))?;
 
     let cipher = sw_vault::Cipher {
-        id: Some(cipher_id),
+        id: None,
         r#type: sw_vault::CipherType::Login,
         name: enc_name,
+        favorite: false,
+        reprompt: 0,
+        fields: vec![],
         login: Some(sw_vault::LoginCipher {
             username: Some(enc_user),
             password: Some(enc_pass),

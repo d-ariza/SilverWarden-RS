@@ -167,15 +167,25 @@ pub struct Field {
     pub value: Option<EncString>,
 }
 
+/// Helper function for serde to deserialize a null value as an empty Vec
+pub fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let opt = Option::<Vec<T>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// Login specific payload of a cipher
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginCipher {
     #[serde(default)]
     pub password: Option<EncString>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<EncString>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub uris: Vec<URI>,
     #[serde(default)]
     pub username: Option<EncString>,
@@ -353,47 +363,52 @@ pub struct Profile {
 pub struct Cipher {
     #[serde(default, rename = "type")]
     pub r#type: CipherType,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
     #[serde(default)]
     pub name: EncString,
     #[serde(default)]
-    pub edit: bool,
+    pub notes: Option<EncString>,
     #[serde(default)]
-    pub revision_date: Option<String>,
+    pub favorite: bool,
     #[serde(default)]
-    pub deleted_date: Option<String>,
-
+    pub reprompt: i32,
     #[serde(default)]
     pub folder_id: Option<Uuid>,
     #[serde(default)]
     pub organization_id: Option<Uuid>,
-    #[serde(default)]
-    pub favorite: bool,
-    #[serde(default)]
-    pub attachments: Option<serde_json::Value>,
-    #[serde(default)]
-    pub organization_use_totp: bool,
-    #[serde(default)]
-    pub collection_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub fields: Vec<Field>,
 
+    #[serde(default)]
+    pub login: Option<LoginCipher>,
+    #[serde(default)]
+    pub secure_note: Option<SecureNoteCipher>,
     #[serde(default)]
     pub card: Option<Card>,
     #[serde(default)]
     pub identity: Option<Identity>,
-    #[serde(default)]
-    pub login: Option<LoginCipher>,
-    #[serde(default)]
-    pub notes: Option<EncString>,
-    #[serde(default)]
-    pub secure_note: Option<SecureNoteCipher>,
-    #[serde(default)]
-    pub ssh_key: Option<SSHKeyCipher>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<SSHKeyCipher>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<EncString>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub organization_use_totp: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub collection_ids: Vec<String>,
 }
 
 /// Root data structure returned by Bitwarden `/sync`
