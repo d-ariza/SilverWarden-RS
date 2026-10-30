@@ -424,13 +424,9 @@ impl AuthenticatedClient {
 
     /// Queries the prelogin endpoint to obtain the account's KDF configuration.
     pub async fn prelogin(&self, email: &str) -> Result<sw_crypto::KdfConfig, ApiError> {
-        let api_base = self.api_url.trim_end_matches('/');
-        let url = if api_base.ends_with("/api") {
-            format!("{api_base}/accounts/prelogin")
-        } else {
-            format!("{api_base}/api/accounts/prelogin")
-        };
-        let mut resp = self
+        let identity_base = self.identity_url.trim_end_matches('/');
+        let url = format!("{identity_base}/accounts/prelogin");
+        let resp = self
             .client
             .post(&url)
             .header("User-Agent", BITWARDEN_USER_AGENT)
@@ -440,22 +436,6 @@ impl AuthenticatedClient {
             .json(&serde_json::json!({ "email": email }))
             .send()
             .await?;
-
-        // Fallback for self-hosted / identity endpoint mount
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            let identity_base = self.identity_url.trim_end_matches('/');
-            let alt_url = format!("{identity_base}/accounts/prelogin");
-            resp = self
-                .client
-                .post(&alt_url)
-                .header("User-Agent", BITWARDEN_USER_AGENT)
-                .header("Device-Type", BITWARDEN_DEVICE_TYPE)
-                .header("Bitwarden-Client-Name", BITWARDEN_CLIENT_NAME)
-                .header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION)
-                .json(&serde_json::json!({ "email": email }))
-                .send()
-                .await?;
-        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1082,7 +1062,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .and(header("Content-Type", "application/json"))
             .and(body_string_contains("\"email\":\"test@domain.com\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1313,7 +1293,7 @@ mod tests {
 
         // Step 1: Prelogin mock
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 100000,
@@ -1397,12 +1377,11 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal error"))
             .mount(&server)
             .await;
 
-        // When /api/accounts/prelogin is 500, fallback is NOT triggered (only 404 falls back)
         let client =
             AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
 
@@ -1414,19 +1393,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prelogin_404_fallback_to_identity_mount() {
+    async fn test_prelogin_builds_url_using_identity_url() {
         let server = MockServer::start().await;
 
-        // /api/accounts/prelogin returns 404
-        Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        let custom_identity = format!("{}/custom_identity/mount", server.uri());
+        let dummy_api = format!("{}/dummy_api", server.uri());
 
-        // /accounts/prelogin returns 200
+        // /custom_identity/mount/accounts/prelogin returns 200
         Mock::given(method("POST"))
-            .and(path("/accounts/prelogin"))
+            .and(path("/custom_identity/mount/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 100000,
@@ -1437,7 +1412,7 @@ mod tests {
             .await;
 
         let client =
-            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+            AuthenticatedClient::from_token(&custom_identity, &dummy_api, LoginToken::default());
 
         let kdf_config = client.prelogin("user@example.com").await.unwrap();
         assert_eq!(kdf_config.kdf_type, sw_crypto::KdfType::Pbkdf2);
@@ -1449,7 +1424,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 100000
@@ -1484,7 +1459,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 5000
@@ -1730,7 +1705,7 @@ mod tests {
 
         // Prelogin returning the exact Go parity parameters
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": TEST_KDF_ITERATIONS,

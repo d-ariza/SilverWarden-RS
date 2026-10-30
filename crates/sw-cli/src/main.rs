@@ -129,6 +129,8 @@ pub enum Commands {
 pub enum ConfigCommands {
     /// Show current configuration URLs and login status
     Get,
+    /// Interactively setup server connection and URLs
+    Setup,
     /// Set base server URL (derives identity, api, and notifications URLs)
     SetServer { url: String },
     /// Set identity URL manually
@@ -287,6 +289,129 @@ pub fn resolve_config_path(custom: Option<PathBuf>) -> Result<PathBuf, CliError>
     let home = std::env::var("HOME")
         .map_err(|e| CliError::Config(format!("No se pudo determinar $HOME: {e}")))?;
     Ok(sw_config::get_new_config_path(Path::new(&home)))
+}
+
+/// Helper to parse affirmative or negative user input for boolean prompts.
+pub fn parse_yes_no(input: &str) -> bool {
+    let lower = input.trim().to_lowercase();
+    matches!(lower.as_str(), "s" | "si" | "sí" | "y" | "yes")
+}
+
+/// Helper to read prompts from an arbitrary `BufRead` stream (mockable for tests).
+pub fn prompt_from_io<R: std::io::BufRead, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    msg: &str,
+) -> Result<String, CliError> {
+    write!(writer, "{}", msg).map_err(|e| CliError::Io(e.to_string()))?;
+    writer.flush().map_err(|e| CliError::Io(e.to_string()))?;
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| CliError::Io(e.to_string()))?;
+    Ok(line.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
+/// Interactive guided configuration setup flow.
+pub fn setup_config_flow<P>(
+    mut prompt_fn: P,
+    config: &mut sw_config::ConfigFile,
+) -> Result<(), CliError>
+where
+    P: FnMut(&str) -> Result<String, CliError>,
+{
+    let menu = "¿A qué tipo de servidor deseas conectarte?\n  1) Bitwarden Oficial (Nube)\n  2) Vaultwarden / Autoalojado (Local o propio)\n  3) Configuración Manual (Avanzado)\nSelecciona una opción [1/2/3]: ";
+    let choice = prompt_fn(menu)?;
+    let choice_trimmed = choice.trim().trim_matches(|c: char| !c.is_numeric());
+
+    match choice_trimmed {
+        "1" => {
+            let id_prompt = "Identity URL (por defecto: https://vault.bitwarden.com/identity): ";
+            let id_input = prompt_fn(id_prompt)?;
+            config.identity_url = if id_input.trim().is_empty() {
+                "https://vault.bitwarden.com/identity".to_string()
+            } else {
+                id_input.trim().to_string()
+            };
+
+            let api_prompt = "API URL (por defecto: https://api.bitwarden.com): ";
+            let api_input = prompt_fn(api_prompt)?;
+            config.api_url = if api_input.trim().is_empty() {
+                "https://api.bitwarden.com".to_string()
+            } else {
+                api_input.trim().to_string()
+            };
+
+            let notif_prompt =
+                "Notifications URL (por defecto: https://notifications.bitwarden.com): ";
+            let notif_input = prompt_fn(notif_prompt)?;
+            config.notifications_url = if notif_input.trim().is_empty() {
+                "https://notifications.bitwarden.com".to_string()
+            } else {
+                notif_input.trim().to_string()
+            };
+
+            config.danger_accept_invalid_certs = false;
+        }
+        "2" => {
+            let base_prompt =
+                "URL base de tu servidor (ej. https://localhost o https://mi-vaultwarden.com): ";
+            let base_input = prompt_fn(base_prompt)?;
+            let base = base_input.trim();
+            if base.is_empty() {
+                return Err(CliError::Other(
+                    "La URL del servidor no puede estar vacía.".to_string(),
+                ));
+            }
+            config.set_server(base);
+
+            let cert_prompt = "¿Usas un certificado autofirmado (self-signed)? (s/N): ";
+            let cert_ans = prompt_fn(cert_prompt)?;
+            config.danger_accept_invalid_certs = parse_yes_no(&cert_ans);
+        }
+        "3" => {
+            let id_prompt = "Identity URL: ";
+            let id_input = prompt_fn(id_prompt)?;
+            let id_trimmed = id_input.trim();
+            if id_trimmed.is_empty() {
+                return Err(CliError::Other(
+                    "La Identity URL no puede estar vacía.".to_string(),
+                ));
+            }
+            config.identity_url = id_trimmed.to_string();
+
+            let api_prompt = "API URL: ";
+            let api_input = prompt_fn(api_prompt)?;
+            let api_trimmed = api_input.trim();
+            if api_trimmed.is_empty() {
+                return Err(CliError::Other(
+                    "La API URL no puede estar vacía.".to_string(),
+                ));
+            }
+            config.api_url = api_trimmed.to_string();
+
+            let notif_prompt = "Notifications URL: ";
+            let notif_input = prompt_fn(notif_prompt)?;
+            let notif_trimmed = notif_input.trim();
+            if notif_trimmed.is_empty() {
+                return Err(CliError::Other(
+                    "La Notifications URL no puede estar vacía.".to_string(),
+                ));
+            }
+            config.notifications_url = notif_trimmed.to_string();
+
+            let cert_prompt = "¿Usas un certificado autofirmado (self-signed)? (s/N): ";
+            let cert_ans = prompt_fn(cert_prompt)?;
+            config.danger_accept_invalid_certs = parse_yes_no(&cert_ans);
+        }
+        _ => {
+            return Err(CliError::Other(
+                "Opción inválida. Selecciona 1, 2 o 3.".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Executes a CLI command, returning human-readable output or an error.
@@ -454,25 +579,31 @@ where
                 sw_config::ConfigFile::default()
             };
 
+            // Read saved configuration directly. CLI flags only override for this execution without mutating saved URLs.
+            let mut active_identity_url = config.identity_url.clone();
+            let mut active_api_url = config.api_url.clone();
+            let mut active_insecure = config.danger_accept_invalid_certs;
+
             if let Some(srv) = server {
                 if srv.trim().is_empty() {
                     return Err(CliError::Other(
                         "La URL del servidor no puede estar vacía.".to_string(),
                     ));
                 }
-                config.set_server(srv);
+                let (derived_id, derived_api, _) = sw_config::derive_server_urls(srv);
+                active_identity_url = derived_id;
+                active_api_url = derived_api;
             }
 
-            let insecure = cli.insecure || config.danger_accept_invalid_certs;
             if cli.insecure {
-                config.danger_accept_invalid_certs = true;
+                active_insecure = true;
             }
 
             let client = sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
-                &config.identity_url,
-                &config.api_url,
+                &active_identity_url,
+                &active_api_url,
                 Default::default(),
-                insecure,
+                active_insecure,
             );
             let (token, user_symmetric_key) = client
                 .login(&email_val, &password_val, &config.device_uuid)
@@ -513,9 +644,9 @@ where
                     serde_json::json!({
                         "token": token,
                         "user_symmetric_key": b64_sym_key,
-                        "identity_url": config.identity_url,
-                        "api_url": config.api_url,
-                        "danger_accept_invalid_certs": config.danger_accept_invalid_certs,
+                        "identity_url": active_identity_url,
+                        "api_url": active_api_url,
+                        "danger_accept_invalid_certs": active_insecure,
                     }),
                 )
                 .await;
@@ -680,6 +811,24 @@ where
                         status_login
                     ))
                 }
+                ConfigCommands::Setup => {
+                    setup_config_flow(&mut prompt_fn, &mut config)?;
+                    config
+                        .save_to_file(&config_path)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    let status_insecure = if config.danger_accept_invalid_certs {
+                        "Sí"
+                    } else {
+                        "No"
+                    };
+                    Ok(format!(
+                        "Configuración guardada exitosamente:\n  Identity URL:      {}\n  API URL:           {}\n  Notifications URL: {}\n  Aceptar certs inv: {}",
+                        config.identity_url,
+                        config.api_url,
+                        config.notifications_url,
+                        status_insecure
+                    ))
+                }
                 ConfigCommands::SetServer { url } => {
                     if url.trim().is_empty() {
                         return Err(CliError::Other(
@@ -747,8 +896,25 @@ async fn main() {
     let cli = Cli::parse();
     check_goldwarden_go_conflict();
 
-    let prompt =
-        |msg: &str| rpassword::prompt_password(msg).map_err(|e| CliError::Io(e.to_string()));
+    let prompt = |msg: &str| -> Result<String, CliError> {
+        let is_secret = msg.to_lowercase().contains("contraseña")
+            || msg.to_lowercase().contains("password")
+            || msg.to_lowercase().contains("pin");
+        if is_secret {
+            rpassword::prompt_password(msg).map_err(|e| CliError::Io(e.to_string()))
+        } else {
+            use std::io::{self, Write};
+            print!("{msg}");
+            io::stdout()
+                .flush()
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            Ok(input.trim_end_matches(&['\r', '\n'][..]).to_string())
+        }
+    };
 
     match handle_command(&cli, prompt).await {
         Ok(msg) => {
@@ -1379,7 +1545,7 @@ mod tests {
 
         // Prelogin endpoint returns KdfInformation
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 10
@@ -1820,7 +1986,7 @@ mod tests {
         let password = "super_master_password";
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 10
@@ -1873,7 +2039,7 @@ mod tests {
         let password = "wrong_password";
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 10
@@ -2131,9 +2297,9 @@ mod tests {
         let email = "vaultwarden_user@example.com";
         let password = "super_vaultwarden_password";
 
-        // Prelogin endpoint (derived as {base_url}/api/accounts/prelogin or /accounts/prelogin)
+        // Prelogin endpoint (derived as {base_url}/identity/accounts/prelogin)
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/identity/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 10
@@ -2174,6 +2340,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_file_path = temp_dir.path().join("silverwarden.json");
 
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: "https://initial.vault/identity".to_string(),
+            api_url: "https://initial.vault/api".to_string(),
+            notifications_url: "https://initial.vault/notifications".to_string(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
         let cli = Cli {
             socket: Some(temp_dir.path().join("dummy.sock")),
             config: Some(config_file_path.clone()),
@@ -2192,13 +2366,13 @@ mod tests {
             result.err()
         );
 
-        // Verify config file was updated with derived server URLs
+        // Verify config file was NOT overwritten with server URLs (flag only applies for execution)
         let saved_config = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
-        assert_eq!(saved_config.identity_url, format!("{base_url}/identity"));
-        assert_eq!(saved_config.api_url, format!("{base_url}/api"));
+        assert_eq!(saved_config.identity_url, "https://initial.vault/identity");
+        assert_eq!(saved_config.api_url, "https://initial.vault/api");
         assert_eq!(
             saved_config.notifications_url,
-            format!("{base_url}/notifications")
+            "https://initial.vault/notifications"
         );
         assert!(saved_config.is_logged_in());
     }
@@ -2235,7 +2409,7 @@ mod tests {
         let password = "super_insecure_password";
 
         Mock::given(method("POST"))
-            .and(path("/api/accounts/prelogin"))
+            .and(path("/accounts/prelogin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kdf": 0,
                 "kdfIterations": 10
@@ -2298,6 +2472,155 @@ mod tests {
         assert!(result.is_ok(), "Login with --insecure should succeed");
 
         let saved = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
-        assert!(saved.danger_accept_invalid_certs);
+        assert!(!saved.danger_accept_invalid_certs);
+        assert!(saved.is_logged_in());
+    }
+
+    #[test]
+    fn test_config_setup_option1_bitwarden_defaults() {
+        let input_bytes = b"1\n\n\n\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let mut config = sw_config::ConfigFile::default();
+        let prompt_fn = |msg: &str| prompt_from_io(&mut reader, &mut writer, msg);
+
+        setup_config_flow(prompt_fn, &mut config).expect("Option 1 setup should succeed");
+
+        assert_eq!(config.identity_url, "https://vault.bitwarden.com/identity");
+        assert_eq!(config.api_url, "https://api.bitwarden.com");
+        assert_eq!(
+            config.notifications_url,
+            "https://notifications.bitwarden.com"
+        );
+        assert!(!config.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_config_setup_option1_bitwarden_custom_urls() {
+        let input_bytes = b"1\nhttps://custom.vault/identity\nhttps://custom.vault/api\nhttps://custom.vault/notifications\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let mut config = sw_config::ConfigFile::default();
+        let prompt_fn = |msg: &str| prompt_from_io(&mut reader, &mut writer, msg);
+
+        setup_config_flow(prompt_fn, &mut config).expect("Option 1 custom setup should succeed");
+
+        assert_eq!(config.identity_url, "https://custom.vault/identity");
+        assert_eq!(config.api_url, "https://custom.vault/api");
+        assert_eq!(
+            config.notifications_url,
+            "https://custom.vault/notifications"
+        );
+        assert!(!config.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_config_setup_option2_vaultwarden_self_signed() {
+        let input_bytes = b"2\nhttps://vw.local:8443\ns\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let mut config = sw_config::ConfigFile::default();
+        let prompt_fn = |msg: &str| prompt_from_io(&mut reader, &mut writer, msg);
+
+        setup_config_flow(prompt_fn, &mut config).expect("Option 2 setup should succeed");
+
+        assert_eq!(config.identity_url, "https://vw.local:8443/identity");
+        assert_eq!(config.api_url, "https://vw.local:8443/api");
+        assert_eq!(
+            config.notifications_url,
+            "https://vw.local:8443/notifications"
+        );
+        assert!(config.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_config_setup_option2_vaultwarden_official_certs() {
+        let input_bytes = b"2\nhttps://vw.example.com\nn\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let mut config = sw_config::ConfigFile::default();
+        let prompt_fn = |msg: &str| prompt_from_io(&mut reader, &mut writer, msg);
+
+        setup_config_flow(prompt_fn, &mut config).expect("Option 2 setup should succeed");
+
+        assert_eq!(config.identity_url, "https://vw.example.com/identity");
+        assert_eq!(config.api_url, "https://vw.example.com/api");
+        assert_eq!(
+            config.notifications_url,
+            "https://vw.example.com/notifications"
+        );
+        assert!(!config.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn test_config_setup_option3_manual() {
+        let input_bytes =
+            b"3\nhttps://auth.company.lan\nhttps://api.company.lan\nhttps://ws.company.lan\ns\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let mut config = sw_config::ConfigFile::default();
+        let prompt_fn = |msg: &str| prompt_from_io(&mut reader, &mut writer, msg);
+
+        setup_config_flow(prompt_fn, &mut config).expect("Option 3 setup should succeed");
+
+        assert_eq!(config.identity_url, "https://auth.company.lan");
+        assert_eq!(config.api_url, "https://api.company.lan");
+        assert_eq!(config.notifications_url, "https://ws.company.lan");
+        assert!(config.danger_accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_cli_config_setup_and_get_integration() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let input_bytes = b"2\nhttps://vault.company.lan\ns\n";
+        let mut reader = std::io::Cursor::new(input_bytes);
+        let mut writer = Vec::new();
+
+        let cli_setup = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::Setup,
+            },
+        };
+
+        let output = handle_command(&cli_setup, |msg| {
+            prompt_from_io(&mut reader, &mut writer, msg)
+        })
+        .await
+        .expect("config setup should succeed");
+
+        assert!(output.contains("Configuración guardada exitosamente:"));
+        assert!(output.contains("Identity URL:      https://vault.company.lan/identity"));
+        assert!(output.contains("Aceptar certs inv: Sí"));
+
+        // Now run config get to verify full display of URLs and certs
+        let cli_get = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::Get,
+            },
+        };
+
+        let get_output = handle_command(&cli_get, |_| unreachable!())
+            .await
+            .expect("config get should succeed");
+
+        assert!(get_output.contains("Configuración actual:"));
+        assert!(get_output.contains("Identity URL:      https://vault.company.lan/identity"));
+        assert!(get_output.contains("API URL:           https://vault.company.lan/api"));
+        assert!(get_output.contains("Notifications URL: https://vault.company.lan/notifications"));
+        assert!(get_output.contains("Aceptar certs inv: Sí"));
+        assert!(get_output.contains("Sesión iniciada:   No"));
     }
 }
