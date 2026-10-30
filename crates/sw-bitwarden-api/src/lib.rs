@@ -560,6 +560,154 @@ impl AuthenticatedClient {
         Ok((token, user_symmetric_key))
     }
 
+    /// Authenticates using Bitwarden API credentials (`client_id` and `client_secret`) against `/connect/token`.
+    pub async fn login_with_api_key(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        device_uuid: &str,
+    ) -> Result<LoginToken, ApiError> {
+        let url = format!("{}/connect/token", self.identity_url.trim_end_matches('/'));
+
+        let params = [
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "api"),
+            ("deviceType", BITWARDEN_DEVICE_TYPE),
+            ("deviceIdentifier", device_uuid),
+        ];
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("User-Agent", BITWARDEN_USER_AGENT)
+            .header("Device-Type", BITWARDEN_DEVICE_TYPE)
+            .header("Bitwarden-Client-Name", BITWARDEN_CLIENT_NAME)
+            .header("Bitwarden-Client-Version", BITWARDEN_CLIENT_VERSION)
+            .form(&params)
+            .send()
+            .await
+            .map_err(ApiError::Reqwest)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ApiError::RateLimitExceeded);
+            }
+
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::BAD_REQUEST
+            {
+                return Err(ApiError::Auth(format!(
+                    "Credenciales de API Key inválidas ({status}): {body}"
+                )));
+            }
+
+            return Err(ApiError::Auth(format!(
+                "Login with API key failed with status {status}: {body}"
+            )));
+        }
+
+        let token: LoginToken = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Auth(format!("Failed to parse login token response: {e}")))?;
+
+        // Update stored token in client
+        *self.token.lock().await = token.clone();
+
+        Ok(token)
+    }
+
+    /// Full end-to-end API Key login orchestration:
+    /// login_with_api_key -> prelogin -> derive master key -> stretch key -> decrypt_enc_key.
+    ///
+    /// Returns the active `LoginToken` and the decrypted 64-byte user symmetric key.
+    pub async fn login_api_key(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        email: &str,
+        password: &str,
+        device_uuid: &str,
+    ) -> Result<(LoginToken, Vec<u8>), ApiError> {
+        let token = self
+            .login_with_api_key(client_id, client_secret, device_uuid)
+            .await?;
+
+        if token.key.is_empty() {
+            return Err(ApiError::Auth(
+                "Login with API key succeeded but server did not return an encryption key"
+                    .to_string(),
+            ));
+        }
+
+        let kdf_config = self.prelogin(email).await?;
+        let master_key = sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config)?;
+        let stretched_sym_key = sw_crypto::stretch_key(&master_key)?;
+        let user_symmetric_key = decrypt_enc_key(&token.key, &stretched_sym_key.bytes())?;
+
+        Ok((token, user_symmetric_key))
+    }
+
+    /// Completes a 2FA challenge and decrypts the user symmetric key with the master password.
+    pub async fn complete_2fa(
+        &self,
+        email: &str,
+        password: &str,
+        two_factor_token: &str,
+        code: &str,
+        provider: i32,
+        device_uuid: &str,
+    ) -> Result<(LoginToken, Vec<u8>), ApiError> {
+        let kdf_config = self.prelogin(email).await?;
+        let master_key = sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config)?;
+        let master_password_hash = derive_master_password_hash(master_key.as_slice(), password);
+        let stretched_sym_key = sw_crypto::stretch_key(&master_key)?;
+        let stretched_bytes = stretched_sym_key.bytes();
+
+        let token = match provider {
+            0 => {
+                self.complete_totp(
+                    email,
+                    &master_password_hash,
+                    two_factor_token,
+                    code,
+                    device_uuid,
+                )
+                .await?
+            }
+            1 => {
+                self.complete_email(
+                    email,
+                    &master_password_hash,
+                    two_factor_token,
+                    code,
+                    device_uuid,
+                )
+                .await?
+            }
+            other => {
+                return Err(ApiError::NotImplemented(format!(
+                    "Proveedor 2FA no soportado: {other}"
+                )));
+            }
+        };
+
+        if token.key.is_empty() {
+            return Err(ApiError::Auth(
+                "El servidor no devolvió una clave de cifrado (Key) tras el 2FA".to_string(),
+            ));
+        }
+
+        let user_symmetric_key = decrypt_enc_key(&token.key, &stretched_bytes)?;
+        Ok((token, user_symmetric_key))
+    }
+
     /// Fetches the full synchronization data (`SyncData`) from the Bitwarden `/sync` endpoint.
     ///
     /// Automatically handles fallback between `/sync` and `/api/sync` for compatibility
@@ -811,6 +959,32 @@ pub async fn login(
     client.login(email, password, device_uuid).await
 }
 
+/// Standalone convenience wrapper for `AuthenticatedClient::login_with_api_key`.
+pub async fn login_with_api_key(
+    client: &AuthenticatedClient,
+    client_id: &str,
+    client_secret: &str,
+    device_uuid: &str,
+) -> Result<LoginToken, ApiError> {
+    client
+        .login_with_api_key(client_id, client_secret, device_uuid)
+        .await
+}
+
+/// Standalone convenience wrapper for `AuthenticatedClient::login_api_key`.
+pub async fn login_api_key(
+    client: &AuthenticatedClient,
+    client_id: &str,
+    client_secret: &str,
+    email: &str,
+    password: &str,
+    device_uuid: &str,
+) -> Result<(LoginToken, Vec<u8>), ApiError> {
+    client
+        .login_api_key(client_id, client_secret, email, password, device_uuid)
+        .await
+}
+
 /// Standalone convenience wrapper for `AuthenticatedClient::sync`.
 pub async fn sync(client: &AuthenticatedClient) -> Result<sw_vault::SyncData, ApiError> {
     client.sync().await
@@ -858,6 +1032,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             refresh_token: "refresh_123".to_string(),
             key: "key_abc".to_string(),
+            ..Default::default()
         };
 
         let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
@@ -920,6 +1095,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             refresh_token: "valid_refresh_token".to_string(),
             key: "preserved_key".to_string(),
+            ..Default::default()
         };
 
         let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
@@ -964,6 +1140,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             refresh_token: "invalid_refresh_token".to_string(),
             key: "key".to_string(),
+            ..Default::default()
         };
 
         let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
@@ -2308,5 +2485,132 @@ mod tests {
         );
         let resp = insecure_res.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_login_with_api_key_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("client_id=user.test-client-id"))
+            .and(body_string_contains("client_secret=test-client-secret"))
+            .and(body_string_contains("scope=api"))
+            .and(body_string_contains("deviceType=10"))
+            .and(body_string_contains("deviceIdentifier=test-device-uuid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "api_key_access_token_123",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "api_key_refresh_token_456",
+                "Key": "sample_enc_key"
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let token = client
+            .login_with_api_key(
+                "user.test-client-id",
+                "test-client-secret",
+                "test-device-uuid",
+            )
+            .await
+            .expect("login_with_api_key should succeed");
+
+        assert_eq!(token.access_token, "api_key_access_token_123");
+        assert_eq!(token.expires_in, 3600);
+        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.key, "sample_enc_key");
+        assert_eq!(
+            client.token().lock().await.access_token,
+            "api_key_access_token_123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_with_api_key_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid_client\"}"),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let res = client
+            .login_with_api_key("bad_id", "bad_secret", "uuid")
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("invalid_client"));
+    }
+
+    #[tokio::test]
+    async fn test_login_api_key_orchestration_success() {
+        let server = MockServer::start().await;
+        let email = "user@example.com";
+        let password = "masterpassword123";
+        let device_uuid = "device-1234";
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 600_000,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key = sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config)
+            .expect("master key");
+        let stretched = sw_crypto::stretch_key(&master_key).expect("stretched");
+
+        let raw_user_sym_key = [77u8; 64];
+        let enc_key = sw_vault::encrypt_with(
+            &raw_user_sym_key,
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .expect("encrypted enc_key")
+        .to_string_repr()
+        .expect("repr");
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_api_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_api_refresh",
+                "Key": enc_key
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 600000
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            AuthenticatedClient::from_token(server.uri(), server.uri(), LoginToken::default());
+
+        let (token, user_sym_key) = client
+            .login_api_key("client_id", "client_secret", email, password, device_uuid)
+            .await
+            .expect("login_api_key orchestration should succeed");
+
+        assert_eq!(token.access_token, "mock_api_token");
+        assert_eq!(user_sym_key, raw_user_sym_key);
     }
 }

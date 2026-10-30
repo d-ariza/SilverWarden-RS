@@ -135,3 +135,4 @@ Estos son los JSON exactos que Vaultwarden espera en el endpoint `POST /api/ciph
 
 **Endpoint:** `GET https://api.pwnedpasswords.com/range/{primeros_5_chars_sha1}`  
 **Uso:** Se calcula el SHA-1 de la contraseña, se envían los primeros 5 caracteres, y la API responde con los sufijos de los hashes comprometidos. Si el sufijo coincide, la contraseña está filtrada. No envía la contraseña completa.
+

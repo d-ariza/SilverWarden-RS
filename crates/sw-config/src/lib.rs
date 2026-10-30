@@ -367,6 +367,42 @@ impl ConfigFile {
         Ok(())
     }
 
+    /// Encrypts and sets the API client ID using the derived key.
+    pub fn set_client_id(&mut self, client_id: &str, key: &[u8; 32]) -> Result<(), ConfigError> {
+        self.encrypted_client_id = encrypt_string(client_id, key)?;
+        Ok(())
+    }
+
+    /// Decrypts the API client ID using the derived key.
+    pub fn decrypt_client_id(&self, key: &[u8; 32]) -> Result<String, ConfigError> {
+        if self.encrypted_client_id.is_empty() {
+            return Err(ConfigError::Crypto(
+                "EncryptedClientID is empty".to_string(),
+            ));
+        }
+        decrypt_string(&self.encrypted_client_id, key)
+    }
+
+    /// Encrypts and sets the API client secret using the derived key.
+    pub fn set_client_secret(
+        &mut self,
+        client_secret: &str,
+        key: &[u8; 32],
+    ) -> Result<(), ConfigError> {
+        self.encrypted_client_secret = encrypt_string(client_secret, key)?;
+        Ok(())
+    }
+
+    /// Decrypts the API client secret using the derived key.
+    pub fn decrypt_client_secret(&self, key: &[u8; 32]) -> Result<String, ConfigError> {
+        if self.encrypted_client_secret.is_empty() {
+            return Err(ConfigError::Crypto(
+                "EncryptedClientSecret is empty".to_string(),
+            ));
+        }
+        decrypt_string(&self.encrypted_client_secret, key)
+    }
+
     /// Decrypts the raw user symmetric key bytes using the derived key.
     pub fn decrypt_user_symmetric_key(&self, key: &[u8; 32]) -> Result<Vec<u8>, ConfigError> {
         if self.encrypted_user_symmetric_key.is_empty() {
@@ -454,6 +490,14 @@ pub struct LoginToken {
     pub refresh_token: String,
     #[serde(default, alias = "Key")]
     pub key: String,
+    #[serde(default, alias = "Kdf")]
+    pub kdf: Option<i32>,
+    #[serde(default, alias = "KdfIterations")]
+    pub kdf_iterations: Option<u32>,
+    #[serde(default, alias = "KdfMemory")]
+    pub kdf_memory: Option<u32>,
+    #[serde(default, alias = "KdfParallelism")]
+    pub kdf_parallelism: Option<u32>,
 }
 
 pub const MIGRATION_SUCCESS_MSG: &str =
@@ -1073,6 +1117,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             refresh_token: "mock_refresh".to_string(),
             key: "mock_key".to_string(),
+            ..Default::default()
         };
         let token_json = serde_json::to_string(&token).unwrap();
         let enc_token = encrypt_string(&token_json, &key).unwrap();
@@ -1364,6 +1409,23 @@ mod tests {
         assert_eq!(
             cfg.notifications_url,
             "https://vaultwarden.local:8443/notifications"
+        );
+    }
+
+    #[test]
+    fn test_client_id_and_secret_encryption_helpers() {
+        let key = [88u8; 32];
+        let mut cfg = ConfigFile::default();
+        assert!(cfg.decrypt_client_id(&key).is_err());
+        assert!(cfg.decrypt_client_secret(&key).is_err());
+
+        cfg.set_client_id("user.client-id-1234", &key).unwrap();
+        cfg.set_client_secret("secret_token_5678", &key).unwrap();
+
+        assert_eq!(cfg.decrypt_client_id(&key).unwrap(), "user.client-id-1234");
+        assert_eq!(
+            cfg.decrypt_client_secret(&key).unwrap(),
+            "secret_token_5678"
         );
     }
 

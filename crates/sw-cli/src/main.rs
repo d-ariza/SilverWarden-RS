@@ -97,6 +97,18 @@ pub enum Commands {
         /// Base server URL (e.g. http://localhost:8080)
         #[arg(long)]
         server: Option<String>,
+
+        /// Login using API Key (client_id and client_secret)
+        #[arg(long = "apikey", alias = "api-key")]
+        apikey: bool,
+
+        /// Bitwarden API Key Client ID
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+
+        /// Bitwarden API Key Client Secret
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
     },
     /// Force vault synchronization with server
     Sync,
@@ -575,16 +587,10 @@ where
             email,
             password,
             server,
+            apikey,
+            client_id,
+            client_secret,
         } => {
-            let email_val = match email {
-                Some(e) => e.clone(),
-                None => prompt_fn("Introduce tu email de Bitwarden: ")?,
-            };
-            let password_val = match password {
-                Some(p) => p.clone(),
-                None => prompt_fn("Introduce tu contraseña maestra: ")?,
-            };
-
             let config_path = resolve_config_path(cli.config.clone())?;
             let mut config = if config_path.exists() {
                 sw_config::ConfigFile::load_from_file(&config_path)
@@ -619,10 +625,133 @@ where
                 Default::default(),
                 active_insecure,
             );
-            let (token, user_symmetric_key) = client
-                .login(&email_val, &password_val, &config.device_uuid)
-                .await
-                .map_err(|e| CliError::Other(e.to_string()))?;
+
+            let (
+                token,
+                user_symmetric_key,
+                display_user,
+                resolved_client_id,
+                resolved_client_secret,
+            ) = if *apikey {
+                let cid = match client_id {
+                    Some(c) => c.clone(),
+                    None => match std::env::var("BW_CLIENTID") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu client_id de Bitwarden: ")?,
+                    },
+                };
+                let csecret = match client_secret {
+                    Some(s) => s.clone(),
+                    None => match std::env::var("BW_CLIENTSECRET") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu client_secret de Bitwarden: ")?,
+                    },
+                };
+                let email_val = match email {
+                    Some(e) => e.clone(),
+                    None => match std::env::var("BW_EMAIL") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu email de Bitwarden: ")?,
+                    },
+                };
+                let password_val = match password {
+                    Some(p) => p.clone(),
+                    None => match std::env::var("BW_PASSWORD") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu contraseña maestra: ")?,
+                    },
+                };
+
+                let (token, sym_key) = client
+                    .login_api_key(
+                        &cid,
+                        &csecret,
+                        &email_val,
+                        &password_val,
+                        &config.device_uuid,
+                    )
+                    .await
+                    .map_err(|e| CliError::Other(e.to_string()))?;
+
+                (token, sym_key, email_val, Some(cid), Some(csecret))
+            } else {
+                let email_val = match email {
+                    Some(e) => e.clone(),
+                    None => match std::env::var("BW_EMAIL") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu email de Bitwarden: ")?,
+                    },
+                };
+                let password_val = match password {
+                    Some(p) => p.clone(),
+                    None => match std::env::var("BW_PASSWORD") {
+                        Ok(val) if !val.trim().is_empty() => val,
+                        _ => prompt_fn("Introduce tu contraseña maestra: ")?,
+                    },
+                };
+
+                let login_res = client
+                    .login(&email_val, &password_val, &config.device_uuid)
+                    .await;
+
+                let (token, sym_key) = match login_res {
+                    Ok(pair) => pair,
+                    Err(sw_bitwarden_api::ApiError::TwoFactorRequired {
+                        providers,
+                        token: two_factor_token,
+                    }) => {
+                        println!("El servidor requiere autenticación en dos pasos.");
+                        println!("Métodos disponibles:");
+                        let mut opt_strs = Vec::new();
+                        if providers.is_empty() || providers.contains(&0) {
+                            println!("  0) TOTP (App autenticadora)");
+                            opt_strs.push("0");
+                        }
+                        if providers.contains(&1) {
+                            println!("  1) Email (código enviado a tu correo)");
+                            opt_strs.push("1");
+                        }
+                        if opt_strs.is_empty() {
+                            println!("  0) TOTP (App autenticadora)");
+                            opt_strs.push("0");
+                        }
+
+                        let prompt_msg = format!("Selecciona un método [{}]: ", opt_strs.join("/"));
+                        let choice = prompt_fn(&prompt_msg)?.trim().to_string();
+                        let selected_provider: i32 = match choice.as_str() {
+                            "1" if opt_strs.contains(&"1") => 1,
+                            "0" | "" => 0,
+                            other => other.parse().unwrap_or(0),
+                        };
+
+                        if selected_provider == 1 {
+                            println!("Enviando código de verificación a tu correo...");
+                            if let Err(e) = client
+                                .send_two_factor_email_login(&email_val, &config.device_uuid)
+                                .await
+                            {
+                                eprintln!("Aviso al solicitar código por correo: {e}");
+                            }
+                        }
+
+                        let code = prompt_fn("Introduce el código de verificación de 6 dígitos: ")?;
+                        client
+                            .complete_2fa(
+                                &email_val,
+                                &password_val,
+                                &two_factor_token,
+                                code.trim(),
+                                selected_provider,
+                                &config.device_uuid,
+                            )
+                            .await
+                            .map_err(|e| CliError::Other(e.to_string()))?
+                    }
+                    Err(e) => return Err(CliError::Other(e.to_string())),
+                };
+
+                (token, sym_key, email_val, None, None)
+            };
 
             let config_key = if config.config_key_hash.is_empty() {
                 sw_config::derive_config_key_with_params(
@@ -644,6 +773,18 @@ where
             config
                 .set_user_symmetric_key(&user_symmetric_key, &config_key)
                 .map_err(|e| CliError::Config(e.to_string()))?;
+
+            if let Some(cid) = resolved_client_id {
+                config
+                    .set_client_id(&cid, &config_key)
+                    .map_err(|e| CliError::Config(e.to_string()))?;
+            }
+            if let Some(csecret) = resolved_client_secret {
+                config
+                    .set_client_secret(&csecret, &config_key)
+                    .map_err(|e| CliError::Config(e.to_string()))?;
+            }
+
             config
                 .save_to_file(&config_path)
                 .map_err(|e| CliError::Io(e.to_string()))?;
@@ -669,7 +810,7 @@ where
                 .await;
             }
 
-            Ok(format!("Sesión iniciada con éxito para {email_val}."))
+            Ok(format!("Sesión iniciada con éxito para {display_user}."))
         }
         Commands::Sync => {
             let config_path = resolve_config_path(cli.config.clone())?;
@@ -1112,6 +1253,9 @@ mod tests {
                 email: Some("test@test.com".to_string()),
                 password: Some("mypass".to_string()),
                 server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             }
         );
     }
@@ -1133,6 +1277,34 @@ mod tests {
                 email: Some("user@vaultwarden.local".to_string()),
                 password: None,
                 server: Some("http://localhost:8080".to_string()),
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_login_with_apikey() {
+        let cli = Cli::try_parse_from([
+            "silverwarden",
+            "login",
+            "--apikey",
+            "--client-id",
+            "user.123",
+            "--client-secret",
+            "secret456",
+        ])
+        .expect("Should parse login with apikey");
+        assert_eq!(
+            cli.command,
+            Commands::Login {
+                email: None,
+                password: None,
+                server: None,
+                apikey: true,
+                client_id: Some("user.123".to_string()),
+                client_secret: Some("secret456".to_string()),
             }
         );
     }
@@ -1642,6 +1814,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -2056,6 +2231,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -2112,6 +2290,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -2394,6 +2575,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: Some(base_url.clone()),
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -2503,6 +2687,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -2773,6 +2960,9 @@ mod tests {
                 email: Some(email.to_string()),
                 password: Some(password.to_string()),
                 server: Some(base_url.clone()),
+                apikey: false,
+                client_id: None,
+                client_secret: None,
             },
         };
 
@@ -3108,5 +3298,228 @@ mod tests {
         );
 
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_interactive_2fa_totp_success() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user2fa@example.com";
+        let password = "password123";
+
+        // Prelogin endpoint
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        // 1. Initial login fails with 2FA required challenge
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {
+                    "0": {}
+                },
+                "twoFactorToken": "challenge_token_2fa_xyz"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // 2. 2FA completion returns access token with encrypted key
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_2fa_access_token_123",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_2fa_refresh_token_456",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("0".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("123456".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Interactive 2FA login should succeed: {:?}",
+            result.err()
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("Sesión iniciada con éxito"));
+
+        let saved_cfg = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
+        assert!(saved_cfg.is_logged_in());
+        assert!(!saved_cfg.encrypted_token.is_empty());
+        assert!(!saved_cfg.encrypted_user_symmetric_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_api_key_success() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "apiuser@example.com";
+        let password = "masterpassword123";
+        let client_id = "user.api_client_test";
+        let client_secret = "secret_api_key_value";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [9u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("scope=api"))
+            .and(body_string_contains("client_id=user.api_client_test"))
+            .and(body_string_contains("client_secret=secret_api_key_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_api_access_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_api_refresh_token",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: true,
+                client_id: Some(client_id.to_string()),
+                client_secret: Some(client_secret.to_string()),
+            },
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            result.is_ok(),
+            "API key login should succeed: {:?}",
+            result.err()
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("Sesión iniciada con éxito"));
+
+        let saved_cfg = sw_config::ConfigFile::load_from_file(&config_file_path).unwrap();
+        assert!(saved_cfg.is_logged_in());
+        assert!(!saved_cfg.encrypted_token.is_empty());
+        assert!(!saved_cfg.encrypted_user_symmetric_key.is_empty());
+
+        let config_key = sw_config::derive_config_key_with_params(
+            "",
+            &saved_cfg.device_uuid,
+            CLI_KDF_MEMORY_KIB,
+        )
+        .unwrap();
+        assert_eq!(saved_cfg.decrypt_client_id(&config_key).unwrap(), client_id);
+        assert_eq!(
+            saved_cfg.decrypt_client_secret(&config_key).unwrap(),
+            client_secret
+        );
     }
 }
