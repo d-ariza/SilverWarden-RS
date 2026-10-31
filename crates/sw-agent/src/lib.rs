@@ -369,10 +369,10 @@ async fn handle_sync(
         return Err("No hay sesión iniciada. Ejecuta 'silverwarden login' primero.".to_string());
     }
 
-    let agent = state
-        .vault_agent
-        .as_ref()
-        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
 
     let client = state.api_client.as_ref().or_else(|| agent.api_client());
     if let Some(c) = client {
@@ -404,14 +404,47 @@ async fn handle_sync(
     }))
 }
 
+async fn handle_sync_data(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sync_data: sw_vault::SyncData = serde_json::from_value(payload.clone())
+        .map_err(|e| format!("Error deserializando SyncData: {e}"))?;
+
+    if let Some(vp) = state.vault_path() {
+        let _ = sw_vault::save_vault(&vp, &sync_data);
+    }
+
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
+
+    // Load sync data into the agent's VaultStore without modifying existing user_symmetric_key in memory
+    agent.vault().load_sync_data(sync_data).await;
+
+    let logins = agent
+        .vault()
+        .all()
+        .await
+        .into_iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+        .count();
+
+    Ok(serde_json::json!({
+        "status": "synced",
+        "logins": logins,
+    }))
+}
+
 async fn handle_list_logins(state: &AgentState) -> Result<serde_json::Value, String> {
     if state.is_locked {
         return Err("Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero.".to_string());
     }
-    let agent = state
-        .vault_agent
-        .as_ref()
-        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
     let sym_key = agent
         .get_symmetric_key()
         .await
@@ -446,10 +479,10 @@ async fn handle_get_login(
         .or_else(|| payload.as_str())
         .ok_or_else(|| "Campo 'name' requerido".to_string())?;
 
-    let agent = state
-        .vault_agent
-        .as_ref()
-        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
     let sym_key = agent
         .get_symmetric_key()
         .await
@@ -510,10 +543,10 @@ async fn handle_create_login(
         return Err("El campo 'password' no puede estar vacío".to_string());
     }
 
-    let agent = state
-        .vault_agent
-        .as_ref()
-        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
 
     let profile = agent.vault().profile().await;
     let mut profile_id = profile.and_then(|p| p.id);
@@ -616,10 +649,10 @@ async fn handle_delete_login(
         .or_else(|| payload.as_str())
         .ok_or_else(|| "Campo 'name' requerido".to_string())?;
 
-    let agent = state
-        .vault_agent
-        .as_ref()
-        .ok_or_else(|| "Vault agent no configurado".to_string())?;
+    let agent = match state.vault_agent.as_ref() {
+        Some(a) => a.clone(),
+        None => sw_ssh_agent::shared_vault_agent(),
+    };
     let sym_key = agent
         .get_symmetric_key()
         .await
@@ -1080,6 +1113,16 @@ pub fn default_registry() -> ActionsRegistry {
         Box::pin(async move { handle_sync(state, &p).await })
     });
 
+    // SyncData / ReloadVault
+    registry.register_async("SyncData", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_sync_data(state, &p).await })
+    });
+    registry.register_async("ReloadVault", |state, _ctx, payload| {
+        let p = payload.clone();
+        Box::pin(async move { handle_sync_data(state, &p).await })
+    });
+
     // ListLogins
     registry.register_async("ListLogins", |state, _ctx, _payload| {
         Box::pin(handle_list_logins(state))
@@ -1190,6 +1233,13 @@ impl AgentDaemon {
                 IpcResponse::Ok(serde_json::json!({ "status": "locked" }))
             }
             IpcRequest::Sync => IpcResponse::Ok(serde_json::json!({ "status": "synced" })),
+            IpcRequest::SyncData(val) | IpcRequest::ReloadVault(val) => {
+                let mut state = self.state.write().await;
+                match handle_sync_data(&mut state, &val).await {
+                    Ok(resp) => IpcResponse::Ok(resp),
+                    Err(e) => IpcResponse::Error(e),
+                }
+            }
             IpcRequest::GetLogins { filter: _ } => IpcResponse::Ok(serde_json::json!([])),
         }
     }

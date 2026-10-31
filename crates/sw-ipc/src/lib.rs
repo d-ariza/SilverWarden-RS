@@ -46,6 +46,8 @@ pub enum IpcRequest {
     Unlock { pin: String },
     Lock,
     Sync,
+    SyncData(serde_json::Value),
+    ReloadVault(serde_json::Value),
     GetLogins { filter: Option<String> },
 }
 

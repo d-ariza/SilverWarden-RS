@@ -32,6 +32,20 @@ pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 pub const SSHSIG_GIT_MAGIC: &[u8] = b"SSHSIG\x00\x00\x00\x03git";
 
+/// Helper function to generate an Ed25519 keypair for tests or fixtures.
+pub fn generate_test_ed25519(seed_byte: u8, comment: &str) -> (String, String) {
+    let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
+        russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed_byte; 32]),
+    );
+    let pk = russh::keys::PrivateKey::new(keypair, comment).unwrap();
+    let pem = pk
+        .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let pub_openssh = pk.public_key().to_openssh().unwrap();
+    (pem, pub_openssh)
+}
+
 #[cfg(any(test, debug_assertions))]
 const TEST_RSA_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
@@ -1514,19 +1528,6 @@ mod tests {
 
     fn make_test_key() -> SymmetricKey {
         SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap()
-    }
-
-    fn generate_test_ed25519(seed_byte: u8, comment: &str) -> (String, String) {
-        let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
-            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed_byte; 32]),
-        );
-        let pk = russh::keys::PrivateKey::new(keypair, comment).unwrap();
-        let pem = pk
-            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
-            .unwrap()
-            .to_string();
-        let pub_openssh = pk.public_key().to_openssh().unwrap();
-        (pem, pub_openssh)
     }
 
     async fn setup_test_vault_with_keys(

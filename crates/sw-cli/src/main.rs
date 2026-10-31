@@ -613,6 +613,12 @@ where
                 let (derived_id, derived_api, _) = sw_config::derive_server_urls(srv);
                 active_identity_url = derived_id;
                 active_api_url = derived_api;
+                if config.identity_url == sw_config::ConfigFile::default().identity_url
+                    || config.identity_url.is_empty()
+                {
+                    config.identity_url = active_identity_url.clone();
+                    config.api_url = active_api_url.clone();
+                }
             }
 
             if cli.insecure {
@@ -827,21 +833,80 @@ where
                 ));
             }
 
-            let payload = serde_json::json!({
-                "encrypted_token": config.encrypted_token,
-                "encrypted_user_symmetric_key": config.encrypted_user_symmetric_key,
-                "identity_url": config.identity_url,
-                "api_url": config.api_url,
-                "notifications_url": config.notifications_url,
-                "danger_accept_invalid_certs": config.danger_accept_invalid_certs,
-            });
+            let config_key = if config.config_key_hash.is_empty() {
+                sw_config::derive_config_key_with_params(
+                    "",
+                    &config.device_uuid,
+                    CLI_KDF_MEMORY_KIB,
+                )
+                .or_else(|_| {
+                    sw_config::derive_config_key_with_params(
+                        "",
+                        &config.device_uuid,
+                        sw_config::KDF_MEMORY_KIB_TEST,
+                    )
+                })
+                .map_err(|e| CliError::Config(e.to_string()))?
+            } else {
+                let pin = prompt_fn("Introduce tu PIN de SilverWarden para sincronizar: ")?;
+                config
+                    .unlock_with_params(&pin, CLI_KDF_MEMORY_KIB)
+                    .or_else(|_| config.unlock_with_params(&pin, sw_config::KDF_MEMORY_KIB_TEST))
+                    .map_err(|e| CliError::Config(format!("PIN incorrecto: {e}")))?
+            };
 
-            let resp = send_command(&socket_path, "Sync", payload).await?;
-            let logins = resp
-                .payload
-                .get("logins")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let token = config
+                .decrypt_token(&config_key)
+                .map_err(|e| CliError::Config(e.to_string()))?;
+
+            let active_identity_url = config.identity_url.clone();
+            let active_api_url = config.api_url.clone();
+            let mut active_insecure = config.danger_accept_invalid_certs;
+            if cli.insecure {
+                active_insecure = true;
+            }
+
+            let client = sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                &active_identity_url,
+                &active_api_url,
+                token,
+                active_insecure,
+            );
+
+            let sync_data = client
+                .sync()
+                .await
+                .map_err(|e| match e {
+                    sw_bitwarden_api::ApiError::RateLimitExceeded => CliError::Other(
+                        "El servidor ha bloqueado temporalmente tu IP por demasiados intentos de login. Espera unos minutos o cambia de red (por ejemplo, usa datos móviles).".to_string(),
+                    ),
+                    _ => CliError::Other(format!("Error al sincronizar con el servidor: {e}")),
+                })?;
+
+            let vault_path = if let Some(ref cfg_path) = cli.config {
+                cfg_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("vault.json")
+            } else {
+                sw_vault::VaultPaths::default_paths()
+                    .map_err(|e| CliError::Other(e.to_string()))?
+                    .vault_file()
+            };
+            let _ = sw_vault::save_vault(&vault_path, &sync_data);
+
+            let logins = sync_data
+                .ciphers
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+                .count();
+
+            if socket_path.exists() {
+                if let Ok(payload) = serde_json::to_value(&sync_data) {
+                    let _ = send_command(&socket_path, "SyncData", payload).await;
+                }
+            }
+
             Ok(format!(
                 "Sincronización completada ({logins} logins descargados)."
             ))
@@ -1865,6 +1930,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_sync_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let ciphers = (0..5)
+            .map(|_| sw_vault::Cipher {
+                id: Some(sw_vault::Uuid::new_v4()),
+                r#type: sw_vault::CipherType::Login,
+                name: sw_crypto::EncString::default(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let sync_data = sw_vault::SyncData {
+            ciphers,
+            ..Default::default()
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sync_data))
+            .mount(&mock_server)
+            .await;
+
         let temp_dir = tempfile::tempdir().unwrap();
         let socket_path = temp_dir.path().join("sync_success.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -1872,7 +1962,7 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let req = sw_ipc::read_message(&mut stream).await.unwrap();
-                assert_eq!(req.action, "Sync");
+                assert_eq!(req.action, "SyncData");
                 let resp = IpcMessage::new(
                     "Ok",
                     serde_json::json!({
@@ -1886,10 +1976,22 @@ mod tests {
 
         let config_file_path = temp_dir.path().join("silverwarden.json");
 
-        let logged_in_cfg = sw_config::ConfigFile {
-            encrypted_token: "some_encrypted_token".to_string(),
+        let mut logged_in_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
             ..Default::default()
         };
+        let config_key = sw_config::derive_config_key_with_params(
+            "",
+            &logged_in_cfg.device_uuid,
+            sw_config::KDF_MEMORY_KIB_TEST,
+        )
+        .unwrap();
+        let token = sw_config::LoginToken {
+            access_token: "test_token".to_string(),
+            ..Default::default()
+        };
+        logged_in_cfg.set_token(&token, &config_key).unwrap();
         logged_in_cfg.save_to_file(&config_file_path).unwrap();
 
         let cli = Cli {
@@ -1901,6 +2003,205 @@ mod tests {
 
         let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
         assert!(output.contains("Sincronización completada (5 logins descargados)."));
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_without_agent_running() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let ciphers = (0..3)
+            .map(|_| sw_vault::Cipher {
+                id: Some(sw_vault::Uuid::new_v4()),
+                r#type: sw_vault::CipherType::Login,
+                name: sw_crypto::EncString::default(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let sync_data = sw_vault::SyncData {
+            ciphers,
+            ..Default::default()
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sync_data))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let nonexistent_socket = temp_dir.path().join("no_agent.sock");
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let mut logged_in_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
+            ..Default::default()
+        };
+        let config_key = sw_config::derive_config_key_with_params(
+            "",
+            &logged_in_cfg.device_uuid,
+            sw_config::KDF_MEMORY_KIB_TEST,
+        )
+        .unwrap();
+        let token = sw_config::LoginToken {
+            access_token: "test_token".to_string(),
+            ..Default::default()
+        };
+        logged_in_cfg.set_token(&token, &config_key).unwrap();
+        logged_in_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(nonexistent_socket),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Sync,
+        };
+
+        let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
+        assert!(output.contains("Sincronización completada (3 logins descargados)."));
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_e2e_agent_receives_sync_data_and_ssh_add_lists_keys() {
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
+        let (priv_1, pub_1) = sw_ssh_agent::generate_test_ed25519(1, "work-laptop");
+        let enc_name_1 = sw_crypto::encrypt_with(
+            b"work-laptop",
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &sym_key,
+        )
+        .unwrap();
+        let enc_priv_1 = sw_crypto::encrypt_with(
+            priv_1.as_bytes(),
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &sym_key,
+        )
+        .unwrap();
+        let enc_pub_1 = sw_crypto::encrypt_with(
+            pub_1.as_bytes(),
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &sym_key,
+        )
+        .unwrap();
+
+        let cipher_ssh = sw_vault::Cipher {
+            id: Some(sw_vault::Uuid::new_v4()),
+            r#type: sw_vault::CipherType::SshKey,
+            name: enc_name_1,
+            ssh_key: Some(sw_vault::SSHKeyCipher {
+                private_key: Some(enc_priv_1),
+                public_key: Some(enc_pub_1),
+                key_fingerprint: None,
+            }),
+            ..Default::default()
+        };
+
+        let sync_data = sw_vault::SyncData {
+            ciphers: vec![cipher_ssh],
+            ..Default::default()
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sync_data))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_socket_path = temp_dir.path().join("agent.sock");
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        // 1. Setup VaultAgentServer unlocked with sym_key, but starting with empty VaultStore
+        let vault_store = Arc::new(sw_vault::VaultStore::new());
+        let vault_agent = Arc::new(sw_ssh_agent::VaultAgentServer::with_key(
+            vault_store.clone(),
+            sym_key.try_clone().unwrap(),
+        ));
+
+        // Verify SSH agent currently has 0 keys
+        let identities_before = vault_agent.request_identities().await.unwrap();
+        assert_eq!(identities_before.len(), 0);
+
+        // 2. Start agent daemon with this vault_agent
+        let mut agent_state = sw_agent::AgentState::default().with_vault_agent(vault_agent.clone());
+        agent_state.config_directory = Some(temp_dir.path().to_path_buf());
+        let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, vault_agent.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let a_sock = agent_socket_path.clone();
+        let mut rx = shutdown_rx;
+        let daemon_handle = tokio::spawn(async move {
+            let _ = sw_agent::run_agent_daemon_with_shutdown(&a_sock, daemon, async move {
+                let _ = rx.recv().await;
+            })
+            .await;
+        });
+
+        // Wait until agent socket is ready
+        for _ in 0..50 {
+            if agent_socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert!(agent_socket_path.exists());
+
+        // 3. Write CLI config
+        let mut logged_in_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url,
+            ..Default::default()
+        };
+        let config_key = sw_config::derive_config_key_with_params(
+            "",
+            &logged_in_cfg.device_uuid,
+            sw_config::KDF_MEMORY_KIB_TEST,
+        )
+        .unwrap();
+        let token = sw_config::LoginToken {
+            access_token: "test_token".to_string(),
+            ..Default::default()
+        };
+        logged_in_cfg.set_token(&token, &config_key).unwrap();
+        logged_in_cfg.save_to_file(&config_file_path).unwrap();
+
+        // 4. Run CLI sync command
+        let cli = Cli {
+            socket: Some(agent_socket_path.clone()),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Sync,
+        };
+
+        let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
+        assert!(output.contains("Sincronización completada (0 logins descargados)."));
+
+        // 5. Query SSH identities from vault_agent: it should now have "work-laptop"!
+        let identities_after = vault_agent.request_identities().await.unwrap();
+        assert_eq!(identities_after.len(), 1);
+        match &identities_after[0] {
+            sw_ssh_agent::AgentIdentity::PublicKey { comment, .. } => {
+                assert_eq!(comment, "work-laptop");
+            }
+            sw_ssh_agent::AgentIdentity::Certificate { comment, .. } => {
+                assert_eq!(comment, "work-laptop");
+            }
+        }
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = daemon_handle.await;
     }
 
     #[tokio::test]
@@ -3000,9 +3301,15 @@ mod tests {
             command: Commands::Sync,
         };
 
-        let sync_res = handle_command(&cli_sync, |_| unreachable!())
-            .await
-            .expect("Sync step should succeed without state error");
+        let sync_res = handle_command(&cli_sync, |msg| {
+            if msg.contains("PIN") {
+                Ok(pin.to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await
+        .expect("Sync step should succeed without state error");
         assert!(sync_res.contains("Sincronización completada"));
 
         let _ = shutdown_tx.send(());
