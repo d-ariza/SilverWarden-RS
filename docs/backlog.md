@@ -754,6 +754,8 @@ Una historia pasa a `Hecho` solo cuando:
 
 **7 de 7 de M5 completadas. Milestone M5 (SSH Agent) 100% completado y verificado en runtime (2026-11-01).** Ver evidencia en `03-ejecucion.md` §5.7.1 y `04-validacion.md` §9.7.
 
+
+
 ---
 
 ## Post-MVP (P1 / P2 — se detallan cuando se aborden)
@@ -766,21 +768,21 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 
 ### [SW-050] PIN + pincache en agente
 
-**Historia:** Como usuario, quiero que el agente recuerde mi PIN en memoria durante una ventana de tiempo configurable para no tener que ingresarlo repetidamente en cada acción.
+**Historia:** Como usuario, quiero que el agente mantenga la `config_key` derivada en memoria bloqueada durante una ventana de tiempo deslizante configurable (15 min) para no tener que re-ejecutar Argon2i (2-5s y 2 GiB RAM) repetidamente en cada acción de desbloqueo.
 
 **Implementación / Tests:**
-- Módulo `PinCache` en `sw-agent` con expiración automática (TTL por defecto: 300 segundos).
-- Almacenamiento seguro en memoria con `zeroize` al expirar o resetear.
-- Integración en las acciones IPC del agente (`Unlock`, `PinSet`, `PinUpdate`).
-- Purgado inmediato del PIN al invocar `Lock`.
+- Componente `PinCache` en `sw-agent` con expiración deslizante automática (TTL por defecto: 900 segundos / 15 min, configurable vía `RuntimeConfig.pin_cache_ttl_secs`).
+- Almacenamiento seguro en memoria bloqueada (`MemLockedBuffer` / `SymmetricKey`) con `zeroize` al expirar o resetear. No almacena el PIN en texto plano ni la clave simétrica de usuario.
+- Integración en las acciones IPC del agente (`Unlock` con atajo de cache hit, `PinSet`, `PinUpdate`, y métricas en `Status`).
+- Purgado inmediato (Zeroize) de la clave al invocar `Lock` o `PinUpdate`.
 
 **Criterios de aceptación:**
-- Operaciones subsiguientes no solicitan PIN si el TTL sigue activo.
+- Desbloqueo subsiguiente sin PIN aprovecha el caché válido inmediatamente (`from_cache: true`).
 - Al expirar el TTL, se exige el PIN nuevamente.
-- `Lock` limpia la clave en caché inmediatamente.
-- Cobertura de tests unitarios ≥85%.
+- `Lock` limpia la clave en caché inmediatamente (`zeroize`).
+- Cobertura de tests unitarios ≥85% (96.36% archivo, 91.82% producción pura).
 
-**Depende de:** M5 cerrado · **Estado:** Pendiente
+**Depende de:** M5 cerrado · **Estado:** Hecho (2026-11-01)
 
 ---
 
@@ -862,6 +864,17 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 ### M7 — GUI Tauri (P1)
 
 ---
+
+### reglas de diseño
+- estados de carga. un esqueleto en lugar de espacios vacios o spinner para todo
+- diseño responsive: que la app se adapte a difeentes tamaños, no limitrse a encoger la version desktop
+- jerarqui visual: evita elementos que compitan por la atencion. destaca la accion principal y que la interfaz sea facil de escanear
+- siempre definir tipografias, espaciados, bordes y sombras que mantengan la consitencia en toda la app
+- consistencia entre componentes: botones, cards, campos, modales, etc. con el mismo lenguaje vsual, incluso en el dark mode
+- accesibilidad: imagenes con textos alternativos, botones accesibles y contraste que permita leer el contenido.
+- estados de lainterfaz: definimos que ocurre cuando no hya datos o falla o cuando una accion no se completa. no solo el happy path sino los edge cases
+- estados de interaccion: botones, enlaces, inputs, toast, menus, etc. necesitan hover, focus, active y diabled cuando correspondan
+
 
 ### [SW-060] Scaffold Tauri v2 + Svelte 5 + TS
 

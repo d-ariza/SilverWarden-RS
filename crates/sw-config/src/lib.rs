@@ -162,8 +162,14 @@ pub fn decrypt_string(b64: &str, key: &[u8; 32]) -> Result<String, ConfigError> 
         .map_err(|e| ConfigError::Crypto(format!("Plaintext is not valid UTF-8: {e}")))
 }
 
+pub const DEFAULT_PIN_CACHE_TTL_SECS: u64 = 900;
+
+pub fn default_pin_cache_ttl_secs() -> u64 {
+    DEFAULT_PIN_CACHE_TTL_SECS
+}
+
 /// Runtime configuration matching Goldwarden Go RuntimeConfig.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct RuntimeConfig {
     pub auth_method: String,
@@ -182,6 +188,33 @@ pub struct RuntimeConfig {
     pub ssh_agent_socket_path: String,
     pub goldwarden_socket_path: String,
     pub daemon_auth_token: String,
+    #[serde(
+        default = "default_pin_cache_ttl_secs",
+        alias = "pin_cache_ttl_secs",
+        alias = "pinCacheTtlSecs"
+    )]
+    pub pin_cache_ttl_secs: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            auth_method: String::new(),
+            do_not_persist_config: false,
+            config_directory: String::new(),
+            disable_ssh_agent: false,
+            websocket_disabled: false,
+            device_uuid: String::new(),
+            user: String::new(),
+            password: String::new(),
+            pin: String::new(),
+            use_memguard: false,
+            ssh_agent_socket_path: String::new(),
+            goldwarden_socket_path: String::new(),
+            daemon_auth_token: String::new(),
+            pin_cache_ttl_secs: default_pin_cache_ttl_secs(),
+        }
+    }
 }
 
 /// Helper function to deserialize an optional or null struct as Default
@@ -1458,6 +1491,7 @@ mod tests {
                 ssh_agent_socket_path: "/tmp/gw-ssh.sock".to_string(),
                 goldwarden_socket_path: "/tmp/gw.sock".to_string(),
                 daemon_auth_token: "token123".to_string(),
+                pin_cache_ttl_secs: 900,
             },
             danger_accept_invalid_certs: true,
             server_url: "https://vw.local".to_string(),
@@ -1504,6 +1538,7 @@ mod tests {
         assert!(rt_map.contains_key("DisableSSHAgent"));
         assert!(rt_map.contains_key("DeviceUUID"));
         assert!(rt_map.contains_key("SSHAgentSocketPath"));
+        assert!(rt_map.contains_key("PinCacheTtlSecs"));
 
         // Test reading from a Go sample without the 2 new fields or RuntimeConfig
         let go_json = r#"{
@@ -1540,5 +1575,41 @@ mod tests {
         cfg.save_to_file(&file_path).expect("save_to_file");
         let loaded = ConfigFile::load_from_file(&file_path).expect("load_from_file");
         assert_eq!(cfg, loaded);
+    }
+
+    #[test]
+    fn test_runtime_config_pin_cache_ttl_secs_default_and_roundtrip() {
+        // Default applies 900
+        let default_rt = RuntimeConfig::default();
+        assert_eq!(default_rt.pin_cache_ttl_secs, 900);
+
+        // Deserializing empty JSON object produces default 900
+        let from_empty: RuntimeConfig = serde_json::from_str("{}").expect("empty json object");
+        assert_eq!(from_empty.pin_cache_ttl_secs, 900);
+
+        // Deserializing with PascalCase key
+        let with_pascal: RuntimeConfig =
+            serde_json::from_str(r#"{"PinCacheTtlSecs": 1200}"#).expect("pascal json");
+        assert_eq!(with_pascal.pin_cache_ttl_secs, 1200);
+
+        // Deserializing with alias snake_case
+        let with_snake: RuntimeConfig =
+            serde_json::from_str(r#"{"pin_cache_ttl_secs": 600}"#).expect("snake json");
+        assert_eq!(with_snake.pin_cache_ttl_secs, 600);
+
+        // Deserializing with alias camelCase
+        let with_camel: RuntimeConfig =
+            serde_json::from_str(r#"{"pinCacheTtlSecs": 300}"#).expect("camel json");
+        assert_eq!(with_camel.pin_cache_ttl_secs, 300);
+
+        // Roundtrip serialization
+        let custom = RuntimeConfig {
+            pin_cache_ttl_secs: 1800,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&custom).expect("serialize");
+        assert!(serialized.contains(r#""PinCacheTtlSecs":1800"#));
+        let roundtrip: RuntimeConfig = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(custom, roundtrip);
     }
 }

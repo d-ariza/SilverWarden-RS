@@ -188,4 +188,48 @@ Cada decisión se registra con:
 - **Evidencia:** `docs/lecciones-aprendidas.md` (sección 8 completa 8.1-8.8), `docs/deuda-tecnica.md` (sin sección 8, solo DT-18), commits `969fa84` (movimiento erróneo) y el commit de cierre de M5 (reversión). `grep -c "## 8. Lecciones de M5" docs/lecciones-aprendidas.md` → 1; `grep -c "## 8. Lecciones de M5" docs/deuda-tecnica.md` → 0.
 - **Estado:** Vigente.
 
+## D-M6-1 — PinCache cachea los 32 bytes de la `config_key` en `LockedBuffer`
+
+- **Fecha:** 2026-11-01
+- **Contexto:** La derivación de clave con Argon2i (`t=2, m=2048 MiB, p=8`) consume ~2-5 segundos de CPU y 2 GiB de RAM en cada desbloqueo del vault. Repetir esta operación continuamente degrada severamente la experiencia de usuario.
+- **Decisión:** El PinCache cachea los 32 bytes de la `config_key` en `LockedBuffer` (`MemLockedBuffer` con `mlock` + `MADV_DONTDUMP` + `Zeroize`). NO cachea la `user_symmetric_key` ni el PIN. La `config_key` es de 32 bytes (Argon2i); no se construye una `SymmetricKey` de 64 bytes con MAC redundante. En cada desbloqueo con caché válido, la `user_symmetric_key` se descifra desde `encrypted_user_symmetric_key` con la `config_key` en microsegundos vía AES-CBC-256.
+- **Alternativas:**
+  - (a) Construir `SymmetricKey::from_parts(key, key)` duplicando 32 bytes a 64 bytes con MAC redundante. Rechazada: fallo de diseño, la `config_key` mide exactamente 32 bytes.
+  - (b) Cachear el PIN del usuario en memoria. Rechazada por seguridad: el PIN es el secreto maestro raíz del usuario y nunca debe persistir en memoria.
+  - (c) Cachear la `user_symmetric_key` en el PinCache. Rechazada: la `user_symmetric_key` solo debe residir en el gestor de bóveda activo; la separación criptográfica mantiene el menor radio de impacto.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`struct PinCache` con `Option<MemLockedBuffer>`, `Unlock` handler con branch `from_cache: true`), tests `test_pin_cache_store_and_get`, `test_unlock_uses_pin_cache_when_valid`, `test_unlock_cache_hit_decrypts_token_and_symmetric_key`.
+- **Estado:** Vigente.
+
+## D-M6-2 — TTL deslizante (sliding window) de 15 minutos configurable
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Se requiere un balance entre usabilidad y seguridad de sesión. Una sesión demasiado corta obliga al usuario a esperar 2-5s constantemente; una sesión estática infinita expone la clave si el equipo queda desatendido.
+- **Decisión:** Establecer un TTL por defecto de 900 segundos (15 minutos), configurable mediante `RuntimeConfig.pin_cache_ttl_secs`. El TTL es deslizante (*sliding*): cada lectura exitosa (`PinCache::get`) reinicia la ventana de expiración a `now + ttl`.
+- **Alternativas:**
+  - (a) TTL fijo absoluto (ignora actividad del usuario). Rechazada: bloquea operaciones legítimas en medio del flujo de trabajo activo.
+  - (b) TTL no configurable codificado en constantes. Rechazada: impide a usuarios avanzados o entornos de alta seguridad ajustar su ventana de exposición.
+- **Evidencia:** `crates/sw-config/src/lib.rs` (`RuntimeConfig.pin_cache_ttl_secs`), `crates/sw-agent/src/lib.rs` (`PinCache::get`), test `test_pin_cache_ttl_resets_on_get`, `test_pin_cache_expires_after_ttl`.
+- **Estado:** Vigente.
+
+## D-M6-3 — Empleo de `tokio::time::Instant` y tests con TTLs cortos
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Se intentó usar `tokio::time::pause()` para tests deterministas, pero `pause()` no afecta a `Instant::now()` sin la feature `test-util`.
+- **Decisión:** Los tests de TTL usan `tokio::time::sleep` real con TTLs cortos (50-70ms). Si en M6+ se necesita determinismo total, migrar a un `Clock` trait inyectable. `PinCache` mantiene `tokio::time::Instant` para integración con el runtime asíncrono.
+- **Alternativas:**
+  - (a) Forzar dependencia `tokio/test-util` en producción. Rechazada para no inflar dependencias de release.
+  - (b) Usar `std::time::Instant`. Rechazada: bloquea la integración asíncrona fluida con Tokio time y timers futuros.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`PinCache.expires_at: Option<tokio::time::Instant>`), tests `test_pin_cache_expires_after_ttl` y `test_pin_cache_ttl_resets_on_get`. Registrado en `docs/deuda-tecnica.md` (DT-20).
+- **Estado:** Vigente.
+
+## D-M6-4 — Limpieza estricta (Zeroize) del PinCache en Lock y PinUpdate
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Cuando el usuario bloquea explícitamente el vault o modifica su PIN maestro, mantener la `config_key` anterior en memoria vulneraría las expectativas de seguridad y el aislamiento de sesiones.
+- **Decisión:** Ejecutar `state.pin_cache.clear()` (que libera y zeroiza la memoria bloqueada de `SymmetricKey`) de forma inmediata al procesar la acción IPC `Lock` y al cambiar el PIN con `PinUpdate`. Tras `PinUpdate`, se cachea exclusivamente la clave derivada del nuevo PIN.
+- **Alternativas:**
+  - (a) Mantener el caché tras `Lock` permitiendo desbloqueos rápidos subsecuentes. Rechazada tajantemente: `Lock` es una orden explícita de clausura que debe purgar todos los secretos de memoria.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (handlers de `Lock` y `PinUpdate`), tests `test_lock_clears_pin_cache`, `test_pin_update_clears_and_stores_new`.
+- **Estado:** Vigente.
+
 

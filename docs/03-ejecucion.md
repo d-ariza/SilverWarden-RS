@@ -1806,6 +1806,52 @@ Gate ≥85% cumplido según la métrica estándar del proyecto. Commit `0eefb93`
 
 Verificado por `test_websocket_sync_writes_to_injected_vault_path` y por comparación de `mtime` de `~/.config/goldwarden/goldwarden.json` y `~/.local/share/silverwarden/vault.json` antes/después de la suite. Sin cambios.
 
+---
+
+## 6. Milestone M6: Seguridad de Sesión
+
+### 6.1 [SW-050] PinCache — Caché de clave de configuración derivada en sw-agent
+
+**Fecha:** 2026-11-01  
+**Objetivo:** Evitar la re-ejecución repetitiva de Argon2i (`t=2, m=2048 MiB, p=8`, ~2-5s y 2 GiB de RAM) en cada llamada a `Unlock`. Se implementa una memoria intermedia en RAM bloqueada para los 32 bytes de la `config_key` con una ventana de expiración deslizante (sliding TTL) de 15 minutos (900 segundos). El PIN maestro en texto plano y la clave simétrica de usuario nunca se almacenan en el PinCache.
+
+#### Decisiones de diseño aplicadas
+- **D-M6-1:** PinCache almacena exclusivamente los 32 bytes reales de la `config_key` (`MemLockedBuffer` de `sw-crypto`, con `mlock` + `MADV_DONTDUMP` + `Zeroize`), no el PIN ni una `SymmetricKey` de 64 bytes con MAC redundante. La `user_symmetric_key` se descifra en cada desbloqueo vía AES-CBC-256 en microsegundos.
+- **D-M6-2:** TTL sliding window de 900s por defecto, configurable mediante `RuntimeConfig.pin_cache_ttl_secs`.
+- **D-M6-3:** Pruebas de TTL con temporizadores de 50-70ms usando `tokio::time::sleep` (registrado en DT-20 para migrar a `Clock` trait si se requiere determinismo sin esperas reales).
+- **D-M6-4:** Purga con Zeroize en operaciones de `Lock` y `PinUpdate`, y al expirar el TTL.
+
+#### Archivos modificados
+- `crates/sw-config/src/lib.rs`: campo `pin_cache_ttl_secs: u64` en `RuntimeConfig` (default 900, serde alias PascalCase/snake_case/camelCase), tests de serialización y roundtrip.
+- `crates/sw-agent/src/lib.rs`: `struct PinCache` (32 bytes en `MemLockedBuffer`) con métodos `new`, `store`, `get` (sliding TTL), `is_valid`, `remaining` y `clear`. Integración en `AgentState`, atajo de cache hit en `Unlock`, purga en `Lock` y `PinUpdate`, reporte de métricas en `Status` (`pin_cached`, `pin_cached_remaining_secs`), y 11 tests específicos (10 obligatorios + 1 test E2E de descifrado en cache hit).
+
+#### Nota metodológica sobre pruebas de desbloqueo
+El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo mediante `state.is_locked = true` directamente para evaluar aisladamente la rama de cache hit del despachador sin invocar la acción `Lock` (la cual por diseño en D-M6-4 purga el `PinCache`). Para verificar el flujo real con descifrado criptográfico completo, se implementó el test `test_unlock_cache_hit_decrypts_token_and_symmetric_key`, el cual comprueba que tras un primer desbloqueo con PIN y un bloqueo del `vault_agent`, el segundo desbloqueo sin PIN descifra correctamente tanto el `LoginToken` como la `user_symmetric_key` (64 bytes) a partir de la `config_key` cacheada.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 55 pasan, 0 fallan (39 previos + 11 de PinCache inicial + 5 ramas de cache hit) |
+| Pruebas workspace completo | `cargo test --workspace --exclude sw-gui` | 420 pasan, 0 fallan, 1 ignorado (`test_sha3_hash_parity`) |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) |
+| Cobertura `sw-agent` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.56%** líneas / **97.17%** regiones (gate ≥85% ampliamente superado) |
+| Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.15%** líneas / **93.06%** regiones (gate ≥90% ampliamente superado) |
+
+#### Comparativa de Cobertura en `sw-agent` (Antes vs Después de Ramas de Cache Hit)
+
+| Métrica | Antes (50 tests) | Después (55 tests) | Delta | Quality Gate |
+|---|---|---|---|---|
+| `cargo llvm-cov -p sw-agent` (aislado) | 72.63% (1372 perdidas) | **74.19%** (1359 perdidas) | +1.56% | — |
+| `sw-agent/src/lib.rs` (workspace canónico) | 97.17% líneas | **97.56%** líneas (solo 98 perdidas) | +0.39% | ≥85% (✅ Superado) |
+| `sw-agent/src/lib.rs` regiones (workspace) | 96.80% regiones | **97.17%** regiones | +0.37% | ≥85% (✅ Superado) |
+| Workspace Global Líneas | 92.88% líneas | **93.15%** líneas | +0.27% | ≥90% (✅ Superado) |
+| Workspace Global Regiones | 92.80% regiones | **93.06%** regiones | +0.26% | ≥90% (✅ Superado) |
+
+*Nota metodológica:* La medición aislada con `-p sw-agent` evalúa exclusivamente las pruebas internas del crate sin disparar los arneses de integración ni las llamadas IPC desde `sw-cli` o `sw-ssh-agent`, lo que deja sin ejercitar segmentos del daemon. La medición estándar y canónica del workspace (`--workspace --exclude sw-gui`) cubre todo el flujo operativo del agente alcanzando el **97.56%** en `sw-agent/src/lib.rs`.
+
 
 
 

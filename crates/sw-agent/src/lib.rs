@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use sw_config::ConfigFile;
+use sw_crypto::mem::{LockedBuffer, MemLockedBuffer};
 use sw_ipc::{read_message, write_message, IpcMessage, IpcRequest, IpcResponse};
 use sw_ssh_agent::VaultAgentServer;
 use sw_systemauth::{CallingContext, SessionStore, SessionType};
@@ -36,6 +37,108 @@ const AGENT_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB;
 #[cfg(test)]
 const AGENT_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB_TEST;
 
+/// In-memory cache for the derived 32-byte config key (in locked RAM).
+/// Protects against repeated Argon2i executions (which consume ~2-5s and 2 GiB RAM).
+/// Does NOT store the user's PIN or the user symmetric key.
+pub struct PinCache {
+    config_key: Option<MemLockedBuffer>,
+    expires_at: Option<tokio::time::Instant>,
+    ttl: Duration,
+}
+
+impl PinCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            config_key: None,
+            expires_at: None,
+            ttl,
+        }
+    }
+
+    pub fn store(&mut self, key: &[u8]) {
+        if key.len() != 32 {
+            return;
+        }
+        if let Ok(buf) = MemLockedBuffer::new(key) {
+            self.config_key = Some(buf);
+            self.expires_at = Some(tokio::time::Instant::now() + self.ttl);
+        }
+    }
+
+    pub fn get(&mut self) -> Option<[u8; 32]> {
+        if !self.is_valid() {
+            return None;
+        }
+        // Sliding TTL: resets expires_at on each successful get
+        self.expires_at = Some(tokio::time::Instant::now() + self.ttl);
+        self.config_key.as_ref().and_then(|buf| {
+            let slice = buf.as_slice();
+            if slice.len() != 32 {
+                None
+            } else {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(slice);
+                Some(out)
+            }
+        })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match (self.expires_at, &self.config_key) {
+            (Some(exp), Some(buf)) => tokio::time::Instant::now() < exp && buf.len() == 32,
+            _ => false,
+        }
+    }
+
+    pub fn remaining(&self) -> Option<Duration> {
+        if !self.is_valid() {
+            return None;
+        }
+        self.expires_at.and_then(|exp| {
+            let now = tokio::time::Instant::now();
+            if exp > now {
+                Some(exp - now)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn clear(&mut self) {
+        self.config_key = None;
+        self.expires_at = None;
+    }
+}
+
+impl Clone for PinCache {
+    fn clone(&self) -> Self {
+        Self {
+            config_key: self
+                .config_key
+                .as_ref()
+                .and_then(|buf| MemLockedBuffer::new(buf.as_slice()).ok()),
+            expires_at: self.expires_at,
+            ttl: self.ttl,
+        }
+    }
+}
+
+impl std::fmt::Debug for PinCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinCache")
+            .field("has_key", &self.config_key.is_some())
+            .field("expires_at", &self.expires_at)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
+}
+
+impl Default for PinCache {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(sw_config::DEFAULT_PIN_CACHE_TTL_SECS))
+    }
+}
+
 /// Central state maintained by the agent daemon.
 #[derive(Clone, Debug)]
 pub struct AgentState {
@@ -47,11 +150,13 @@ pub struct AgentState {
     pub vault_agent: Option<Arc<VaultAgentServer>>,
     pub config_directory: Option<PathBuf>,
     pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
+    pub pin_cache: PinCache,
 }
 
 impl AgentState {
     pub fn new(config: ConfigFile) -> Self {
         let has_pin = !config.config_key_hash.is_empty();
+        let pin_cache_ttl = Duration::from_secs(config.runtime_config.pin_cache_ttl_secs);
         Self {
             config,
             sessions: SessionStore::new(),
@@ -61,6 +166,7 @@ impl AgentState {
             vault_agent: None,
             config_directory: None,
             api_client: None,
+            pin_cache: PinCache::new(pin_cache_ttl),
         }
     }
 
@@ -853,7 +959,7 @@ pub fn save_config_file(config: &ConfigFile, path: &Path) -> Result<(), std::io:
 pub fn default_registry() -> ActionsRegistry {
     let mut registry = ActionsRegistry::new();
 
-    // Status: devuelve { locked, has_pin, logged_in, version }
+    // Status: devuelve { locked, has_pin, logged_in, version, pin_cached, pin_cached_remaining_secs }
     registry.register(
         "Status",
         |state: &mut AgentState, _ctx: &CallingContext, _payload: &serde_json::Value| {
@@ -863,22 +969,23 @@ pub fn default_registry() -> ActionsRegistry {
                 "has_pin": state.has_pin,
                 "logged_in": logged_in,
                 "version": env!("CARGO_PKG_VERSION"),
+                "pin_cached": state.pin_cache.is_valid(),
+                "pin_cached_remaining_secs": state.pin_cache.remaining().map(|d| d.as_secs()).unwrap_or(0),
             }))
         },
     );
 
-    // Unlock: recibe { pin }, verifica contra sw-config, actualiza estado, crea sesión Pin
+    // Unlock: recibe { pin } opcional, verifica caché o KDF, actualiza estado, crea sesiones
     registry.register_async(
         "Unlock",
         |state: &mut AgentState, ctx: &CallingContext, payload: &serde_json::Value| {
-            #[rustfmt::skip]
-            let pin = match payload {
-                serde_json::Value::Object(map) => match map.get("pin").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => return Box::pin(async { Err("Campo 'pin' requerido en payload".to_string()) }),
-                },
-                serde_json::Value::String(s) => s.clone(),
-                _ => return Box::pin(async { Err("Payload inválido para Unlock: se esperaba objeto con 'pin' o string".to_string()) }),
+            let pin_opt = match payload {
+                serde_json::Value::Object(map) => map
+                    .get("pin")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                serde_json::Value::String(s) => Some(s.clone()),
+                _ => None,
             };
 
             // Sync from payload if present
@@ -888,7 +995,10 @@ pub fn default_registry() -> ActionsRegistry {
                         state.config.encrypted_token = enc_tok.to_string();
                     }
                 }
-                if let Some(enc_sym) = map.get("encrypted_user_symmetric_key").and_then(|v| v.as_str()) {
+                if let Some(enc_sym) = map
+                    .get("encrypted_user_symmetric_key")
+                    .and_then(|v| v.as_str())
+                {
                     if !enc_sym.is_empty() {
                         state.config.encrypted_user_symmetric_key = enc_sym.to_string();
                     }
@@ -908,12 +1018,14 @@ pub fn default_registry() -> ActionsRegistry {
                                 state.config.encrypted_token = disk_cfg.encrypted_token;
                             }
                             if !disk_cfg.encrypted_user_symmetric_key.is_empty() {
-                                state.config.encrypted_user_symmetric_key = disk_cfg.encrypted_user_symmetric_key;
+                                state.config.encrypted_user_symmetric_key =
+                                    disk_cfg.encrypted_user_symmetric_key;
                             }
                             state.config.identity_url = disk_cfg.identity_url;
                             state.config.api_url = disk_cfg.api_url;
                             state.config.notifications_url = disk_cfg.notifications_url;
-                            state.config.danger_accept_invalid_certs = disk_cfg.danger_accept_invalid_certs;
+                            state.config.danger_accept_invalid_certs =
+                                disk_cfg.danger_accept_invalid_certs;
                         }
                     }
                 }
@@ -923,40 +1035,124 @@ pub fn default_registry() -> ActionsRegistry {
                 return Box::pin(async { Err("No hay PIN configurado en el agente".to_string()) });
             }
 
-            let (verified, memory_kib) =
-                match state.config.verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB) {
-                    Ok(true) => (true, AGENT_KDF_MEMORY_KIB),
-                    Ok(false) => {
-                        match state
-                            .config
-                            .verify_pin_with_params(&pin, sw_config::KDF_MEMORY_KIB_TEST)
-                        {
-                            Ok(true) => (true, sw_config::KDF_MEMORY_KIB_TEST),
-                            Ok(false) => (false, AGENT_KDF_MEMORY_KIB),
-                            Err(e) => {
-                                return Box::pin(async move {
-                                    Err(format!("Error al verificar PIN: {e}"))
-                                })
-                            }
+            // 1. Si no hay PIN en el payload: intentar cache hit (evita Argon2i)
+            if pin_opt.is_none() {
+                if let Some(config_key) = state.pin_cache.get() {
+                    state.is_locked = false;
+                    state
+                        .sessions
+                        .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
+                    state.sessions.create_session(
+                        ctx,
+                        SessionType::AccessVault,
+                        Duration::from_secs(3600),
+                    );
+
+                    if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
+                        if let Ok(token) = state.config.decrypt_token(&config_key) {
+                            state.api_client = Some(Arc::new(
+                                sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                                    state.config.identity_url.clone(),
+                                    state.config.api_url.clone(),
+                                    token,
+                                    state.config.danger_accept_invalid_certs,
+                                ),
+                            ));
                         }
                     }
-                    Err(e) => {
-                        return Box::pin(async move { Err(format!("Error al verificar PIN: {e}")) })
+
+                    let va = state.vault_agent.clone();
+                    let enc_sym = state.config.encrypted_user_symmetric_key.clone();
+
+                    return Box::pin(async move {
+                        if let Some(agent) = va {
+                            let sym_key = if !enc_sym.is_empty() {
+                                if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &config_key) {
+                                    use base64::Engine;
+                                    if let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(dec.trim())
+                                    {
+                                        sw_crypto::SymmetricKey::from_bytes(&bytes).or_else(|_| {
+                                            sw_crypto::SymmetricKey::from_parts(
+                                                &config_key,
+                                                &config_key,
+                                            )
+                                        })
+                                    } else {
+                                        sw_crypto::SymmetricKey::from_parts(
+                                            &config_key,
+                                            &config_key,
+                                        )
+                                    }
+                                } else {
+                                    sw_crypto::SymmetricKey::from_parts(&config_key, &config_key)
+                                }
+                            } else {
+                                sw_crypto::SymmetricKey::from_parts(&config_key, &config_key)
+                            };
+
+                            if let Ok(sk) = sym_key {
+                                agent.unlock(sk).await;
+                            }
+                        }
+                        Ok(serde_json::json!({ "status": "unlocked", "from_cache": true }))
+                    });
+                } else {
+                    return Box::pin(async {
+                        Err("Campo 'pin' requerido en payload (no hay caché válido)".to_string())
+                    });
+                }
+            }
+
+            // 2. Si hay PIN en el payload: se valida el PIN con KDF y se actualiza el caché
+            let pin = pin_opt.unwrap();
+
+            let (verified, memory_kib) = match state
+                .config
+                .verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB)
+            {
+                Ok(true) => (true, AGENT_KDF_MEMORY_KIB),
+                Ok(false) => {
+                    match state
+                        .config
+                        .verify_pin_with_params(&pin, sw_config::KDF_MEMORY_KIB_TEST)
+                    {
+                        Ok(true) => (true, sw_config::KDF_MEMORY_KIB_TEST),
+                        Ok(false) => (false, AGENT_KDF_MEMORY_KIB),
+                        Err(e) => {
+                            return Box::pin(
+                                async move { Err(format!("Error al verificar PIN: {e}")) },
+                            )
+                        }
                     }
-                };
+                }
+                Err(e) => {
+                    return Box::pin(async move { Err(format!("Error al verificar PIN: {e}")) })
+                }
+            };
 
             if !verified {
                 return Box::pin(async { Err("PIN incorrecto".to_string()) });
             }
 
             state.is_locked = false;
-            state.sessions.create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
-            state.sessions.create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
+            state
+                .sessions
+                .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
+            state
+                .sessions
+                .create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
             let va = state.vault_agent.clone();
             let enc_sym = state.config.encrypted_user_symmetric_key.clone();
-            let key_res = sw_config::derive_config_key_with_params(&pin, &state.config.device_uuid, memory_kib);
+            let key_res = sw_config::derive_config_key_with_params(
+                &pin,
+                &state.config.device_uuid,
+                memory_kib,
+            );
 
             if let Ok(key) = &key_res {
+                state.pin_cache.store(key);
+
                 if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
                     if let Ok(token) = state.config.decrypt_token(key) {
                         state.api_client = Some(Arc::new(
@@ -977,9 +1173,12 @@ pub fn default_registry() -> ActionsRegistry {
                         let sym_key = if !enc_sym.is_empty() {
                             if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &key) {
                                 use base64::Engine;
-                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(dec.trim()) {
-                                    sw_crypto::SymmetricKey::from_bytes(&bytes)
-                                        .or_else(|_| sw_crypto::SymmetricKey::from_parts(&key, &key))
+                                if let Ok(bytes) =
+                                    base64::engine::general_purpose::STANDARD.decode(dec.trim())
+                                {
+                                    sw_crypto::SymmetricKey::from_bytes(&bytes).or_else(|_| {
+                                        sw_crypto::SymmetricKey::from_parts(&key, &key)
+                                    })
                                 } else {
                                     sw_crypto::SymmetricKey::from_parts(&key, &key)
                                 }
@@ -995,7 +1194,7 @@ pub fn default_registry() -> ActionsRegistry {
                         }
                     }
                 }
-                Ok(serde_json::json!({ "status": "unlocked" }))
+                Ok(serde_json::json!({ "status": "unlocked", "from_cache": false }))
             })
         },
     );
@@ -1004,6 +1203,7 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register_async(
         "Lock",
         |state: &mut AgentState, _ctx: &CallingContext, _payload: &serde_json::Value| {
+            state.pin_cache.clear();
             state.is_locked = true;
             state.sessions.wipe();
             let va = state.vault_agent.clone();
@@ -1035,6 +1235,7 @@ pub fn default_registry() -> ActionsRegistry {
                 .map_err(|e| format!("Error al derivar clave de PIN: {e}"))?;
             state.config.config_key_hash = sw_config::hash_config_key(&key);
             state.has_pin = true;
+            state.pin_cache.store(&key);
 
             if let Some(path) = state.config_path() {
                 let _ = save_config_file(&state.config, &path);
@@ -1062,10 +1263,20 @@ pub fn default_registry() -> ActionsRegistry {
                 return Err("El PIN no está configurado. Usa PinSet.".to_string());
             }
 
+            state.pin_cache.clear();
+
             state
                 .config
                 .update_pin_with_params(old_pin, new_pin, AGENT_KDF_MEMORY_KIB)
                 .map_err(|e| format!("Error al actualizar PIN: {e}"))?;
+
+            if let Ok(new_key) = sw_config::derive_config_key_with_params(
+                new_pin,
+                &state.config.device_uuid,
+                AGENT_KDF_MEMORY_KIB,
+            ) {
+                state.pin_cache.store(&new_key);
+            }
 
             if let Some(path) = state.config_path() {
                 let _ = save_config_file(&state.config, &path);
@@ -3958,5 +4169,760 @@ mod tests {
             .execute("ReloadVault", &mut state, &ctx, &sync_empty)
             .await;
         assert_eq!(res_rv.unwrap()["status"], "synced");
+    }
+
+    #[tokio::test]
+    async fn test_pin_cache_store_and_get() {
+        let mut cache = PinCache::new(Duration::from_secs(900));
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+        assert!(cache.remaining().is_none());
+
+        let key = [55u8; 32];
+        cache.store(&key);
+
+        assert!(cache.is_valid());
+        assert!(cache.remaining().is_some());
+        let retrieved = cache.get();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), [55u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_pin_cache_expires_after_ttl() {
+        let ttl = Duration::from_millis(50);
+        let mut cache = PinCache::new(ttl);
+        let key = [42u8; 32];
+        cache.store(&key);
+        assert!(cache.is_valid());
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+        assert!(cache.remaining().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pin_cache_ttl_resets_on_get() {
+        let ttl = Duration::from_millis(60);
+        let mut cache = PinCache::new(ttl);
+        let key = [77u8; 32];
+        cache.store(&key);
+
+        // Esperar la mitad del TTL (30ms)
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(cache.is_valid());
+        let rem1 = cache.remaining().unwrap();
+        assert!(rem1 <= Duration::from_millis(40));
+
+        // get() reinicia el TTL a 60ms
+        let ret = cache.get();
+        assert!(ret.is_some());
+
+        // Esperar 40ms más (total 70ms desde store, pero 40ms desde get)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(cache.is_valid());
+        assert!(cache.get().is_some());
+
+        // Esperar 70ms más -> ahora expira
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pin_cache_clear() {
+        let mut cache = PinCache::new(Duration::from_secs(900));
+        let key = [88u8; 32];
+        cache.store(&key);
+        assert!(cache.is_valid());
+
+        cache.clear();
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+        assert!(cache.remaining().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unlock_uses_pin_cache_when_valid() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let mut state = AgentState::new(ConfigFile {
+            device_uuid: "test-dev-uuid".to_string(),
+            ..Default::default()
+        })
+        .with_config_directory(temp_dir.path());
+        let ctx = test_ctx();
+
+        // 1. Configurar PIN
+        let set_res = registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "cache_pin_123" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(set_res["status"], "pin_set");
+
+        // 2. Primer Unlock con PIN: cache miss
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "cache_pin_123" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(state.pin_cache.is_valid());
+
+        // Simulamos bloqueo del agente sin llamar a Lock (ej. bloqueo por inactividad o cambio de bandera)
+        state.is_locked = true;
+
+        // 3. Segundo Unlock sin PIN: cache hit (no ejecuta Argon2i)
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_falls_back_to_argon2_when_cache_miss() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let mut state = AgentState::new(ConfigFile {
+            device_uuid: "test-dev-uuid".to_string(),
+            ..Default::default()
+        })
+        .with_config_directory(temp_dir.path());
+        let ctx = test_ctx();
+
+        registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "my_pin_456" }),
+            )
+            .await
+            .unwrap();
+
+        // Limpiamos explícitamente el caché para forzar cache miss
+        state.pin_cache.clear();
+        assert!(!state.pin_cache.is_valid());
+
+        // Intento de Unlock sin PIN debe fallar al no haber caché
+        let err_no_pin = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err_no_pin,
+            "Campo 'pin' requerido en payload (no hay caché válido)"
+        );
+
+        // Unlock con PIN ejecuta Argon2i y llena el caché
+        let unlock_res = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "my_pin_456" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock_res["status"], "unlocked");
+        assert_eq!(unlock_res["from_cache"], false);
+        assert!(state.pin_cache.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_lock_clears_pin_cache() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let mut state = AgentState::new(ConfigFile {
+            device_uuid: "test-dev-uuid".to_string(),
+            ..Default::default()
+        })
+        .with_config_directory(temp_dir.path());
+        let ctx = test_ctx();
+
+        registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "lock_pin_789" }),
+            )
+            .await
+            .unwrap();
+
+        let unlock = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "lock_pin_789" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock["status"], "unlocked");
+        assert!(state.pin_cache.is_valid());
+
+        // Lock debe limpiar el pin_cache por seguridad
+        let lock_res = registry
+            .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_res["status"], "locked");
+        assert!(!state.pin_cache.is_valid());
+        assert!(state.pin_cache.get().is_none());
+
+        // Posterior Unlock sin PIN falla porque el caché fue limpiado
+        let unlock_fail = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert!(unlock_fail.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pin_update_clears_and_stores_new() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let mut state = AgentState::new(ConfigFile {
+            device_uuid: "test-dev-uuid".to_string(),
+            ..Default::default()
+        })
+        .with_config_directory(temp_dir.path());
+        let ctx = test_ctx();
+
+        registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "old_pin_111" }),
+            )
+            .await
+            .unwrap();
+
+        let _ = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "old_pin_111" }),
+            )
+            .await
+            .unwrap();
+        assert!(state.pin_cache.is_valid());
+
+        // PinUpdate debe limpiar el caché previo y almacenar la nueva clave derivada
+        let update_res = registry
+            .execute(
+                "PinUpdate",
+                &mut state,
+                &ctx,
+                &serde_json::json!({
+                    "old_pin": "old_pin_111",
+                    "new_pin": "new_pin_222"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_res["status"], "pin_updated");
+        assert!(state.pin_cache.is_valid());
+
+        // El nuevo PIN está en caché y permite Unlock inmediato sin enviar PIN
+        state.is_locked = true;
+        let unlock_cache = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock_cache["status"], "unlocked");
+        assert_eq!(unlock_cache["from_cache"], true);
+    }
+
+    #[tokio::test]
+    async fn test_status_reports_pin_cached() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let mut state = AgentState::new(ConfigFile {
+            device_uuid: "test-dev-uuid".to_string(),
+            ..Default::default()
+        })
+        .with_config_directory(temp_dir.path());
+        let ctx = test_ctx();
+
+        // Status inicial antes de configurar PIN
+        let st_init = registry
+            .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st_init["pin_cached"], false);
+        assert_eq!(st_init["pin_cached_remaining_secs"], 0);
+
+        registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "status_pin_333" }),
+            )
+            .await
+            .unwrap();
+
+        let _ = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": "status_pin_333" }),
+            )
+            .await
+            .unwrap();
+
+        let st_after = registry
+            .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st_after["pin_cached"], true);
+        let remaining = st_after["pin_cached_remaining_secs"].as_u64().unwrap();
+        assert!(remaining > 0 && remaining <= 900);
+    }
+
+    #[tokio::test]
+    async fn test_pin_cache_constant_time_no_panic() {
+        let mut cache = PinCache::new(Duration::from_secs(900));
+
+        // Intento de almacenar clave de tamaño incorrecto (ej. 64 bytes o 16 bytes)
+        cache.store(&[1u8; 64]);
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+
+        cache.store(&[1u8; 16]);
+        assert!(!cache.is_valid());
+        assert!(cache.get().is_none());
+
+        // Con clave válida de 32 bytes
+        let valid_key = [9u8; 32];
+        cache.store(&valid_key);
+        assert!(cache.is_valid());
+
+        let retrieved = cache.get();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), [9u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_decrypts_token_and_symmetric_key() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-1234";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        // Preparamos token sintético y lo ciframos con config_key
+        let original_token = sw_config::LoginToken {
+            access_token: "mock_access_token_123".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: "mock_refresh_token_456".to_string(),
+            key: "mock_key_789".to_string(),
+            ..Default::default()
+        };
+        let token_json = serde_json::to_string(&original_token).unwrap();
+        let enc_token = sw_config::encrypt_string(&token_json, &config_key).unwrap();
+
+        // Preparamos clave simétrica de usuario (64 bytes) y la ciframos con config_key
+        use base64::Engine;
+        let original_user_sym_key = [77u8; 64];
+        let user_sym_b64 = base64::engine::general_purpose::STANDARD.encode(original_user_sym_key);
+        let enc_user_sym = sw_config::encrypt_string(&user_sym_b64, &config_key).unwrap();
+
+        let (va, _) = test_agent(1);
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: enc_token,
+            encrypted_user_symmetric_key: enc_user_sym,
+            identity_url: "https://identity.bitwarden.test".to_string(),
+            api_url: "https://api.bitwarden.test".to_string(),
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = Some(va.clone());
+
+        // 1. Primer Unlock con PIN: cache miss
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!va.is_locked());
+        assert!(state.api_client.is_some());
+
+        // 2. Simular bloqueo del agente
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // 3. Segundo Unlock sin PIN: cache hit. Debe descifrar token y user_symmetric_key idénticos
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+
+        // Verificar que el token descifrado coincide exactamente
+        let cached_cfg_key = state.pin_cache.get().unwrap();
+        let decrypted_token = state.config.decrypt_token(&cached_cfg_key).unwrap();
+        assert_eq!(decrypted_token.access_token, original_token.access_token);
+        assert_eq!(decrypted_token.refresh_token, original_token.refresh_token);
+
+        // Verificar que la user_symmetric_key descifrada coincide exactamente
+        let dec_user_sym_b64 =
+            sw_config::decrypt_string(&state.config.encrypted_user_symmetric_key, &cached_cfg_key)
+                .unwrap();
+        let dec_user_sym_bytes = base64::engine::general_purpose::STANDARD
+            .decode(dec_user_sym_b64.trim())
+            .unwrap();
+        assert_eq!(dec_user_sym_bytes, original_user_sym_key);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_empty_encrypted_token() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-empty-tok";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        use base64::Engine;
+        let original_user_sym_key = [77u8; 64];
+        let user_sym_b64 = base64::engine::general_purpose::STANDARD.encode(original_user_sym_key);
+        let enc_user_sym = sw_config::encrypt_string(&user_sym_b64, &config_key).unwrap();
+
+        let (va, _) = test_agent(1);
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: String::new(),
+            encrypted_user_symmetric_key: enc_user_sym,
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = Some(va.clone());
+
+        // 1. Primer Unlock con PIN (cache miss): encrypted_token está vacío -> no crea api_client
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!va.is_locked());
+        assert!(state.api_client.is_none());
+
+        // 2. Simular bloqueo
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // 3. Segundo Unlock sin PIN (cache hit): encrypted_token sigue vacío -> api_client permanece None
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+        assert!(state.api_client.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_empty_encrypted_user_symmetric_key() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-empty-sym";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        let (va, _) = test_agent(1);
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: String::new(),
+            encrypted_user_symmetric_key: String::new(),
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = Some(va.clone());
+
+        // 1. Primer Unlock con PIN (cache miss): enc_sym vacío -> fallback a from_parts
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!va.is_locked());
+
+        // 2. Simular bloqueo
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // 3. Segundo Unlock sin PIN (cache hit): enc_sym vacío -> fallback a from_parts
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_decrypt_string_fails() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-corrupt-sym";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        // Generar un EncString válido y corromperlo cambiando el último carácter (MAC inválida)
+        let valid_enc =
+            sw_config::encrypt_string("dummy_user_symmetric_key_payload", &config_key).unwrap();
+        let mut chars: Vec<char> = valid_enc.chars().collect();
+        let last_idx = chars.len() - 1;
+        chars[last_idx] = if chars[last_idx] == 'A' { 'B' } else { 'A' };
+        let corrupted_enc: String = chars.into_iter().collect();
+
+        let (va, _) = test_agent(1);
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: String::new(),
+            encrypted_user_symmetric_key: corrupted_enc,
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = Some(va.clone());
+
+        // 1. Primer Unlock con PIN (cache miss): decrypt_string falla -> fallback a from_parts
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!va.is_locked());
+
+        // 2. Simular bloqueo
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // 3. Segundo Unlock sin PIN (cache hit): decrypt_string falla -> fallback a from_parts sin pánico
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_base64_decode_fails() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-bad-b64";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        // 1. Cifrar un string que se descifra correctamente pero NO es base64 válido
+        let not_base64 = "this string is definitely NOT valid base64!!! @@##";
+        let enc_not_b64 = sw_config::encrypt_string(not_base64, &config_key).unwrap();
+
+        let (va, _) = test_agent(1);
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: String::new(),
+            encrypted_user_symmetric_key: enc_not_b64,
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = Some(va.clone());
+
+        // Unlock con PIN (cache miss): base64 decode falla -> fallback a from_parts
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!va.is_locked());
+
+        // Simular bloqueo
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // Unlock sin PIN (cache hit): base64 decode falla -> fallback a from_parts
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+
+        // 2. Probar rama adicional: base64 decode es válido pero longitud no es 64 bytes (falla from_bytes)
+        use base64::Engine;
+        let short_key_b64 = base64::engine::general_purpose::STANDARD.encode([42u8; 16]);
+        let enc_short_key = sw_config::encrypt_string(&short_key_b64, &config_key).unwrap();
+        state.config.encrypted_user_symmetric_key = enc_short_key;
+
+        // Simular bloqueo
+        state.is_locked = true;
+        va.lock().await;
+        assert!(va.is_locked());
+
+        // Unlock sin PIN (cache hit): decode ok, from_bytes falla (16 != 64) -> fallback a from_parts
+        let unlock3 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock3["status"], "unlocked");
+        assert_eq!(unlock3["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(!va.is_locked());
+    }
+
+    #[tokio::test]
+    async fn test_unlock_cache_hit_no_vault_agent() {
+        let registry = default_registry();
+        let (_state, temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        let device_uuid = "test-device-uuid-no-va";
+        let pin = "correct_secret_pin";
+        let config_key =
+            sw_config::derive_config_key_with_params(pin, device_uuid, AGENT_KDF_MEMORY_KIB)
+                .unwrap();
+        let config_key_hash = sw_config::hash_config_key(&config_key);
+
+        let cfg = ConfigFile {
+            device_uuid: device_uuid.to_string(),
+            config_key_hash,
+            encrypted_token: String::new(),
+            encrypted_user_symmetric_key: String::new(),
+            ..Default::default()
+        };
+
+        let mut state = AgentState::new(cfg).with_config_directory(temp_dir.path());
+        state.vault_agent = None; // Sin vault_agent
+
+        // 1. Unlock con PIN: cache miss sin vault_agent
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(unlock1["from_cache"], false);
+        assert!(!state.is_locked);
+        assert!(state.vault_agent.is_none());
+
+        // 2. Simular bloqueo
+        state.is_locked = true;
+
+        // 3. Unlock sin PIN: cache hit sin vault_agent
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert!(!state.is_locked);
+        assert!(state.vault_agent.is_none());
     }
 }

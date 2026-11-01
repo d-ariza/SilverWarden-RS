@@ -92,6 +92,20 @@
 - **Retoma:** M6/M7.
 - **Estado:** Abierta.
 
+### DT-19 — El CLI no consulta `Status` antes de `Unlock` para omitir el prompt de PIN
+- **Descripción:** En SW-050 se implementó el PinCache en `sw-agent` y el atajo de cache hit cuando no se envía PIN en el payload de `Unlock`. Sin embargo, `sw-cli` (`silverwarden unlock`) aún solicita interactivamente el PIN por terminal antes de enviar la petición IPC, en lugar de consultar primero la acción `Status` del agente para verificar si `pin_cached: true` y omitir el prompt.
+- **Impacto:** Bajo (usabilidad en terminal). El atajo está disponible para clientes IPC (como la futura GUI M7 o llamadas de automatización), pero el CLI aún pide el PIN antes de despachar.
+- **Motivo:** Fuera del alcance estricto de SW-050 (enfocado en el subsistema de agente `sw-agent`).
+- **Retoma:** M6 (refactorización de comandos de sesión en CLI) o M7.
+- **Estado:** Abierta.
+
+### DT-20 — PinCache usa sleep real en tests de TTL (no determinista)
+- **Descripción:** En `sw-agent`, los tests de TTL de `PinCache` (`test_pin_cache_expires_after_ttl` y `test_pin_cache_ttl_resets_on_get`) utilizan `tokio::time::sleep` real con duraciones cortas (50-70ms) en lugar de avance virtual del reloj (`tokio::time::pause()` y `advance()`), debido a que `Instant::now()` no es interceptado sin habilitar la feature `test-util` de tokio.
+- **Impacto:** Bajo (las pruebas demoran ~200ms en total y pasan de forma consistente en CI local).
+- **Motivo:** Evitar añadir dependencias adicionales o feature flags de prueba en crates de producción.
+- **Retoma:** M6+ (si se requiere determinismo temporal absoluto, introducir una abstracción `Clock` inyectable).
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
