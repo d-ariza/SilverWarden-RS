@@ -821,7 +821,7 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 - Tests unitarios con simulación de señales D-Bus.
 - Cobertura ≥85%.
 
-**Depende de:** SW-050 · **Estado:** Pendiente
+**Depende de:** SW-050 · **Estado:** Hecho (2026-11-01)
 
 ---
 

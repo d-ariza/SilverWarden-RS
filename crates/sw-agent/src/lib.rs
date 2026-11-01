@@ -152,6 +152,7 @@ pub struct AgentState {
     pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
     pub pin_cache: PinCache,
     pub notifier: Arc<dyn sw_notify::Notifier>,
+    pub last_activity: Arc<tokio::sync::RwLock<tokio::time::Instant>>,
 }
 
 impl AgentState {
@@ -169,7 +170,25 @@ impl AgentState {
             api_client: None,
             pin_cache: PinCache::new(pin_cache_ttl),
             notifier: Arc::new(sw_notify::DbusNotifier::new()),
+            last_activity: Arc::new(tokio::sync::RwLock::new(tokio::time::Instant::now())),
         }
+    }
+
+    /// Touches the last activity timestamp, resetting the inactivity counter.
+    pub async fn touch_activity(&self) {
+        let mut guard = self.last_activity.write().await;
+        *guard = tokio::time::Instant::now();
+    }
+
+    /// Returns the duration elapsed since the last IPC or user activity.
+    pub async fn idle_duration(&self) -> Duration {
+        let guard = self.last_activity.read().await;
+        tokio::time::Instant::now().saturating_duration_since(*guard)
+    }
+
+    /// Returns the configured idle time-to-live before automatic lock.
+    pub async fn idle_ttl(&self) -> Duration {
+        Duration::from_secs(self.config.runtime_config.idle_ttl_secs)
     }
 
     /// Sets an injectable desktop notifier.
@@ -1440,6 +1459,10 @@ impl AgentDaemon {
     }
 
     pub async fn handle_message(&self, ctx: &CallingContext, msg: IpcMessage) -> IpcMessage {
+        {
+            let state = self.state.read().await;
+            state.touch_activity().await;
+        }
         let mut state = self.state.write().await;
         match self
             .registry
@@ -1542,6 +1565,158 @@ where
     run_agent_daemon_with_shutdown(socket_path, daemon, shutdown_signal).await
 }
 
+/// Event from systemd-logind via D-Bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogindEvent {
+    PrepareForSleep(bool),
+    Lock,
+}
+
+/// Handles systemd-logind events (PrepareForSleep, Lock), locking the vault if appropriate.
+pub async fn handle_logind_event(state: &Arc<RwLock<AgentState>>, event: LogindEvent) {
+    let should_lock = match event {
+        LogindEvent::PrepareForSleep(start) => start,
+        LogindEvent::Lock => true,
+    };
+    if !should_lock {
+        return;
+    }
+    let mut state_guard = state.write().await;
+    if state_guard.is_locked {
+        return;
+    }
+    state_guard.pin_cache.clear();
+    state_guard.is_locked = true;
+    state_guard.sessions.wipe();
+    let va = state_guard.vault_agent.clone();
+    let notifier = state_guard.notifier.clone();
+    drop(state_guard);
+
+    if let Some(agent) = va {
+        agent.lock().await;
+    }
+    let reason = match event {
+        LogindEvent::PrepareForSleep(_) => "Bóveda bloqueada por suspensión del sistema",
+        LogindEvent::Lock => "Bóveda bloqueada por bloqueo de pantalla",
+    };
+    let _ = notifier.notify("SilverWarden", reason).await;
+}
+
+/// Spawns the inactivity monitor task which periodically checks if idle duration exceeded TTL.
+pub fn spawn_idle_monitor(
+    state: Arc<RwLock<AgentState>>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    check_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(check_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let state_guard = state.read().await;
+                    if state_guard.is_locked {
+                        continue;
+                    }
+                    let idle = state_guard.idle_duration().await;
+                    let ttl = state_guard.idle_ttl().await;
+                    drop(state_guard);
+                    if idle >= ttl {
+                        let mut state_guard = state.write().await;
+                        if state_guard.is_locked {
+                            continue;
+                        }
+                        state_guard.pin_cache.clear();
+                        state_guard.is_locked = true;
+                        state_guard.sessions.wipe();
+                        let va = state_guard.vault_agent.clone();
+                        let notifier = state_guard.notifier.clone();
+                        drop(state_guard);
+
+                        if let Some(agent) = va {
+                            agent.lock().await;
+                        }
+                        let _ = notifier.notify("SilverWarden", "Bóveda bloqueada por inactividad").await;
+                    }
+                }
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    })
+}
+
+/// Spawns the systemd-logind monitor task subscribing to PrepareForSleep and Lock signals.
+pub fn spawn_logind_monitor(
+    state: Arc<RwLock<AgentState>>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use zbus::export::ordered_stream::OrderedStreamExt;
+
+        let connection = match zbus::Connection::system().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("systemd-logind no disponible vía system D-Bus: {e}");
+                return;
+            }
+        };
+
+        let proxy = match zbus::proxy::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Proxy org.freedesktop.login1 no disponible: {e}");
+                return;
+            }
+        };
+
+        let mut prepare_for_sleep = match proxy.receive_signal("PrepareForSleep").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("No se pudo suscribir a señal PrepareForSleep de logind: {e}");
+                return;
+            }
+        };
+
+        let mut lock_signal = match proxy.receive_signal("Lock").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("No se pudo suscribir a señal Lock de logind: {e}");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                res = prepare_for_sleep.next() => {
+                    match res {
+                        Some(msg) => {
+                            if let Ok(start) = msg.body().deserialize::<bool>() {
+                                handle_logind_event(&state, LogindEvent::PrepareForSleep(start)).await;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                res = lock_signal.next() => {
+                    match res {
+                        Some(_) => {
+                            handle_logind_event(&state, LogindEvent::Lock).await;
+                        }
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    })
+}
+
 /// Runs the agent server using a custom daemon instance and a shutdown future.
 pub async fn run_agent_daemon_with_shutdown<F>(
     socket_path: &Path,
@@ -1561,6 +1736,14 @@ where
         let mut state = daemon.state.write().await;
         state.shutdown_sender = Some(shutdown_tx);
     }
+
+    let (monitor_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let idle_handle = spawn_idle_monitor(
+        daemon.state.clone(),
+        monitor_shutdown_tx.subscribe(),
+        Duration::from_secs(5),
+    );
+    let logind_handle = spawn_logind_monitor(daemon.state.clone(), monitor_shutdown_tx.subscribe());
 
     tokio::pin!(shutdown_signal);
 
@@ -1597,6 +1780,9 @@ where
             }
         }
     }
+
+    let _ = monitor_shutdown_tx.send(());
+    let _ = tokio::join!(idle_handle, logind_handle);
 
     // Clean up socket file on shutdown
     let _ = std::fs::remove_file(socket_path);
@@ -4975,5 +5161,176 @@ mod tests {
         assert_eq!(lock_res["status"], "locked");
         assert!(state.is_locked);
         assert!(mock_notifier.notifications().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_last_activity_updates_on_ipc() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = false;
+        let daemon = AgentDaemon::with_state(state);
+        let ctx = test_ctx();
+
+        let past = tokio::time::Instant::now() - Duration::from_secs(60);
+        *daemon.state.read().await.last_activity.write().await = past;
+
+        let idle_before = daemon.state.read().await.idle_duration().await;
+        assert!(idle_before >= Duration::from_secs(59));
+
+        let msg = IpcMessage::new("Status", serde_json::json!({}));
+        let _ = daemon.handle_message(&ctx, msg).await;
+
+        let idle_after = daemon.state.read().await.idle_duration().await;
+        assert!(idle_after < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_idle_monitor_locks_after_ttl() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = false;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        state.notifier = mock_notifier.clone();
+        state.config.runtime_config.idle_ttl_secs = 10;
+        let state_arc = Arc::new(RwLock::new(state));
+
+        let past = tokio::time::Instant::now() - Duration::from_secs(20);
+        *state_arc.read().await.last_activity.write().await = past;
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let monitor_handle = spawn_idle_monitor(
+            state_arc.clone(),
+            shutdown_tx.subscribe(),
+            Duration::from_millis(10),
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+
+        assert!(state_arc.read().await.is_locked);
+        let notifs = mock_notifier.notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(
+            notifs[0],
+            (
+                "SilverWarden".to_string(),
+                "Bóveda bloqueada por inactividad".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_monitor_resets_on_activity() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = false;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        state.notifier = mock_notifier.clone();
+        state.config.runtime_config.idle_ttl_secs = 100;
+        let state_arc = Arc::new(RwLock::new(state));
+
+        *state_arc.read().await.last_activity.write().await =
+            tokio::time::Instant::now() - Duration::from_secs(50);
+
+        state_arc.read().await.touch_activity().await;
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let monitor_handle = spawn_idle_monitor(
+            state_arc.clone(),
+            shutdown_tx.subscribe(),
+            Duration::from_millis(10),
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+
+        assert!(!state_arc.read().await.is_locked);
+        assert!(mock_notifier.notifications().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_logind_prepare_for_sleep_locks() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = false;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        state.notifier = mock_notifier.clone();
+        let state_arc = Arc::new(RwLock::new(state));
+
+        // PrepareForSleep(false) should not lock
+        handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(false)).await;
+        assert!(!state_arc.read().await.is_locked);
+        assert!(mock_notifier.notifications().is_empty());
+
+        // PrepareForSleep(true) should lock
+        handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(true)).await;
+        assert!(state_arc.read().await.is_locked);
+        let notifs = mock_notifier.notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(
+            notifs[0],
+            (
+                "SilverWarden".to_string(),
+                "Bóveda bloqueada por suspensión del sistema".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logind_lock_signal_locks() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = false;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        state.notifier = mock_notifier.clone();
+        let state_arc = Arc::new(RwLock::new(state));
+
+        handle_logind_event(&state_arc, LogindEvent::Lock).await;
+        assert!(state_arc.read().await.is_locked);
+        let notifs = mock_notifier.notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(
+            notifs[0],
+            (
+                "SilverWarden".to_string(),
+                "Bóveda bloqueada por bloqueo de pantalla".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_monitor_does_not_lock_when_already_locked() {
+        let (mut state, _temp_dir) = temp_state();
+        state.is_locked = true;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        state.notifier = mock_notifier.clone();
+        state.config.runtime_config.idle_ttl_secs = 1;
+        let state_arc = Arc::new(RwLock::new(state));
+
+        *state_arc.read().await.last_activity.write().await =
+            tokio::time::Instant::now() - Duration::from_secs(10);
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let monitor_handle = spawn_idle_monitor(
+            state_arc.clone(),
+            shutdown_tx.subscribe(),
+            Duration::from_millis(10),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+
+        handle_logind_event(&state_arc, LogindEvent::Lock).await;
+        handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(true)).await;
+
+        assert!(state_arc.read().await.is_locked);
+        assert!(mock_notifier.notifications().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_logind_monitor_shutdown() {
+        let state = Arc::new(RwLock::new(AgentState::default()));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_logind_monitor(state, shutdown_tx.subscribe());
+        let _ = shutdown_tx.send(());
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok());
     }
 }

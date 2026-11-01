@@ -273,5 +273,46 @@ Cada decisión se registra con:
 - **Evidencia:** `crates/sw-notify/tests/manual_dbus.rs`, cobertura `sw-notify` del 94.68% de líneas.
 - **Estado:** Vigente.
 
+## D-M6-9 — Lock automático por inactividad, suspensión del sistema y bloqueo de pantalla
+
+- **Fecha:** 2026-11-01
+- **Contexto:** El agente debe proteger el vault de accesos no autorizados cuando el usuario se aleja o suspende su equipo, replicando la paridad con Goldwarden Go.
+- **Decisión:** Implementar bloqueo automático ante 3 eventos: (1) inactividad por exceder el TTL configurado sin peticiones IPC, (2) suspensión del sistema señalada por `PrepareForSleep(start=true)` de `systemd-logind`, y (3) bloqueo de pantalla señalado por `Lock` de `systemd-logind`. Cada evento limpia `PinCache`, ejecuta `sessions.wipe()`, bloquea `vault_agent`, y emite la notificación de escritorio correspondiente.
+- **Alternativas:**
+  - (a) Delegar el bloqueo exclusivamente al usuario o CLI. Rechazada: infringe la especificación de seguridad de Goldwarden ante suspensión y desatención física.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`handle_logind_event`, `spawn_idle_monitor`), tests `test_idle_monitor_locks_after_ttl`, `test_logind_prepare_for_sleep_locks`, `test_logind_lock_signal_locks`.
+- **Estado:** Vigente.
+
+## D-M6-10 — TTL default de 600 segundos (10 min) configurable en RuntimeConfig
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Se requiere un intervalo de tiempo de inactividad razonable y configurable para el bloqueo de la bóveda.
+- **Decisión:** Establecer un TTL default de 600 segundos (10 minutos) en `RuntimeConfig.idle_ttl_secs`, configurable vía `silverwarden.json` con soporte de aliases `idle_ttl_secs` y `idleTtlSecs`. Es más estricto que el TTL de `PinCache` (900s) debido a que la bóveda abierta expone credenciales y secretos completos.
+- **Alternativas:**
+  - (a) Usar el mismo TTL de PinCache (15 min). Rechazada: 10 minutos proporciona mayor seguridad contra accesos no autorizados en terminales desatendidas.
+- **Evidencia:** `crates/sw-config/src/lib.rs` (`DEFAULT_IDLE_TTL_SECS = 600`), test `test_runtime_config_idle_ttl_secs_default_and_roundtrip`.
+- **Estado:** Vigente.
+
+## D-M6-11 — Contador de inactividad basado en `tokio::time::Instant` y `touch_activity`
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Cada petición IPC al demonio debe actualizar el temporizador de inactividad sin causar contención de locks en el estado global.
+- **Decisión:** Proteger el timestamp `last_activity` con un `Arc<tokio::sync::RwLock<tokio::time::Instant>>` independiente dentro de `AgentState`. En `handle_message`, invocar `state.touch_activity().await` adquiriendo y liberando de inmediato el lock de actividad antes de procesar el mensaje con el registro de acciones.
+- **Alternativas:**
+  - (a) Mantener el timestamp dentro del lock `write().await` global durante toda la ejecución de los handlers. Rechazada: introduciría contención innecesaria en operaciones de larga duración.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`touch_activity`, `handle_message`), test `test_last_activity_updates_on_ipc`.
+- **Estado:** Vigente.
+
+## D-M6-12 — Monitoreo de `systemd-logind` en bus de sistema con fallback silencioso
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Los eventos de suspensión (`PrepareForSleep`) y bloqueo (`Lock`) provienen de `org.freedesktop.login1` en el bus de sistema D-Bus (`zbus::Connection::system()`). En entornos de desarrollo, contenedores o sistemas no-systemd, el bus de sistema o logind pueden no estar disponibles.
+- **Decisión:** Ejecutar `spawn_logind_monitor` en un task en segundo plano que intente conectarse a `org.freedesktop.login1`. Si la conexión o las suscripciones fallan, emitir un warning vía `tracing::warn!` y finalizar la tarea limpiamente sin abortar el demonio del agente.
+- **Alternativas:**
+  - (a) Abortar el arranque del daemon si `systemd-logind` no responde. Rechazada: impediría usar el agente en entornos WSL, contenedores Docker o entornos no-systemd.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`spawn_logind_monitor`), test `test_spawn_logind_monitor_shutdown`, `crates/sw-agent/tests/manual_logind.rs`.
+- **Estado:** Vigente.
+
+
 
 

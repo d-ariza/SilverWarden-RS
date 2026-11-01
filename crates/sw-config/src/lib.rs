@@ -168,6 +168,12 @@ pub fn default_pin_cache_ttl_secs() -> u64 {
     DEFAULT_PIN_CACHE_TTL_SECS
 }
 
+pub const DEFAULT_IDLE_TTL_SECS: u64 = 600;
+
+pub fn default_idle_ttl_secs() -> u64 {
+    DEFAULT_IDLE_TTL_SECS
+}
+
 /// Runtime configuration matching Goldwarden Go RuntimeConfig.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
@@ -194,6 +200,12 @@ pub struct RuntimeConfig {
         alias = "pinCacheTtlSecs"
     )]
     pub pin_cache_ttl_secs: u64,
+    #[serde(
+        default = "default_idle_ttl_secs",
+        alias = "idle_ttl_secs",
+        alias = "idleTtlSecs"
+    )]
+    pub idle_ttl_secs: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -213,6 +225,7 @@ impl Default for RuntimeConfig {
             goldwarden_socket_path: String::new(),
             daemon_auth_token: String::new(),
             pin_cache_ttl_secs: default_pin_cache_ttl_secs(),
+            idle_ttl_secs: default_idle_ttl_secs(),
         }
     }
 }
@@ -1492,6 +1505,7 @@ mod tests {
                 goldwarden_socket_path: "/tmp/gw.sock".to_string(),
                 daemon_auth_token: "token123".to_string(),
                 pin_cache_ttl_secs: 900,
+                idle_ttl_secs: 600,
             },
             danger_accept_invalid_certs: true,
             server_url: "https://vw.local".to_string(),
@@ -1539,6 +1553,7 @@ mod tests {
         assert!(rt_map.contains_key("DeviceUUID"));
         assert!(rt_map.contains_key("SSHAgentSocketPath"));
         assert!(rt_map.contains_key("PinCacheTtlSecs"));
+        assert!(rt_map.contains_key("IdleTtlSecs"));
 
         // Test reading from a Go sample without the 2 new fields or RuntimeConfig
         let go_json = r#"{
@@ -1609,6 +1624,42 @@ mod tests {
         };
         let serialized = serde_json::to_string(&custom).expect("serialize");
         assert!(serialized.contains(r#""PinCacheTtlSecs":1800"#));
+        let roundtrip: RuntimeConfig = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(custom, roundtrip);
+    }
+
+    #[test]
+    fn test_runtime_config_idle_ttl_secs_default_and_roundtrip() {
+        // Default applies 600
+        let default_rt = RuntimeConfig::default();
+        assert_eq!(default_rt.idle_ttl_secs, 600);
+
+        // Deserializing empty JSON object produces default 600
+        let from_empty: RuntimeConfig = serde_json::from_str("{}").expect("empty json object");
+        assert_eq!(from_empty.idle_ttl_secs, 600);
+
+        // Deserializing with PascalCase key
+        let with_pascal: RuntimeConfig =
+            serde_json::from_str(r#"{"IdleTtlSecs": 900}"#).expect("pascal json");
+        assert_eq!(with_pascal.idle_ttl_secs, 900);
+
+        // Deserializing with alias snake_case
+        let with_snake: RuntimeConfig =
+            serde_json::from_str(r#"{"idle_ttl_secs": 300}"#).expect("snake json");
+        assert_eq!(with_snake.idle_ttl_secs, 300);
+
+        // Deserializing with alias camelCase
+        let with_camel: RuntimeConfig =
+            serde_json::from_str(r#"{"idleTtlSecs": 120}"#).expect("camel json");
+        assert_eq!(with_camel.idle_ttl_secs, 120);
+
+        // Roundtrip serialization
+        let custom = RuntimeConfig {
+            idle_ttl_secs: 1800,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&custom).expect("serialize");
+        assert!(serialized.contains(r#""IdleTtlSecs":1800"#));
         let roundtrip: RuntimeConfig = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(custom, roundtrip);
     }

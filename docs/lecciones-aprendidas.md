@@ -320,3 +320,15 @@ Estos principios deben ser la base de la v2 (si se hace). La v2 debería:
 
 **Generalización:** Cualquier integración con servicios del sistema operativo (D-Bus, sockets del sistema, biometría, demonios de escritorio) debe interactuar a través de traits inyectables. Las pruebas automatizadas estándar deben ejecutarse 100% en memoria contra mocks; las pruebas reales deben ser pruebas de integración aisladas sin romper el pipeline de CI ni distorsionar la cobertura del código productivo.
 
+
+### 8.10. Manejo de señales D-Bus del sistema y temporizadores de inactividad asíncronos
+
+**Problema:** El bloqueo automático de una bóveda de contraseñas requiere coordinar dos fuentes independientes de eventos: señales del sistema operativo (`PrepareForSleep` y `Lock` emitidas por `systemd-logind` sobre el bus de sistema) y un temporizador deslizante de inactividad de peticiones IPC. En sistemas sin `systemd` o entornos de prueba/CI sin bus de sistema accesible, el demonio no debe fallar al iniciar, y el temporizador no debe generar condiciones de carrera o contención innecesaria al acceder al estado del agente.
+
+**Solución:**
+1. Desacoplar el timestamp de actividad en `Arc<tokio::sync::RwLock<tokio::time::Instant>>` para que `handle_message` lo actualice de forma inmediata sin retener bloqueos mutables durante el procesamiento de comandos largos.
+2. Emplear tareas en segundo plano (`tokio::spawn`) coordinadas con receptores `tokio::sync::broadcast` para un apagado limpio y coordinado durante el shutdown del demonio.
+3. En `spawn_logind_monitor`, aplicar degradación elegante con registro de advertencia (`tracing::warn!`) y retorno limpio si el bus de sistema D-Bus o el servicio `org.freedesktop.login1` no están disponibles.
+4. Desacoplar la lógica de procesamiento de eventos (`handle_logind_event`) en funciones directas sobre `Arc<RwLock<AgentState>>`, permitiendo pruebas unitarias deterministas en memoria y aislando los tests reales contra D-Bus en `tests/manual_logind.rs` con `#[ignore]`.
+
+**Generalización:** Las dependencias del sistema operativo para eventos de ciclo de vida (suspensión, bloqueo de pantalla) deben aislarse en monitores asíncronos con fallback tolerante a fallos. La lógica de negocio que responde a los eventos debe estar desacoplada de la capa de transporte que los recibe para garantizar la testabilidad unitaria en cualquier plataforma sin dependencias de infraestructura externa.

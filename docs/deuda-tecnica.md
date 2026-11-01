@@ -34,14 +34,14 @@
 - **Impacto:** Bajo (funcionalidad, no seguridad).
 - **Motivo:** Se pospuso a M6 (SW-053).
 - **Retoma:** M6.
-- **Estado:** Abierta.
+- **Estado:** Cerrada (SW-053, backend D-Bus Notifications implementado con fallback silencioso).
 
 ### DT-9 — Lock por inactividad no implementado
 - **Descripción:** El agente no bloquea el vault automáticamente si el sistema está inactivo.
 - **Impacto:** Medio. Un usuario que deja la sesión abierta podría tener el vault expuesto.
 - **Motivo:** Se pospuso a M6 (SW-052).
 - **Retoma:** M6.
-- **Estado:** Abierta.
+- **Estado:** Cerrada (SW-052, implementado contador de inactividad configurable y monitoreo de PrepareForSleep/Lock de logind).
 
 ### DT-10 — Biometría (polkit) no implementada
 - **Descripción:** El agente no usa biometría para desbloquear el vault.
@@ -111,6 +111,13 @@
 - **Impacto:** Bajo para MVP CLI/Daemon local (la inmensa mayoría de distribuciones Linux exponen `org.freedesktop.Notifications` en la sesión de usuario).
 - **Motivo:** Evitar dependencias adicionales pesadas (como `ashpd`) o complejidad de IPC en la fase M6.
 - **Retoma:** M10 (Portabilidad y Empaquetado).
+- **Estado:** Abierta.
+
+### DT-22 — Integración de systemd-logind probada manualmente o ignorada en CI
+- **Descripción:** La suscripción a señales D-Bus de `systemd-logind` (`PrepareForSleep`, `Lock`) se prueba unitariamente a nivel de lógica en `handle_logind_event` y con `spawn_idle_monitor`, pero la prueba de integración contra el bus de sistema D-Bus real (`tests/manual_logind.rs`) está marcada con `#[ignore]` para evitar fallos en entornos CI headless o contenedores donde no corre `systemd-logind`.
+- **Impacto:** Bajo. La lógica de bloqueo, limpieza de caché y notificaciones está cubierta al 100% en tests unitarios.
+- **Motivo:** Ausencia del bus de sistema de `systemd-logind` en runners CI estándar.
+- **Retoma:** M10 (CI e2e con contenedor o VM con bus de sistema activo).
 - **Estado:** Abierta.
 
 ---

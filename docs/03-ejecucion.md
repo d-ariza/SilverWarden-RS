@@ -1904,3 +1904,41 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 
 
 
+
+---
+
+### 6.3 [SW-052] Lock por inactividad y suspensión del sistema
+
+**Fecha:** 2026-11-01  
+**Objetivo:** Implementar el bloqueo automático de la bóveda ante: (1) inactividad por exceder el tiempo de espera configurado (`idle_ttl_secs`, default 600s / 10 min) sin peticiones IPC, (2) suspensión del sistema señalada por `PrepareForSleep(start=true)` de `systemd-logind`, y (3) bloqueo de pantalla señalado por la señal `Lock` de `systemd-logind` sobre D-Bus del sistema.
+
+#### Decisiones de diseño aplicadas
+- **D-M6-9:** Bloqueo automático ante 3 eventos de ciclo de vida (inactividad, suspensión y bloqueo de pantalla), garantizando purga de `PinCache`, reseteo de sesiones en memoria y llamada a `vault_agent.lock()`, emitiendo notificaciones descriptivas.
+- **D-M6-10:** TTL default de 600 segundos (10 min) en `RuntimeConfig.idle_ttl_secs`, configurable vía `silverwarden.json` con soporte de aliases `idle_ttl_secs` y `idleTtlSecs`.
+- **D-M6-11:** Temporizador de inactividad desacoplado mediante `Arc<tokio::sync::RwLock<tokio::time::Instant>>` y reseteado mediante `touch_activity()` en cada petición en `handle_message` sin contención del lock principal.
+- **D-M6-12:** Monitoreo de `systemd-logind` en segundo plano mediante `spawn_logind_monitor` sobre el bus de sistema D-Bus con fallback silencioso (`tracing::warn!`) ante entornos sin systemd o sin bus de sistema.
+
+#### Archivos modificados
+- `crates/sw-config/src/lib.rs`: campo `idle_ttl_secs` en `RuntimeConfig`, constante `DEFAULT_IDLE_TTL_SECS = 600`, helper `default_idle_ttl_secs()`, serde default y aliases, y test `test_runtime_config_idle_ttl_secs_default_and_roundtrip`.
+- `crates/sw-agent/Cargo.toml`: dependencia `zbus = { workspace = true }`.
+- `crates/sw-agent/src/lib.rs`: campo `last_activity` en `AgentState`, métodos `touch_activity`, `idle_duration`, `idle_ttl`; enum `LogindEvent`, funciones `handle_logind_event`, `spawn_idle_monitor`, `spawn_logind_monitor`; integración de monitores y canal de broadcast en `run_agent_daemon_with_shutdown`; invocación de `touch_activity` en `handle_message`; 7 tests unitarios nuevos.
+- `crates/sw-agent/tests/manual_logind.rs`: prueba de integración D-Bus real aislada con `#[ignore]`.
+- `docs/decisiones.md`: decisiones registradas D-M6-9 a D-M6-12.
+- `docs/deuda-tecnica.md`: adición de DT-22, actualización de DT-8 y DT-9 a cerradas.
+- `docs/backlog.md`: SW-052 marcado como `Hecho (2026-11-01)`.
+- `docs/lecciones-aprendidas.md`: lección 8.10 añadida.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config` | 31 pasan, 0 fallan |
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 64 pasan, 1 ignorado (`manual_logind.rs`), 0 fallan |
+| Pruebas manuales D-Bus logind | `cargo test -p sw-agent --test manual_logind -- --ignored` | 1 pasa, 0 fallan |
+| Pruebas workspace completo | `cargo test --workspace --exclude sw-gui` | 436 pasan, 0 fallan, 2 ignorados |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) |
+| Cobertura `sw-config` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **95.99%** líneas / **94.97%** regiones (gate ≥85% ampliamente superado) |
+| Cobertura `sw-agent/src/lib.rs` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.19%** líneas / **96.96%** regiones (gate ≥85% ampliamente superado) |
+| Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.17%** líneas / **93.13%** regiones (gate ≥90% ampliamente superado) |
