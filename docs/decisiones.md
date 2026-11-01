@@ -144,3 +144,21 @@ Cada decisión se registra con:
 - **Alternativas:** Omitir `encryptedFor` y requerir parches en el servidor (incompatible con instancias existentes).
 - **Evidencia:** `crates/sw-vault/src/lib.rs`, `crates/sw-agent/src/lib.rs`, validación exitosa en servidor real.
 - **Estado:** Vigente.
+
+## D49 — Cabecera `Bitwarden-Client-Version` moderna (>= 2024.12.0)
+
+- **Fecha:** 2026-10-31
+- **Contexto:** Vaultwarden (en su endpoint `GET /sync`) filtra y omite los ciphers de tipo 5 (`CipherType::SshKey`) si la cabecera `Bitwarden-Client-Version` enviada por el cliente no cumple la restricción semver `>= 2024.12.0`. Nuestro cliente enviaba `0.0.1`, haciendo que Vaultwarden omitiera las claves SSH descargadas.
+- **Decisión:** Actualizar `BITWARDEN_CLIENT_VERSION` en `crates/sw-bitwarden-api/src/lib.rs` a `"2024.12.0"`.
+- **Alternativas:** Mantener `0.0.1` (provoca sincronización incompleta de ítems tipo 5 en Vaultwarden).
+- **Evidencia:** `crates/sw-bitwarden-api/src/lib.rs`, test `test_sync_sends_modern_client_version_header`, y verificación en Vaultwarden local donde se sincronizan los 8 ciphers incluyendo las 2 claves SSH.
+- **Estado:** Vigente.
+
+## D50 — Aislamiento de almacenamiento en WebSocket Daemon vía inyección de `VaultPaths`
+
+- **Fecha:** 2026-10-31
+- **Contexto:** Al recibir notificaciones push `SyncCiphers` / `SyncVault`, el daemon de WebSocket invocaba `do_full_sync` utilizando `VaultPaths::default_paths()`. En entornos de pruebas esto escribía directamente en `~/.local/share/silverwarden/vault.json` del usuario host, violando el principio de aislamiento de tests.
+- **Decisión:** Exigir `vault_paths: VaultPaths` como parámetro explícito en `run_websocket_daemon` y `run_websocket_daemon_with_options`. Los tests inyectan un `VaultPaths::new(&temp_dir.path().join("cache"))`, mientras que en runtime de producción se provee la ruta estándar del sistema.
+- **Alternativas:** Modificar variables globales de directorio de datos o asumir que el test corre en contenedor efímero (frágil y riesgoso para el entorno del desarrollador).
+- **Evidencia:** `crates/sw-bitwarden-api/src/websocket.rs`, test `test_websocket_sync_writes_to_injected_vault_path` que verifica que la escritura ocurre dentro del `TempDir` y que el archivo real del host permanece intacto.
+- **Estado:** Vigente.

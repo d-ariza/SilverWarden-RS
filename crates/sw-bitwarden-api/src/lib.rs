@@ -29,7 +29,7 @@ pub use twofactor::{
 pub const BITWARDEN_USER_AGENT: &str = "silverwarden/0.0.1";
 pub const BITWARDEN_DEVICE_TYPE: &str = "10";
 pub const BITWARDEN_CLIENT_NAME: &str = "silverwarden";
-pub const BITWARDEN_CLIENT_VERSION: &str = "0.0.1";
+pub const BITWARDEN_CLIENT_VERSION: &str = "2024.12.0";
 
 #[derive(Error, Debug)]
 pub enum ApiError {
@@ -1988,6 +1988,41 @@ mod tests {
         assert_eq!(sync_data.folders.len(), 1);
         assert_eq!(sync_data.ciphers.len(), 1);
         assert_eq!(sync_data.ciphers[0].r#type, sw_vault::CipherType::Login);
+    }
+
+    #[tokio::test]
+    async fn test_sync_sends_modern_client_version_header() {
+        let server = MockServer::start().await;
+
+        let sample_sync_json = serde_json::json!({
+            "profile": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "name": "Test User",
+                "email": "user@example.com"
+            },
+            "folders": [],
+            "ciphers": []
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .and(header("Authorization", "Bearer sync_token"))
+            .and(header("Bitwarden-Client-Version", "2024.12.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_sync_json))
+            .mount(&server)
+            .await;
+
+        let token = LoginToken {
+            access_token: "sync_token".to_string(),
+            ..LoginToken::default()
+        };
+
+        let client = AuthenticatedClient::from_token(server.uri(), server.uri(), token);
+        let res = client.sync().await;
+        assert!(
+            res.is_ok(),
+            "Sync must send Bitwarden-Client-Version: 2024.12.0 and succeed"
+        );
     }
 
     #[tokio::test]

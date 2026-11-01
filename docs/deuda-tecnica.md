@@ -65,11 +65,11 @@
 - **Estado:** Abierta.
 
 ### DT-13 — Normalizar las claves SSH en Vaultwarden
-- **Descripción:** En Vaultwarden local funcionó con claves de tipo `SSHKey` (tipo 5), pero en instancias como Disroot se guardaron históricamente como `SecureNote`. El agente Rust debe manejar ambos formatos, pero Vaultwarden cuenta con una bandera experimental (`EXPERIMENTAL_CLIENT_FEATURE_FLAGS`) que podríamos necesitar activar para clientes modernos.
-- **Impacto:** Medio (compatibilidad entre distintos backends y versiones de Vaultwarden).
-- **Motivo:** Asegurar interoperabilidad tanto con vaults legados como con implementaciones modernas.
+- **Descripción:** En Vaultwarden local funcionó con claves de tipo `SSHKey` (tipo 5), pero en instancias como Disroot se guardaron históricamente como `SecureNote`. Además, Vaultwarden filtra los ciphers tipo 5 si el cliente no reporta `Bitwarden-Client-Version >= 2024.12.0`.
+- **Impacto:** Bajo. Mitigado y resuelto con D-M5-3 (soporte dual de tipo 5 y SecureNote) y D49 (`BITWARDEN_CLIENT_VERSION = "2024.12.0"`).
+- **Motivo:** Asegurar interoperabilidad tanto con vaults legados como con implementaciones modernas de Vaultwarden.
 - **Retoma:** M6/M7.
-- **Estado:** Abierta.
+- **Estado:** Mitigada / Resuelta para Tipo 5 en Vaultwarden moderno (D49).
 
 ### DT-14 — Comandos CLI para Notas, Tarjetas e Identidades
 - **Descripción:** El agente tiene el modelo (`sw-vault`) y la API (`sw-bitwarden-api`), pero el CLI no tiene subcomandos para crear/leer/borrar estos tipos.

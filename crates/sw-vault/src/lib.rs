@@ -2571,4 +2571,100 @@ mod tests {
         assert_eq!(blocking_type5.len(), 1);
         assert_eq!(blocking_legacy.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_sync_regression_all_cipher_types_including_ssh_keys() {
+        let key = SymmetricKey::from_bytes(&[0x77u8; 64]).unwrap();
+
+        let enc_name = |s: &str| {
+            encrypt_with(s.as_bytes(), EncStringType::AesCbc256HmacSha256B64, &key).unwrap()
+        };
+
+        let cipher_login = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Login,
+            name: enc_name("Login Item"),
+            login: Some(LoginCipher {
+                username: Some(enc_name("user")),
+                password: Some(enc_name("pass")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let cipher_note = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Note,
+            name: enc_name("Note Item"),
+            ..Default::default()
+        };
+
+        let cipher_card = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Card,
+            name: enc_name("Card Item"),
+            ..Default::default()
+        };
+
+        let cipher_identity = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::Identity,
+            name: enc_name("Identity Item"),
+            ..Default::default()
+        };
+
+        let cipher_ssh_1 = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::SshKey,
+            name: enc_name("SSH Key 1"),
+            ssh_key: Some(SSHKeyCipher {
+                private_key: Some(enc_name("priv_key_1")),
+                public_key: Some(enc_name("pub_key_1")),
+                key_fingerprint: None,
+            }),
+            ..Default::default()
+        };
+
+        let cipher_ssh_2 = Cipher {
+            id: Some(Uuid::new_v4()),
+            r#type: CipherType::SshKey,
+            name: enc_name("SSH Key 2"),
+            ssh_key: Some(SSHKeyCipher {
+                private_key: Some(enc_name("priv_key_2")),
+                public_key: Some(enc_name("pub_key_2")),
+                key_fingerprint: None,
+            }),
+            ..Default::default()
+        };
+
+        let sync_data = SyncData {
+            ciphers: vec![
+                cipher_login,
+                cipher_note,
+                cipher_card,
+                cipher_identity,
+                cipher_ssh_1,
+                cipher_ssh_2,
+            ],
+            ..Default::default()
+        };
+
+        let store = VaultStore::new();
+        store.load_sync_data(sync_data).await;
+
+        // Verify that load_sync_data inserted all 6 items
+        assert_eq!(store.len().await, 6);
+
+        // Verify get_logins() returns 1
+        let logins = store.get_logins().await;
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].r#type, CipherType::Login);
+
+        // Verify get_ssh_keys() returns 2
+        let ssh_keys = store.get_ssh_keys(&key).await.unwrap();
+        assert_eq!(ssh_keys.len(), 2);
+        let mut names: Vec<String> = ssh_keys.into_iter().map(|k| k.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["SSH Key 1", "SSH Key 2"]);
+    }
 }

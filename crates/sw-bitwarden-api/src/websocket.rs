@@ -334,12 +334,14 @@ pub async fn run_websocket_daemon(
     vault_store: Arc<VaultStore>,
     config: Arc<RwLock<ConfigFile>>,
     user_symmetric_key: SymmetricKey,
+    vault_paths: VaultPaths,
 ) -> Result<(), ApiError> {
     run_websocket_daemon_with_options(
         client,
         vault_store,
         config,
         user_symmetric_key,
+        vault_paths,
         std::time::Duration::from_secs(60),
         None,
     )
@@ -352,6 +354,7 @@ pub async fn run_websocket_daemon_with_options(
     vault_store: Arc<VaultStore>,
     config: Arc<RwLock<ConfigFile>>,
     user_symmetric_key: SymmetricKey,
+    vault_paths: VaultPaths,
     backoff: std::time::Duration,
     mut stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), ApiError> {
@@ -449,8 +452,6 @@ pub async fn run_websocket_daemon_with_options(
             match msg.message_type {
                 NOTIFICATION_SYNC_CIPHERS | NOTIFICATION_SYNC_VAULT => {
                     let api_client = get_or_create_api_client(&client, &config).await;
-                    let vault_paths =
-                        VaultPaths::default_paths().unwrap_or_else(|_| VaultPaths::new("."));
                     let _ = api_client
                         .do_full_sync(&vault_paths, &vault_store, Some(&user_symmetric_key))
                         .await;
@@ -701,12 +702,16 @@ mod tests {
 
         let user_symmetric_key = SymmetricKey::from_parts(&[42u8; 32], &[43u8; 32]).unwrap();
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("cache"));
+
         // 4. Run daemon (will process update, fetch cipher, then logout)
         let daemon_result = run_websocket_daemon(
             client_arc.clone(),
             vault_store.clone(),
             config.clone(),
             user_symmetric_key,
+            vault_paths,
         )
         .await;
 
@@ -797,6 +802,9 @@ mod tests {
 
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("cache"));
+
         let vault_clone = vault_store.clone();
         let daemon_handle = tokio::spawn(async move {
             run_websocket_daemon_with_options(
@@ -804,6 +812,7 @@ mod tests {
                 vault_clone,
                 config,
                 user_symmetric_key,
+                vault_paths,
                 std::time::Duration::from_millis(100),
                 Some(stop_rx),
             )
@@ -902,6 +911,9 @@ mod tests {
         let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("cache"));
+
         let vault_clone = vault_store.clone();
         let daemon_handle = tokio::spawn(async move {
             run_websocket_daemon_with_options(
@@ -909,6 +921,7 @@ mod tests {
                 vault_clone,
                 config,
                 user_symmetric_key,
+                vault_paths,
                 std::time::Duration::from_millis(50),
                 Some(stop_rx),
             )
@@ -980,17 +993,163 @@ mod tests {
         }));
         let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("cache"));
+
         let daemon_res = run_websocket_daemon_with_options(
             client_arc,
             vault_store,
             config,
             user_symmetric_key,
+            vault_paths,
             std::time::Duration::from_millis(100),
             None,
         )
         .await;
 
         assert!(daemon_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_websocket_sync_writes_to_injected_vault_path() {
+        let http_server = MockServer::start().await;
+
+        let sync_data = serde_json::json!({
+            "profile": {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "email": "injected@example.com"
+            },
+            "folders": [],
+            "ciphers": [
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "type": 1,
+                    "name": "2.dGVzdA==|dGVzdA==|dGVzdA==",
+                    "notes": null,
+                    "login": {
+                        "username": null,
+                        "password": null
+                    }
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sync_data))
+            .mount(&http_server)
+            .await;
+
+        let auth_client = Arc::new(AuthenticatedClient::from_token(
+            http_server.uri(),
+            http_server.uri(),
+            LoginToken {
+                access_token: "injected_token".to_string(),
+                ..Default::default()
+            },
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let _ = ws_stream.next().await.unwrap().unwrap();
+            ws_stream
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    "{}\x1e".into(),
+                ))
+                .await
+                .unwrap();
+
+            // Send SyncCiphers (Type: 4)
+            let sync_msg = encode_notification_message(NOTIFICATION_SYNC_CIPHERS, None, true);
+            ws_stream
+                .send(tokio_tungstenite::tungstenite::Message::Binary(sync_msg))
+                .await
+                .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = ws_stream.close(None).await;
+        });
+
+        let ws_url = format!("ws://{}", ws_addr);
+        let ws_client = WebsocketClient::connect(&ws_url, "injected_token")
+            .await
+            .unwrap()
+            .with_api_client(auth_client);
+
+        let client_arc = Arc::new(Mutex::new(ws_client));
+        let vault_store = Arc::new(VaultStore::new());
+        let config = Arc::new(RwLock::new(ConfigFile {
+            notifications_url: ws_url,
+            api_url: http_server.uri(),
+            identity_url: http_server.uri(),
+            ..Default::default()
+        }));
+
+        let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let vault_paths = VaultPaths::new(&cache_dir);
+        let injected_vault_file = vault_paths.vault_file();
+
+        let real_vault_file = VaultPaths::default_paths()
+            .map(|p| p.vault_file())
+            .unwrap_or_else(|_| std::path::PathBuf::from("/nonexistent/vault.json"));
+        let real_file_metadata_before = std::fs::metadata(&real_vault_file).ok();
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let vault_clone = vault_store.clone();
+        let daemon_handle = tokio::spawn(async move {
+            run_websocket_daemon_with_options(
+                client_arc,
+                vault_clone,
+                config,
+                user_symmetric_key,
+                vault_paths,
+                std::time::Duration::from_millis(50),
+                Some(stop_rx),
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if injected_vault_file.exists() {
+                break;
+            }
+        }
+
+        let _ = stop_tx.send(true);
+        let _ = daemon_handle.await;
+
+        assert!(
+            injected_vault_file.exists(),
+            "Vault file should have been written to injected TempDir at {}",
+            injected_vault_file.display()
+        );
+        let content = std::fs::read_to_string(&injected_vault_file).unwrap();
+        assert!(content.contains("injected@example.com"));
+
+        let real_file_metadata_after = std::fs::metadata(&real_vault_file).ok();
+        match (real_file_metadata_before, real_file_metadata_after) {
+            (None, after) => assert!(
+                after.is_none(),
+                "Real home vault file must not be created by test"
+            ),
+            (Some(b), Some(a)) => {
+                let mod_b = b.modified().ok();
+                let mod_a = a.modified().ok();
+                assert_eq!(
+                    mod_b, mod_a,
+                    "Real home vault file must not be modified by test"
+                );
+            }
+            _ => {}
+        }
     }
 
     #[tokio::test]
@@ -1036,11 +1195,15 @@ mod tests {
         }));
         let user_symmetric_key = SymmetricKey::from_parts(&[1u8; 32], &[2u8; 32]).unwrap();
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vault_paths = VaultPaths::new(temp_dir.path().join("cache"));
+
         let daemon_res = run_websocket_daemon_with_options(
             client_arc,
             vault_store,
             config,
             user_symmetric_key,
+            vault_paths,
             std::time::Duration::from_millis(50),
             None,
         )

@@ -426,6 +426,67 @@ where
     Ok(())
 }
 
+/// Formats the human-readable summary of synchronized items by type.
+pub fn format_sync_summary(
+    total: usize,
+    logins: usize,
+    ssh_keys: usize,
+    notes: usize,
+    cards: usize,
+    identities: usize,
+) -> String {
+    if total == 0 {
+        return "Sincronización completada: 0 elementos.".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if logins > 0 {
+        parts.push(if logins == 1 {
+            "1 login".to_string()
+        } else {
+            format!("{logins} logins")
+        });
+    }
+    if ssh_keys > 0 {
+        parts.push(if ssh_keys == 1 {
+            "1 clave SSH".to_string()
+        } else {
+            format!("{ssh_keys} claves SSH")
+        });
+    }
+    if notes > 0 {
+        parts.push(if notes == 1 {
+            "1 nota".to_string()
+        } else {
+            format!("{notes} notas")
+        });
+    }
+    if cards > 0 {
+        parts.push(if cards == 1 {
+            "1 tarjeta".to_string()
+        } else {
+            format!("{cards} tarjetas")
+        });
+    }
+    if identities > 0 {
+        parts.push(if identities == 1 {
+            "1 identidad".to_string()
+        } else {
+            format!("{identities} identidades")
+        });
+    }
+
+    let elem_str = if total == 1 { "elemento" } else { "elementos" };
+    if parts.is_empty() {
+        format!("Sincronización completada: {total} {elem_str}.")
+    } else {
+        format!(
+            "Sincronización completada: {total} {elem_str} ({}).",
+            parts.join(", ")
+        )
+    }
+}
+
 /// Executes a CLI command, returning human-readable output or an error.
 pub async fn handle_command<P>(cli: &Cli, mut prompt_fn: P) -> Result<String, CliError>
 where
@@ -895,10 +956,31 @@ where
             };
             let _ = sw_vault::save_vault(&vault_path, &sync_data);
 
-            let logins = sync_data
+            let non_deleted: Vec<_> = sync_data
                 .ciphers
                 .iter()
-                .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+                .filter(|c| c.deleted_date.is_none())
+                .collect();
+            let total = non_deleted.len();
+            let logins = non_deleted
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::Login)
+                .count();
+            let ssh_keys = non_deleted
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
+                .count();
+            let notes = non_deleted
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::Note)
+                .count();
+            let cards = non_deleted
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::Card)
+                .count();
+            let identities = non_deleted
+                .iter()
+                .filter(|c| c.r#type == sw_vault::CipherType::Identity)
                 .count();
 
             if socket_path.exists() {
@@ -907,8 +989,8 @@ where
                 }
             }
 
-            Ok(format!(
-                "Sincronización completada ({logins} logins descargados)."
+            Ok(format_sync_summary(
+                total, logins, ssh_keys, notes, cards, identities,
             ))
         }
         Commands::Logins { action, filter } => match action {
@@ -2002,7 +2084,7 @@ mod tests {
         };
 
         let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
-        assert!(output.contains("Sincronización completada (5 logins descargados)."));
+        assert!(output.contains("Sincronización completada: 5 elementos (5 logins)."));
     }
 
     #[tokio::test]
@@ -2062,7 +2144,7 @@ mod tests {
         };
 
         let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
-        assert!(output.contains("Sincronización completada (3 logins descargados)."));
+        assert!(output.contains("Sincronización completada: 3 elementos (3 logins)."));
     }
 
     #[tokio::test]
@@ -2185,7 +2267,7 @@ mod tests {
         };
 
         let output = handle_command(&cli, |_| unreachable!()).await.unwrap();
-        assert!(output.contains("Sincronización completada (0 logins descargados)."));
+        assert!(output.contains("Sincronización completada: 1 elemento (1 clave SSH)."));
 
         // 5. Query SSH identities from vault_agent: it should now have "work-laptop"!
         let identities_after = vault_agent.request_identities().await.unwrap();
@@ -2374,6 +2456,22 @@ mod tests {
         let go_sock = home_fake.join(".goldwarden.sock");
         std::fs::write(&go_sock, b"").unwrap();
         assert!(check_goldwarden_go_conflict());
+    }
+
+    #[test]
+    fn test_format_sync_summary_breakdown() {
+        assert_eq!(
+            format_sync_summary(8, 3, 2, 1, 1, 1),
+            "Sincronización completada: 8 elementos (3 logins, 2 claves SSH, 1 nota, 1 tarjeta, 1 identidad)."
+        );
+        assert_eq!(
+            format_sync_summary(0, 0, 0, 0, 0, 0),
+            "Sincronización completada: 0 elementos."
+        );
+        assert_eq!(
+            format_sync_summary(1, 1, 0, 0, 0, 0),
+            "Sincronización completada: 1 elemento (1 login)."
+        );
     }
 
     #[test]

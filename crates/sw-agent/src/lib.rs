@@ -390,17 +390,26 @@ async fn handle_sync(
         }
     }
 
-    let logins = agent
-        .vault()
-        .all()
-        .await
+    let all_ciphers = agent.vault().all().await;
+    let non_deleted: Vec<_> = all_ciphers
         .into_iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+        .filter(|c| c.deleted_date.is_none())
+        .collect();
+    let total = non_deleted.len();
+    let logins = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Login)
+        .count();
+    let ssh_keys = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
         .count();
 
     Ok(serde_json::json!({
         "status": "synced",
         "logins": logins,
+        "total": total,
+        "ssh_keys": ssh_keys,
     }))
 }
 
@@ -423,17 +432,26 @@ async fn handle_sync_data(
     // Load sync data into the agent's VaultStore without modifying existing user_symmetric_key in memory
     agent.vault().load_sync_data(sync_data).await;
 
-    let logins = agent
-        .vault()
-        .all()
-        .await
+    let all_ciphers = agent.vault().all().await;
+    let non_deleted: Vec<_> = all_ciphers
         .into_iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none())
+        .filter(|c| c.deleted_date.is_none())
+        .collect();
+    let total = non_deleted.len();
+    let logins = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Login)
+        .count();
+    let ssh_keys = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
         .count();
 
     Ok(serde_json::json!({
         "status": "synced",
         "logins": logins,
+        "total": total,
+        "ssh_keys": ssh_keys,
     }))
 }
 
