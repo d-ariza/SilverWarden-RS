@@ -520,6 +520,7 @@ where
                 };
 
                 tokio::select! {
+                    // llvm-cov: ignore -- Real SIGINT / ctrl_c signal cannot be simulated in unit test runner without terminating the runner
                     _ = tokio::signal::ctrl_c() => {
                         println!("Señal de parada recibida (Ctrl+C). Deteniendo servicios...");
                     }
@@ -1217,6 +1218,7 @@ where
     }
 }
 
+// llvm-cov: ignore -- Binary entrypoint not invoked by the unit test runner
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -2444,6 +2446,7 @@ mod tests {
     }
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ASYNC_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct EnvGuard {
         key: String,
@@ -4206,5 +4209,1817 @@ mod tests {
             }
             e => panic!("Unexpected error: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_format_sync_summary_additional_combinations() {
+        assert_eq!(
+            format_sync_summary(1, 0, 0, 1, 0, 0),
+            "Sincronización completada: 1 elemento (1 nota)."
+        );
+        assert_eq!(
+            format_sync_summary(1, 0, 0, 0, 1, 0),
+            "Sincronización completada: 1 elemento (1 tarjeta)."
+        );
+        assert_eq!(
+            format_sync_summary(1, 0, 0, 0, 0, 1),
+            "Sincronización completada: 1 elemento (1 identidad)."
+        );
+        assert_eq!(
+            format_sync_summary(2, 0, 0, 0, 0, 2),
+            "Sincronización completada: 2 elementos (2 identidades)."
+        );
+        assert_eq!(
+            format_sync_summary(2, 0, 0, 2, 0, 0),
+            "Sincronización completada: 2 elementos (2 notas)."
+        );
+        assert_eq!(
+            format_sync_summary(5, 0, 2, 0, 3, 0),
+            "Sincronización completada: 5 elementos (2 claves SSH, 3 tarjetas)."
+        );
+        assert_eq!(
+            format_sync_summary(3, 0, 0, 0, 0, 0),
+            "Sincronización completada: 3 elementos."
+        );
+        assert_eq!(
+            format_sync_summary(1, 0, 0, 0, 0, 0),
+            "Sincronización completada: 1 elemento."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_start_terminates_on_agent_bind_failure() {
+        let invalid_sock = PathBuf::from("/nonexistent/directory/never_exists/agent.sock");
+        let cli = test_cli(
+            Some(invalid_sock.clone()),
+            Commands::Agent {
+                action: AgentCommands::Start { no_ssh: true },
+            },
+        );
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        let msg = res.unwrap();
+        assert!(msg.contains("Agente finalizado en"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_start_terminates_on_agent_and_ssh_failure() {
+        let invalid_sock = PathBuf::from("/nonexistent/directory/never_exists/agent.sock");
+        let cli = test_cli(
+            Some(invalid_sock.clone()),
+            Commands::Agent {
+                action: AgentCommands::Start { no_ssh: false },
+            },
+        );
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        let msg = res.unwrap();
+        assert!(msg.contains("Agente finalizado en"));
+    }
+
+    #[tokio::test]
+    async fn test_config_set_empty_urls_validation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = temp_dir.path().join("silverwarden.json");
+
+        let cli_srv = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetServer {
+                    url: "   ".to_string(),
+                },
+            },
+        };
+        let err_srv = handle_command(&cli_srv, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_srv {
+            CliError::Other(msg) => {
+                assert!(msg.contains("La URL del servidor no puede estar vacía"))
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_id = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetIdentity {
+                    url: "".to_string(),
+                },
+            },
+        };
+        let err_id = handle_command(&cli_id, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_id {
+            CliError::Other(msg) => {
+                assert!(msg.contains("La URL de identity no puede estar vacía"))
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_api = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetApi {
+                    url: "  ".to_string(),
+                },
+            },
+        };
+        let err_api = handle_command(&cli_api, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_api {
+            CliError::Other(msg) => assert!(msg.contains("La URL de API no puede estar vacía")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_notif = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetNotifications {
+                    url: "".to_string(),
+                },
+            },
+        };
+        let err_notif = handle_command(&cli_notif, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_notif {
+            CliError::Other(msg) => {
+                assert!(msg.contains("La URL de notifications no puede estar vacía"))
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_subcommands() {
+        let cli_list = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Ssh {
+                ssh_command: SshCommands::List,
+            },
+        };
+        let res_list = handle_command(&cli_list, |_| Ok(String::new()))
+            .await
+            .unwrap();
+        assert!(res_list.contains("Listando claves SSH"));
+
+        let cli_add_empty = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Ssh {
+                ssh_command: SshCommands::Add {
+                    key_id: "  ".to_string(),
+                },
+            },
+        };
+        let err_add = handle_command(&cli_add_empty, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_add {
+            CliError::Other(msg) => {
+                assert!(msg.contains("El nombre de la clave SSH no puede estar vacío"))
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_add_ok = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Ssh {
+                ssh_command: SshCommands::Add {
+                    key_id: "id_ed25519".to_string(),
+                },
+            },
+        };
+        let res_add = handle_command(&cli_add_ok, |_| Ok(String::new()))
+            .await
+            .unwrap();
+        assert!(res_add.contains("Registrando clave SSH id_ed25519"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_2fa_email_provider_success() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user_email_2fa@example.com";
+        let password = "password123";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {
+                    "0": {},
+                    "1": {}
+                },
+                "twoFactorToken": "challenge_token_email_2fa"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/two-factor/send-email-login"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_email_2fa_access_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_email_2fa_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("1".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("654321".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "Email 2FA login failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_2fa_email_send_fails_but_continues() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user_email_send_fail@example.com";
+        let password = "password123";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {
+                    "1": {}
+                },
+                "twoFactorToken": "challenge_token_email_fail"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/two-factor/send-email-login"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal error sending mail"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("1".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("111222".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_2fa_invalid_provider_falls_back_to_totp() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user_fallback@example.com";
+        let password = "password123";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {
+                    "0": {}
+                },
+                "twoFactorToken": "challenge_token_fallback"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("invalid_provider".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("123456".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_2fa_code_invalid() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user_bad_code@example.com";
+        let password = "password123";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {
+                    "0": {}
+                },
+                "twoFactorToken": "challenge_token_bad_code"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=0"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid two-step verification code."
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("0".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("000000".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_empty_server_flag() {
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Login {
+                email: Some("test@example.com".to_string()),
+                password: Some("password".to_string()),
+                server: Some("   ".to_string()),
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => {
+                assert!(msg.contains("La URL del servidor no puede estar vacía"))
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_apikey_from_env_vars() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _g_cid = EnvGuard::new("BW_CLIENTID");
+        let _g_csec = EnvGuard::new("BW_CLIENTSECRET");
+        let _g_em = EnvGuard::new("BW_EMAIL");
+        let _g_pw = EnvGuard::new("BW_PASSWORD");
+
+        unsafe {
+            std::env::set_var("BW_CLIENTID", "user.env_cid");
+            std::env::set_var("BW_CLIENTSECRET", "env_secret_123");
+            std::env::set_var("BW_EMAIL", "env_user@example.com");
+            std::env::set_var("BW_PASSWORD", "env_password_456");
+        }
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(b"env_password_456", "env_user@example.com", &kdf_config)
+                .unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [9u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "apikey_access_token_env",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "apikey_refresh_token_env",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: None,
+                password: None,
+                server: None,
+                apikey: true,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |_| unreachable!()).await;
+        assert!(
+            result.is_ok(),
+            "ApiKey login from env failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_apikey_prompts_missing_credentials() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _g_cid = EnvGuard::new("BW_CLIENTID");
+        let _g_csec = EnvGuard::new("BW_CLIENTSECRET");
+        let _g_em = EnvGuard::new("BW_EMAIL");
+        let _g_pw = EnvGuard::new("BW_PASSWORD");
+
+        unsafe {
+            std::env::remove_var("BW_CLIENTID");
+            std::env::remove_var("BW_CLIENTSECRET");
+            std::env::remove_var("BW_EMAIL");
+            std::env::remove_var("BW_PASSWORD");
+        }
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(b"prompt_pwd", "prompt_user@example.com", &kdf_config)
+                .unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [3u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "apikey_access_token_prompt",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "apikey_refresh_token_prompt",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: None,
+                password: None,
+                server: None,
+                apikey: true,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("client_id") {
+                Ok("prompt_cid".to_string())
+            } else if prompt_str.contains("client_secret") {
+                Ok("prompt_csec".to_string())
+            } else if prompt_str.contains("email") {
+                Ok("prompt_user@example.com".to_string())
+            } else if prompt_str.contains("contraseña") {
+                Ok("prompt_pwd".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "ApiKey login with prompts failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_with_existing_pin_unlocks_config_or_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(b"password", "user@example.com", &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [4u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access_token_pin",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "refresh_pin",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let mut initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        let pin_key = sw_config::derive_config_key_with_params(
+            "1234",
+            &initial_cfg.device_uuid,
+            CLI_KDF_MEMORY_KIB,
+        )
+        .unwrap();
+        initial_cfg.config_key_hash = sw_config::hash_config_key(&pin_key);
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some("user@example.com".to_string()),
+                password: Some("password".to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let res_err = handle_command(&cli, |_| Ok("wrong_pin".to_string())).await;
+        assert!(res_err.is_err());
+        match res_err.unwrap_err() {
+            CliError::Config(msg) => assert!(msg.contains("PIN incorrecto")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let res_ok = handle_command(&cli, |_| Ok("1234".to_string())).await;
+        assert!(res_ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_rate_limit_exceeded() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Rate limit exceeded"))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let mut cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        let config_key =
+            sw_config::derive_config_key_with_params("", &cfg.device_uuid, CLI_KDF_MEMORY_KIB)
+                .unwrap();
+        cfg.set_token(
+            &sw_config::LoginToken {
+                access_token: "test_token".to_string(),
+                expires_in: 3600,
+                token_type: "Bearer".to_string(),
+                refresh_token: "refresh".to_string(),
+                ..Default::default()
+            },
+            &config_key,
+        )
+        .unwrap();
+        cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: true,
+            command: Commands::Sync,
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("bloqueado temporalmente")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_server_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal server error"))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let mut cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        let config_key =
+            sw_config::derive_config_key_with_params("", &cfg.device_uuid, CLI_KDF_MEMORY_KIB)
+                .unwrap();
+        cfg.set_token(
+            &sw_config::LoginToken {
+                access_token: "test_token".to_string(),
+                expires_in: 3600,
+                token_type: "Bearer".to_string(),
+                refresh_token: "refresh".to_string(),
+                ..Default::default()
+            },
+            &config_key,
+        )
+        .unwrap();
+        cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: true,
+            command: Commands::Sync,
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("Error al sincronizar con el servidor")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_with_pin_prompt_wrong_and_correct() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profile": { "id": "22cadb2c-d706-471a-a3e9-9fb725925639", "email": "test@test.com" },
+                "ciphers": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let mut cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        let config_key =
+            sw_config::derive_config_key_with_params("4321", &cfg.device_uuid, CLI_KDF_MEMORY_KIB)
+                .unwrap();
+        cfg.config_key_hash = sw_config::hash_config_key(&config_key);
+        cfg.set_token(
+            &sw_config::LoginToken {
+                access_token: "test_token".to_string(),
+                expires_in: 3600,
+                token_type: "Bearer".to_string(),
+                refresh_token: "refresh".to_string(),
+                ..Default::default()
+            },
+            &config_key,
+        )
+        .unwrap();
+        cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: true,
+            command: Commands::Sync,
+        };
+
+        let res_err = handle_command(&cli, |_| Ok("wrong".to_string())).await;
+        assert!(res_err.is_err());
+        match res_err.unwrap_err() {
+            CliError::Config(msg) => assert!(msg.contains("PIN incorrecto")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let res_ok = handle_command(&cli, |_| Ok("4321".to_string())).await;
+        assert!(res_ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_empty_name_validations() {
+        let cli_get = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Get {
+                    name: "   ".to_string(),
+                }),
+                filter: None,
+            },
+        };
+        let err_get = handle_command(&cli_get, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_get {
+            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_del = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Delete {
+                    name: "".to_string(),
+                }),
+                filter: None,
+            },
+        };
+        let err_del = handle_command(&cli_del, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_del {
+            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+
+        let cli_create = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "  ".to_string(),
+                    username: "u".to_string(),
+                    password: "p".to_string(),
+                }),
+                filter: None,
+            },
+        };
+        let err_create = handle_command(&cli_create, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err_create {
+            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create_error_payload_propagates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
+                    assert_eq!(msg.action, "CreateLogin");
+                    let resp = IpcMessage::new(
+                        "CreateLogin",
+                        serde_json::json!({
+                            "status": "error",
+                            "error": "Error interno al crear cipher"
+                        }),
+                    );
+                    let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                }
+            }
+        });
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "test".to_string(),
+                    username: "user".to_string(),
+                    password: "pwd".to_string(),
+                }),
+                filter: None,
+            },
+        };
+
+        let err = handle_command(&cli, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        match err {
+            CliError::AgentError(msg) => assert!(msg.contains("Error interno al crear cipher")),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_list_filter_matches_and_no_matches() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
+                    if msg.action == "ListLogins" {
+                        let resp = IpcMessage::new(
+                            "ListLogins",
+                            serde_json::json!([
+                                { "name": "GitHub", "username": "octocat" },
+                                { "name": "Google", "username": "alice@gmail.com" }
+                            ]),
+                        );
+                        let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                    }
+                }
+            }
+        });
+
+        let cli_match = Cli {
+            socket: Some(socket_path.clone()),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::List),
+                filter: Some("octocat".to_string()),
+            },
+        };
+        let out_match = handle_command(&cli_match, |_| Ok(String::new()))
+            .await
+            .unwrap();
+        assert!(out_match.contains("GitHub"));
+        assert!(!out_match.contains("Google"));
+
+        let cli_match_name = Cli {
+            socket: Some(socket_path.clone()),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::List),
+                filter: Some("goog".to_string()),
+            },
+        };
+        let out_match_name = handle_command(&cli_match_name, |_| Ok(String::new()))
+            .await
+            .unwrap();
+        assert!(out_match_name.contains("Google"));
+        assert!(!out_match_name.contains("GitHub"));
+
+        let cli_no_match = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::List),
+                filter: Some("nonexistent".to_string()),
+            },
+        };
+        let out_no_match = handle_command(&cli_no_match, |_| Ok(String::new()))
+            .await
+            .unwrap();
+        assert!(out_no_match.contains("No se encontraron accesos guardados."));
+    }
+
+    #[tokio::test]
+    async fn test_cli_unlock_with_corrupt_config_ignores_and_proceeds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
+                    assert_eq!(msg.action, "Unlock");
+                    assert_eq!(msg.payload.get("pin").unwrap(), "1234");
+                    assert!(msg.payload.get("encrypted_token").is_none());
+                    let resp = IpcMessage::new("Unlock", serde_json::json!({ "unlocked": true }));
+                    let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                }
+            }
+        });
+
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+        std::fs::write(&config_file_path, b"INVALID JSON CONTENT { [ }").unwrap();
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Unlock {
+                pin: Some("1234".to_string()),
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().contains("Bóveda desbloqueada con éxito"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_pin_commands_interactive_prompts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
+                    if msg.action == "PinSet" {
+                        assert_eq!(msg.payload.get("pin").unwrap(), "5555");
+                        let resp =
+                            IpcMessage::new("PinSet", serde_json::json!({ "success": true }));
+                        let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                    } else if msg.action == "PinUpdate" {
+                        assert_eq!(msg.payload.get("old_pin").unwrap(), "5555");
+                        assert_eq!(msg.payload.get("new_pin").unwrap(), "6666");
+                        let resp =
+                            IpcMessage::new("PinUpdate", serde_json::json!({ "success": true }));
+                        let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                    }
+                }
+            }
+        });
+
+        let cli_set = Cli {
+            socket: Some(socket_path.clone()),
+            config: None,
+            insecure: false,
+            command: Commands::Pin {
+                action: PinCommands::Set { pin: None },
+            },
+        };
+        let res_set = handle_command(&cli_set, |_| Ok("5555".to_string()))
+            .await
+            .unwrap();
+        assert!(res_set.contains("PIN configurado exitosamente"));
+
+        let cli_upd = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Pin {
+                action: PinCommands::Update {
+                    old_pin: None,
+                    new_pin: None,
+                },
+            },
+        };
+        let mut upd_count = 0;
+        let res_upd = handle_command(&cli_upd, |_| {
+            upd_count += 1;
+            if upd_count == 1 {
+                Ok("5555".to_string())
+            } else {
+                Ok("6666".to_string())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(res_upd.contains("PIN actualizado exitosamente"));
+    }
+
+    #[tokio::test]
+    async fn test_send_command_agent_error_primitive_payload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                if sw_ipc::read_message(&mut stream).await.is_ok() {
+                    let resp = IpcMessage::new("Error", serde_json::json!(500));
+                    let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                }
+            }
+        });
+
+        let res = send_command(&socket_path, "Ping", serde_json::json!({})).await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::AgentError(msg) => assert_eq!(msg, "500"),
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_with_env_email_and_password() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _g_em = EnvGuard::new("BW_EMAIL");
+        let _g_pw = EnvGuard::new("BW_PASSWORD");
+
+        unsafe {
+            std::env::set_var("BW_EMAIL", "env_login_user@example.com");
+            std::env::set_var("BW_PASSWORD", "env_login_pwd_123");
+        }
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key = sw_crypto::derive_master_key(
+            b"env_login_pwd_123",
+            "env_login_user@example.com",
+            &kdf_config,
+        )
+        .unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [1u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_env_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Login {
+                email: None,
+                password: None,
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_config_file_not_found_creates_default() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("POST"))
+            .and(path("/identity/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(b"password", "user_fresh@example.com", &kdf_config)
+                .unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [1u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_token_fresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("non_existing_silverwarden.json");
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path.clone()),
+            insecure: false,
+            command: Commands::Login {
+                email: Some("user_fresh@example.com".to_string()),
+                password: Some("password".to_string()),
+                server: Some(base_url),
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_ok());
+        assert!(config_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_2fa_empty_providers_list() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        let email = "user_empty_prov@example.com";
+        let password = "password123";
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/prelogin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kdf": 0,
+                "kdfIterations": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let kdf_config = sw_crypto::KdfConfig {
+            kdf_type: sw_crypto::KdfType::Pbkdf2,
+            iterations: 10,
+            memory: None,
+            parallelism: None,
+        };
+        let master_key =
+            sw_crypto::derive_master_key(password.as_bytes(), email, &kdf_config).unwrap();
+        let stretched = sw_crypto::stretch_key(&master_key).unwrap();
+        let synthetic_sym_key = [7u8; 64];
+        let enc_key_wire = sw_crypto::encrypt_with_to_string(
+            &synthetic_sym_key,
+            sw_crypto::EncStringType::AesCbc256HmacSha256B64,
+            &stretched,
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("grant_type=password"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two-step verification required.",
+                "TwoFactorProviders2": {},
+                "twoFactorToken": "challenge_token_empty_providers"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/connect/token"))
+            .and(body_string_contains("twoFactorProvider=0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock_token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "mock_refresh",
+                "key": enc_key_wire
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+
+        let initial_cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        initial_cfg.save_to_file(&config_file_path).unwrap();
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: Some(config_file_path),
+            insecure: false,
+            command: Commands::Login {
+                email: Some(email.to_string()),
+                password: Some(password.to_string()),
+                server: None,
+                apikey: false,
+                client_id: None,
+                client_secret: None,
+            },
+        };
+
+        let result = handle_command(&cli, |prompt_str| {
+            if prompt_str.contains("Selecciona un método") {
+                Ok("0".to_string())
+            } else if prompt_str.contains("código de verificación") {
+                Ok("123456".to_string())
+            } else {
+                Ok("".to_string())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_config_set_server_insecure_flag() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = temp_dir.path().join("silverwarden.json");
+
+        let cli = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: true,
+            command: Commands::Config {
+                action: ConfigCommands::SetServer {
+                    url: "https://vaultwarden.local".to_string(),
+                },
+            },
+        };
+        let res = handle_command(&cli, |_| Ok(String::new())).await.unwrap();
+        assert!(res.contains("Servidor configurado a https://vaultwarden.local"));
+
+        let saved = sw_config::ConfigFile::load_from_file(&cfg_path).unwrap();
+        assert!(saved.danger_accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_migrate() {
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::Migrate {
+                source: "dummy".to_string(),
+            },
+        };
+        let _ = handle_command(&cli, |_| Ok(String::new())).await;
+    }
+
+    #[tokio::test]
+    async fn test_cli_config_setup_command_with_self_signed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = temp_dir.path().join("silverwarden.json");
+
+        let cli = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::Setup,
+            },
+        };
+
+        let mut step = 0;
+        let res = handle_command(&cli, |_| {
+            step += 1;
+            match step {
+                1 => Ok("2".to_string()),
+                2 => Ok("https://vaultwarden.lan".to_string()),
+                _ => Ok("s".to_string()),
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(res.contains("Configuración guardada exitosamente"));
+        assert!(res.contains("Aceptar certs inv: Sí"));
+
+        let saved = sw_config::ConfigFile::load_from_file(&cfg_path).unwrap();
+        assert!(saved.danger_accept_invalid_certs);
+    }
+
+    #[tokio::test]
+    async fn test_cli_sync_with_default_vault_paths() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _g_cfg = EnvGuard::new("SILVERWARDEN_CONFIG_PATH");
+        let _g_home = EnvGuard::new("HOME");
+
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "profile": { "id": "22cadb2c-d706-471a-a3e9-9fb725925639", "email": "test@test.com" },
+                "ciphers": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("silverwarden.json");
+        let fake_home = temp_dir.path().join("fake_home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let mut cfg = sw_config::ConfigFile {
+            identity_url: base_url.clone(),
+            api_url: base_url.clone(),
+            ..Default::default()
+        };
+        let config_key =
+            sw_config::derive_config_key_with_params("", &cfg.device_uuid, CLI_KDF_MEMORY_KIB)
+                .unwrap();
+        cfg.set_token(
+            &sw_config::LoginToken {
+                access_token: "test_token".to_string(),
+                expires_in: 3600,
+                token_type: "Bearer".to_string(),
+                refresh_token: "refresh".to_string(),
+                ..Default::default()
+            },
+            &config_key,
+        )
+        .unwrap();
+        cfg.save_to_file(&config_file_path).unwrap();
+
+        unsafe {
+            std::env::set_var(
+                "SILVERWARDEN_CONFIG_PATH",
+                config_file_path.to_str().unwrap(),
+            );
+            std::env::set_var("HOME", fake_home.to_str().unwrap());
+        }
+
+        let cli = Cli {
+            socket: Some(temp_dir.path().join("dummy.sock")),
+            config: None,
+            insecure: true,
+            command: Commands::Sync,
+        };
+
+        let res = handle_command(&cli, |_| unreachable!()).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cli_logins_create_status_ok_payload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
+                    assert_eq!(msg.action, "CreateLogin");
+                    let resp = IpcMessage::new(
+                        "CreateLogin",
+                        serde_json::json!({
+                            "status": "ok",
+                            "cipher_id": "test_id"
+                        }),
+                    );
+                    let _ = sw_ipc::write_message(&mut stream, &resp).await;
+                }
+            }
+        });
+
+        let cli = Cli {
+            socket: Some(socket_path),
+            config: None,
+            insecure: false,
+            command: Commands::Logins {
+                action: Some(LoginsCommands::Create {
+                    name: "my_site".to_string(),
+                    username: "user".to_string(),
+                    password: "pwd".to_string(),
+                }),
+                filter: None,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await.unwrap();
+        assert!(res.contains("Acceso 'my_site' creado exitosamente"));
     }
 }
