@@ -163,16 +163,19 @@ Cada decisión se registra con:
 - **Evidencia:** `crates/sw-bitwarden-api/src/websocket.rs`, test `test_websocket_sync_writes_to_injected_vault_path` que verifica que la escritura ocurre dentro del `TempDir` y que el archivo real del host permanece intacto.
 - **Estado:** Vigente.
 
-## D51 — Aceptación de la métrica estándar de cobertura para M5
+## D51 — Aceptación y medición dual de la cobertura (estándar y producción pura)
 
 - **Fecha:** 2026-11-01
-- **Contexto:** La cobertura de `sw-cli` es **85.19%** según `cargo llvm-cov -p sw-cli --summary-only`, pero incluye líneas del módulo `mod tests` en el denominador. La cobertura de "producción pura" es menor y no se ha medido.
-- **Decisión:** Aceptar 85.19% como cumplimiento del gate ≥85% para M5, documentando la limitación metodológica en `deuda-tecnica.md` DT-18 y `lecciones-aprendidas.md` 8.7. La mejora de la métrica (separar tests o excluirlos) se pospone a M6.
+- **Contexto:** La cobertura inicial reportada para `sw-cli` fue **85.19%** según `cargo llvm-cov -p sw-cli --summary-only`, pero incluía líneas del módulo `mod tests` (en el mismo archivo `main.rs`). Surgió la duda de si la cobertura de producción pura estaba por debajo del umbral del 85%, mientras que en `sw-agent` la producción pura se encontraba en 78.97%.
+- **Decisión:** Mantener la métrica estándar para trazabilidad del workspace y medir formalmente la cobertura de producción pura en los crates donde tests y producción conviven en el mismo archivo. Se implementó una suite exhaustiva en `sw-agent` y `sw-cli` para llevar la producción pura a ≥90% en ambos crates núcleo.
 - **Alternativas:**
-  - (a) Bloquear M5 hasta tener cobertura de producción pura ≥85%. Rechazada: retrasaría M5 innecesariamente; el bug real (filtro de versión) ya está resuelto y verificado en runtime con `sync` y `ssh-add -L`.
-  - (b) Cambiar el gate a "cobertura de producción pura" retroactivamente. Rechazada: rompería todos los milestones anteriores que usaron la métrica estándar y exigiría re-medir M1-M4.
-- **Evidencia:** `cargo llvm-cov -p sw-cli --summary-only` → 85.19% líneas. Commits `7e70c8b` y `0eefb93`. Tests 104+10, 0 fallos. `$HOME` real intacto.
-- **Estado:** Vigente.
+  - (a) Bloquear milestones sin medir producción pura o confiar ciegamente en el artefacto del denominador. Rechazada: oculta gaps reales en módulos críticos como el daemon.
+  - (b) Mover todos los tests a directorios externos antes de tiempo. Pospuesta: requiere refactorizaciones estructurales de paths y visibilidad interna innecesarias para la fase actual.
+- **Evidencia:** 
+  - `sw-cli`: 85.78% total archivo / **95.97% producción pura** (786/819 líneas evaluables).
+  - `sw-agent`: 97.16% total archivo / **92.46% producción pura** (932/1008 líneas evaluables).
+  - Workspace total: **92.90% líneas / 92.81% regiones** (404 tests pasando, 0 fallos). Ver `docs/04-validacion.md` §9.8.
+- **Estado:** Vigente (Verificado y cerrado).
 
 ## D52 — Ubicación canónica de las lecciones aprendidas
 

@@ -92,14 +92,6 @@
 - **Retoma:** M6/M7.
 - **Estado:** Abierta.
 
-### DT-18 — Cobertura de producción pura en `sw-cli` no medida
-
-- **Descripción:** La cobertura de `sw-cli` reportada por `cargo llvm-cov -p sw-cli --summary-only` es **85.19% de líneas**, pero incluye las líneas del módulo `mod tests` (que viven en `main.rs`) en el denominador. Al añadir 1815 líneas de tests en el commit `0eefb93`, el porcentaje subió parcialmente por artefacto del denominador. La cobertura de "producción pura" (excluyendo tests) **no se ha medido** y se estima inferior al 85%.
-- **Impacto:** Medio (metodológico). El gate del proyecto se cumple según la métrica estándar, pero la métrica es vulnerable a gaming.
-- **Motivo:** Los tests viven en `main.rs` por simplicidad. `cargo llvm-cov --ignore-filename-regex` no permite excluir módulos dentro de un archivo (el regex se aplica al nombre de archivo, no al contenido).
-- **Retoma:** M6. Opciones a evaluar: (a) mover tests a `tests/` (integración) y `src/tests.rs` (unitarios con `#[path]`) y usar `--ignore-filename-regex`; (b) usar `#[cfg_attr(coverage, coverage(off))]` en `mod tests` (requiere feature `coverage`); (c) adoptar `tarpaulin --ignore-tests`. Validar que la cobertura de producción pura ≥85% antes de cerrar M6.
-- **Estado:** Abierta.
-
 ---
 
 ## Items Cerrados (Histórico)
@@ -115,4 +107,9 @@
 
 ### DT-6 — Cobertura de `sw-ssh-agent` (87.48%)
 - **Estado:** Cerrada (commits `bcf8252` y `5be5e24`). Cobertura ahora 94.49% (SW-046).
+
+### DT-18 — Cobertura de producción pura en `sw-cli` y `sw-agent`
+- **Descripción:** La cobertura inicial reportada incluía líneas de `mod tests` en el denominador, dejando dudas sobre el porcentaje real de código de producción.
+- **Resolución:** Medición exhaustiva línea a línea y ampliación de tests. En `sw-cli`, las líneas de producción 1-1259 alcanzaron un **95.97%** (786/819 evaluables). En `sw-agent`, las líneas de producción 1-1383 alcanzaron un **92.46%** (932/1008 evaluables). Ambas superan holgadamente el umbral de calidad ≥90%. A futuro en refactorizaciones mayores se evaluará separar módulos de tests a archivos externos para facilitar la exclusión automática de herramientas.
+- **Estado:** Cerrada (validado empíricamente, ver `docs/04-validacion.md` §9.8 y decisión D51).
 

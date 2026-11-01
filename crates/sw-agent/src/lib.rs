@@ -3049,4 +3049,914 @@ mod tests {
             "Regression: PinSet or PinUpdate wrote to real ~/.config/goldwarden/goldwarden.json!"
         );
     }
+
+    // ====================================================================
+    // FASE 0 — Helpers de test
+    // ====================================================================
+
+    fn test_ctx() -> CallingContext {
+        CallingContext {
+            username: "tester".into(),
+            process_name: "test".into(),
+            parent_process_name: "test_runner".into(),
+            grandparent_process_name: "cargo".into(),
+            process_pid: 10,
+            parent_process_pid: 5,
+            grandparent_process_pid: 1,
+            error: false,
+            authenticated: true,
+        }
+    }
+
+    fn test_agent(seed: u8) -> (Arc<VaultAgentServer>, sw_crypto::SymmetricKey) {
+        let key = sw_crypto::SymmetricKey::from_bytes(&[seed; 64]).unwrap();
+        let vault = Arc::new(sw_vault::VaultStore::new());
+        let agent = Arc::new(VaultAgentServer::new(vault));
+        (agent, key)
+    }
+
+    fn encrypted_login(
+        name: &str,
+        username: &str,
+        password: &str,
+        key: &sw_crypto::SymmetricKey,
+    ) -> sw_vault::Cipher {
+        let enc_name = sw_vault::encrypt_with(
+            name.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            key,
+        )
+        .unwrap();
+        let enc_user = sw_vault::encrypt_with(
+            username.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            key,
+        )
+        .unwrap();
+        let enc_pass = sw_vault::encrypt_with(
+            password.as_bytes(),
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            key,
+        )
+        .unwrap();
+
+        sw_vault::Cipher {
+            id: Some(uuid::Uuid::new_v4()),
+            r#type: sw_vault::CipherType::Login,
+            name: enc_name,
+            favorite: false,
+            reprompt: 0,
+            fields: vec![],
+            login: Some(sw_vault::LoginCipher {
+                username: Some(enc_user),
+                password: Some(enc_pass),
+                uri: None,
+                uris: vec![],
+                totp: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn temp_state() -> (AgentState, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (agent, _) = test_agent(42);
+        let state = AgentState::new(ConfigFile::default())
+            .with_config_directory(temp_dir.path())
+            .with_vault_agent(agent);
+        (state, temp_dir)
+    }
+
+    fn mock_api_client(base_url: &str) -> Arc<sw_bitwarden_api::AuthenticatedClient> {
+        let token = sw_config::LoginToken {
+            access_token: "mock_access_token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: "mock_refresh_token".to_string(),
+            key: "mock_key".to_string(),
+            kdf: None,
+            kdf_iterations: None,
+            kdf_memory: None,
+            kdf_parallelism: None,
+        };
+        Arc::new(
+            sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                format!("{base_url}/identity"),
+                format!("{base_url}/api"),
+                token,
+                true,
+            ),
+        )
+    }
+
+    // ====================================================================
+    // FASE 1 — Tests de handle_sync
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_handle_sync_locked_returns_error() {
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = true;
+        let res = handle_sync(&mut state, &serde_json::json!({})).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Bóveda bloqueada"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_without_session_returns_error() {
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = false;
+        state.config.encrypted_token = String::new();
+        state.api_client = None;
+        let res = handle_sync(&mut state, &serde_json::json!({})).await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err(),
+            "No hay sesión iniciada. Ejecuta 'silverwarden login' primero."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_payload_updates_config_and_summary() {
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = false;
+        let (_, key) = test_agent(42);
+
+        let vault = state.vault_agent.as_ref().unwrap().vault();
+        // Insert 2 logins, 1 ssh key, 1 note
+        vault
+            .insert(encrypted_login("Login1", "u1", "p1", &key))
+            .await;
+        vault
+            .insert(encrypted_login("Login2", "u2", "p2", &key))
+            .await;
+        let enc_ssh_name = sw_vault::encrypt_with(
+            b"enc_ssh",
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        let enc_note_name = sw_vault::encrypt_with(
+            b"enc_note",
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        vault
+            .insert(sw_vault::Cipher {
+                id: Some(uuid::Uuid::new_v4()),
+                r#type: sw_vault::CipherType::SshKey,
+                name: enc_ssh_name,
+                ..Default::default()
+            })
+            .await;
+        vault
+            .insert(sw_vault::Cipher {
+                id: Some(uuid::Uuid::new_v4()),
+                r#type: sw_vault::CipherType::Note,
+                name: enc_note_name,
+                ..Default::default()
+            })
+            .await;
+
+        let payload = serde_json::json!({
+            "encrypted_token": "enc_tok_payload",
+            "encrypted_user_symmetric_key": "enc_sym_payload",
+            "identity_url": "https://identity.test",
+            "api_url": "https://api.test",
+            "danger_accept_invalid_certs": true,
+        });
+
+        let res = handle_sync(&mut state, &payload)
+            .await
+            .expect("sync should succeed");
+        assert_eq!(state.config.encrypted_token, "enc_tok_payload");
+        assert_eq!(state.config.encrypted_user_symmetric_key, "enc_sym_payload");
+        assert_eq!(state.config.identity_url, "https://identity.test");
+        assert_eq!(state.config.api_url, "https://api.test");
+        assert!(state.config.danger_accept_invalid_certs);
+
+        assert_eq!(res["status"], "synced");
+        assert_eq!(res["total"], 4);
+        assert_eq!(res["logins"], 2);
+        assert_eq!(res["ssh_keys"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_disk_config_fallback() {
+        let (mut state, tmp) = temp_state();
+        state.is_locked = false;
+        state.config.encrypted_token = String::new();
+        state.api_client = None;
+
+        let disk_cfg = ConfigFile {
+            encrypted_token: "disk_enc_token".to_string(),
+            encrypted_user_symmetric_key: "disk_enc_sym".to_string(),
+            identity_url: "https://disk-ident.test".to_string(),
+            api_url: "https://disk-api.test".to_string(),
+            danger_accept_invalid_certs: true,
+            ..Default::default()
+        };
+        save_config_file(&disk_cfg, &tmp.path().join("goldwarden.json")).unwrap();
+
+        let res = handle_sync(&mut state, &serde_json::json!({}))
+            .await
+            .expect("sync fallback should succeed");
+        assert_eq!(state.config.encrypted_token, "disk_enc_token");
+        assert_eq!(state.config.encrypted_user_symmetric_key, "disk_enc_sym");
+        assert_eq!(state.config.identity_url, "https://disk-ident.test");
+        assert_eq!(state.config.api_url, "https://disk-api.test");
+        assert_eq!(res["status"], "synced");
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_api_success_persists_vault() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let profile_id = uuid::Uuid::new_v4();
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+        let sync_response = serde_json::json!({
+            "profile": {
+                "id": profile_id.to_string(),
+                "name": "Test User",
+                "email": "test@example.com"
+            },
+            "folders": [],
+            "ciphers": [
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": 1,
+                    "name": valid_enc,
+                    "login": {
+                        "username": valid_enc,
+                        "password": valid_enc
+                    }
+                },
+                {
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": 5,
+                    "name": valid_enc
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sync_response))
+            .mount(&server)
+            .await;
+
+        let (mut state, tmp) = temp_state();
+        state.is_locked = false;
+        state.api_client = Some(mock_api_client(&server.uri()));
+
+        let res = handle_sync(&mut state, &serde_json::json!({}))
+            .await
+            .expect("sync should succeed");
+        assert_eq!(res["status"], "synced");
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["logins"], 1);
+        assert_eq!(res["ssh_keys"], 1);
+
+        // Verify vault.json was persisted on disk in tmp
+        let vault_file = tmp.path().join("vault.json");
+        assert!(vault_file.exists());
+        let loaded = sw_vault::load_vault(&vault_file).expect("load vault from disk");
+        assert_eq!(loaded.ciphers.len(), 2);
+        assert_eq!(loaded.profile.id, Some(profile_id));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_api_rate_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = false;
+        state.api_client = Some(mock_api_client(&server.uri()));
+
+        let err = handle_sync(&mut state, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("El servidor ha bloqueado temporalmente tu IP"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_api_server_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = false;
+        state.api_client = Some(mock_api_client(&server.uri()));
+
+        let err = handle_sync(&mut state, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Error al sincronizar con el servidor"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_token_payload_builds_api_client() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sync_response = serde_json::json!({
+            "profile": {
+                "id": uuid::Uuid::new_v4().to_string(),
+                "name": "User",
+                "email": "u@test.com",
+            },
+            "folders": [],
+            "collections": [],
+            "ciphers": [],
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sync_response))
+            .mount(&server)
+            .await;
+
+        let (mut state, _tmp) = temp_state();
+        state.is_locked = false;
+        assert!(state.api_client.is_none());
+
+        let payload = serde_json::json!({
+            "identity_url": format!("{}/identity", server.uri()),
+            "api_url": format!("{}/api", server.uri()),
+            "danger_accept_invalid_certs": true,
+            "token": {
+                "access_token": "valid_token_xyz",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "valid_refresh_xyz",
+                "key": "valid_key_xyz"
+            }
+        });
+
+        let res = handle_sync(&mut state, &payload)
+            .await
+            .expect("sync with token payload should succeed");
+        assert_eq!(res["status"], "synced");
+        assert!(state.api_client.is_some());
+    }
+
+    // ====================================================================
+    // FASE 2 — Tests de logins
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_handle_list_logins_filters_and_locked() {
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(50);
+        state.vault_agent = Some(agent.clone());
+
+        // 1. Locked -> returns error
+        state.is_locked = true;
+        let err = handle_list_logins(&state).await.unwrap_err();
+        assert!(err.contains("Bóveda bloqueada"));
+
+        // 2. Unlocked
+        agent.unlock(key.try_clone().unwrap()).await;
+        state.is_locked = false;
+
+        let vault = agent.vault();
+        // 1 active login
+        let mut active_login = encrypted_login("ActiveLogin", "alice", "pass123", &key);
+        active_login.deleted_date = None;
+        vault.insert(active_login).await;
+
+        // 1 note
+        let note_enc_name = sw_vault::encrypt_with(
+            b"NoteName",
+            sw_vault::EncStringType::AesCbc256HmacSha256B64,
+            &key,
+        )
+        .unwrap();
+        vault
+            .insert(sw_vault::Cipher {
+                id: Some(uuid::Uuid::new_v4()),
+                r#type: sw_vault::CipherType::Note,
+                name: note_enc_name,
+                ..Default::default()
+            })
+            .await;
+
+        // 1 deleted login
+        let mut deleted_login = encrypted_login("DeletedLogin", "bob", "pass456", &key);
+        deleted_login.deleted_date = Some("2026-01-01T00:00:00Z".to_string());
+        vault.insert(deleted_login).await;
+
+        let res = handle_list_logins(&state)
+            .await
+            .expect("list logins succeeds");
+        let list = res.as_array().expect("array result");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["name"], "ActiveLogin");
+        assert_eq!(list[0]["username"], "alice");
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_login_found_not_found_locked() {
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(51);
+        state.vault_agent = Some(agent.clone());
+
+        // Locked error
+        state.is_locked = true;
+        assert!(
+            handle_get_login(&state, &serde_json::json!({ "name": "GitHub" }))
+                .await
+                .is_err()
+        );
+
+        // Unlock
+        agent.unlock(key.try_clone().unwrap()).await;
+        state.is_locked = false;
+
+        let login = encrypted_login("GitHub", "octocat", "super_secret", &key);
+        agent.vault().insert(login).await;
+
+        // Found exact
+        let res_exact = handle_get_login(&state, &serde_json::json!({ "name": "GitHub" }))
+            .await
+            .unwrap();
+        assert_eq!(res_exact["name"], "GitHub");
+        assert_eq!(res_exact["username"], "octocat");
+        assert_eq!(res_exact["password"], "super_secret");
+
+        // Found case-insensitive
+        let res_case = handle_get_login(&state, &serde_json::json!({ "name": "github" }))
+            .await
+            .unwrap();
+        assert_eq!(res_case["name"], "GitHub");
+
+        // Found from primitive string payload
+        let res_str = handle_get_login(&state, &serde_json::json!("GITHUB"))
+            .await
+            .unwrap();
+        assert_eq!(res_str["name"], "GitHub");
+
+        // Not found
+        let err_not_found = handle_get_login(&state, &serde_json::json!({ "name": "GitLab" }))
+            .await
+            .unwrap_err();
+        assert!(err_not_found.contains("No se encontró ningún acceso con el nombre 'GitLab'"));
+
+        // Missing name in payload
+        let err_missing = handle_get_login(&state, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err_missing.contains("Campo 'name' requerido"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_login_local_and_not_found() {
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(52);
+        state.vault_agent = Some(agent.clone());
+        state.is_locked = false;
+        agent.unlock(key.try_clone().unwrap()).await;
+
+        let login = encrypted_login("Twitter", "bird_user", "tweet123", &key);
+        agent.vault().insert(login).await;
+
+        assert_eq!(agent.vault().all().await.len(), 1);
+
+        // Delete existing
+        let res = handle_delete_login(&mut state, &serde_json::json!({ "name": "Twitter" }))
+            .await
+            .unwrap();
+        assert_eq!(res["status"], "deleted");
+        assert_eq!(res["name"], "Twitter");
+        assert_eq!(agent.vault().all().await.len(), 0);
+
+        // Delete not found
+        let err = handle_delete_login(&mut state, &serde_json::json!({ "name": "Twitter" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("No se encontró ningún acceso con el nombre 'Twitter'"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_login_server_error_is_tolerated() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/api/ciphers/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(53);
+        state.vault_agent = Some(agent.clone());
+        state.is_locked = false;
+        agent.unlock(key.try_clone().unwrap()).await;
+        state.api_client = Some(mock_api_client(&server.uri()));
+
+        let login = encrypted_login("Reddit", "redditor", "upvote_all", &key);
+        agent.vault().insert(login).await;
+
+        let res = handle_delete_login(&mut state, &serde_json::json!({ "name": "Reddit" }))
+            .await
+            .unwrap();
+        assert_eq!(res["status"], "deleted");
+        assert_eq!(res["name"], "Reddit");
+        assert_eq!(agent.vault().all().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_create_login_validations() {
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(54);
+        state.vault_agent = Some(agent.clone());
+
+        // 1. Locked
+        state.is_locked = true;
+        let err_locked = handle_create_login(&mut state, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err_locked.contains("Bóveda bloqueada"));
+
+        state.is_locked = false;
+        agent.unlock(key).await;
+
+        // 2. Non-object payload
+        let err_non_obj = handle_create_login(&mut state, &serde_json::json!("not-an-object"))
+            .await
+            .unwrap_err();
+        assert!(err_non_obj.contains("El payload debe ser un objeto JSON"));
+
+        // 3. Missing fields
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "username": "u", "password": "p" })
+        )
+        .await
+        .unwrap_err()
+        .contains("Campo 'name' requerido"));
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "password": "p" })
+        )
+        .await
+        .unwrap_err()
+        .contains("Campo 'username' requerido"));
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "username": "u" })
+        )
+        .await
+        .unwrap_err()
+        .contains("Campo 'password' requerido"));
+
+        // 4. Empty strings
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "  ", "username": "u", "password": "p" })
+        )
+        .await
+        .unwrap_err()
+        .contains("El campo 'name' no puede estar vacío"));
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "username": "  ", "password": "p" })
+        )
+        .await
+        .unwrap_err()
+        .contains("El campo 'username' no puede estar vacío"));
+        assert!(handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "username": "u", "password": "  " })
+        )
+        .await
+        .unwrap_err()
+        .contains("El campo 'password' no puede estar vacío"));
+
+        // 5. No profile synced
+        let err_no_profile = handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "username": "u", "password": "p" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_no_profile
+            .contains("No se ha sincronizado el perfil. Ejecuta 'silverwarden sync' primero."));
+
+        // 6. Profile present, but no api_client
+        agent
+            .vault()
+            .load_sync_data(sw_vault::SyncData {
+                profile: sw_vault::Profile {
+                    id: Some(uuid::Uuid::new_v4()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        state.api_client = None;
+        let err_no_session = handle_create_login(
+            &mut state,
+            &serde_json::json!({ "name": "n", "username": "u", "password": "p" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_no_session.contains("No hay sesión iniciada en el servidor"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_create_login_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let server_cipher_id = uuid::Uuid::new_v4();
+        let profile_id = uuid::Uuid::new_v4();
+
+        let valid_enc = "2.aXZfMTZfYnl0ZXNfbG9uZw==|Y2lwaGVydGV4dF9ieXRlcw==|bWFjXzMyX2J5dGVzX2xvbmdfaGFzaF9zdHJpbmchIQ==";
+        let response_cipher = serde_json::json!({
+            "id": server_cipher_id.to_string(),
+            "type": 1,
+            "name": valid_enc,
+            "encryptedFor": profile_id.to_string(),
+            "login": {
+                "username": valid_enc,
+                "password": valid_enc
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/ciphers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_cipher))
+            .mount(&server)
+            .await;
+
+        let (mut state, _tmp) = temp_state();
+        let (agent, key) = test_agent(55);
+        state.vault_agent = Some(agent.clone());
+        state.is_locked = false;
+        agent.unlock(key).await;
+
+        // Set profile in vault
+        agent
+            .vault()
+            .load_sync_data(sw_vault::SyncData {
+                profile: sw_vault::Profile {
+                    id: Some(profile_id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+
+        state.api_client = Some(mock_api_client(&server.uri()));
+
+        let payload = serde_json::json!({
+            "name": "Google",
+            "username": "user@gmail.com",
+            "password": "secretpassword"
+        });
+
+        let res = handle_create_login(&mut state, &payload)
+            .await
+            .expect("create login should succeed");
+        assert_eq!(res["status"], "created");
+        assert_eq!(res["id"], server_cipher_id.to_string());
+        assert_eq!(res["name"], "Google");
+
+        // Verify inserted into vault
+        let all = agent.vault().all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, Some(server_cipher_id));
+    }
+
+    // ====================================================================
+    // FASE 3 — Tests de sesión y registry
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_handle_set_session_persists_and_unlocks() {
+        use base64::Engine;
+
+        let (mut state, tmp) = temp_state();
+        let key_bytes = [77u8; 64];
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+
+        let payload = serde_json::json!({
+            "identity_url": "https://ident.custom.test",
+            "api_url": "https://api.custom.test",
+            "notifications_url": "https://notif.custom.test",
+            "danger_accept_invalid_certs": true,
+            "encrypted_token": "enc_tok_sample",
+            "encrypted_user_symmetric_key": "enc_sym_sample",
+            "token": {
+                "access_token": "bearer_abc",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "refresh_token": "refr_123",
+                "key": "key_123"
+            },
+            "user_symmetric_key": key_b64,
+        });
+
+        let res = handle_set_session(&mut state, &payload)
+            .await
+            .expect("set session should succeed");
+        assert_eq!(res["status"], "session_saved");
+
+        // Config updated in memory
+        assert_eq!(state.config.identity_url, "https://ident.custom.test");
+        assert_eq!(state.config.api_url, "https://api.custom.test");
+        assert_eq!(state.config.notifications_url, "https://notif.custom.test");
+        assert!(state.config.danger_accept_invalid_certs);
+        assert_eq!(state.config.encrypted_token, "enc_tok_sample");
+        assert_eq!(state.config.encrypted_user_symmetric_key, "enc_sym_sample");
+
+        // api_client created
+        assert!(state.api_client.is_some());
+
+        // vault unlocked
+        assert!(!state.vault_agent.as_ref().unwrap().is_locked());
+
+        // config file persisted
+        let config_file = tmp.path().join("goldwarden.json");
+        assert!(config_file.exists());
+        let saved_content = std::fs::read_to_string(config_file).unwrap();
+        assert!(saved_content.contains("https://ident.custom.test"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_session_invalid_key_does_not_panic() {
+        let (mut state, _tmp) = temp_state();
+
+        // 1. Invalid base64
+        let payload1 = serde_json::json!({
+            "user_symmetric_key": "not-valid-base64-%%%$$$",
+        });
+        let res1 = handle_set_session(&mut state, &payload1).await;
+        assert!(res1.is_ok());
+
+        // 2. Valid base64 but wrong length (3 bytes instead of 64)
+        let payload2 = serde_json::json!({
+            "user_symmetric_key": "AQID",
+        });
+        let res2 = handle_set_session(&mut state, &payload2).await;
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_data_invalid_payload() {
+        let (mut state, _tmp) = temp_state();
+        let err = handle_sync_data(&mut state, &serde_json::json!("not-a-syncdata-object"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Error deserializando SyncData"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_data_success() {
+        let (mut state, tmp) = temp_state();
+        let (_, key) = test_agent(60);
+        let valid_sync = sw_vault::SyncData {
+            profile: sw_vault::Profile {
+                id: Some(uuid::Uuid::new_v4()),
+                ..Default::default()
+            },
+            ciphers: vec![
+                encrypted_login("LoginSync", "usr", "pwd", &key),
+                sw_vault::Cipher {
+                    id: Some(uuid::Uuid::new_v4()),
+                    r#type: sw_vault::CipherType::SshKey,
+                    name: sw_vault::encrypt_with(
+                        b"ssh_sync",
+                        sw_vault::EncStringType::AesCbc256HmacSha256B64,
+                        &key,
+                    )
+                    .unwrap(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let payload = serde_json::to_value(&valid_sync).unwrap();
+        let res = handle_sync_data(&mut state, &payload)
+            .await
+            .expect("sync data should succeed");
+        assert_eq!(res["status"], "synced");
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["logins"], 1);
+        assert_eq!(res["ssh_keys"], 1);
+
+        // Vault file on disk
+        let vault_file = tmp.path().join("vault.json");
+        assert!(vault_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_agent_state_helpers_and_config_path_variants() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let direct_file = temp_dir.path().join("goldwarden.json");
+        let state = AgentState::new(ConfigFile::default()).with_config_directory(&direct_file);
+        assert_eq!(state.config_path(), Some(direct_file));
+
+        let mock_client = mock_api_client("http://localhost:1234");
+        let state_with_client = state.with_api_client(mock_client);
+        assert!(state_with_client.api_client.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_registry_login_actions_wire_handlers() {
+        let registry = default_registry();
+        let (mut state, _tmp) = temp_state();
+        let ctx = test_ctx();
+
+        // Locked state: these actions must return their specific locked/validation error, not "Acción no reconocida"
+        let res_sync = registry
+            .execute("Sync", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            res_sync.unwrap_err(),
+            "Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero."
+        );
+
+        let res_list = registry
+            .execute("ListLogins", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            res_list.unwrap_err(),
+            "Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero."
+        );
+
+        let res_get = registry
+            .execute(
+                "GetLogin",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "name": "test" }),
+            )
+            .await;
+        assert_eq!(
+            res_get.unwrap_err(),
+            "Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero."
+        );
+
+        let res_create = registry
+            .execute("CreateLogin", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            res_create.unwrap_err(),
+            "Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero."
+        );
+
+        let res_del = registry
+            .execute("DeleteLogin", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            res_del.unwrap_err(),
+            "Bóveda bloqueada. Desbloquea con 'silverwarden unlock' primero."
+        );
+
+        let res_set = registry
+            .execute("SetSession", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(res_set.unwrap()["status"], "session_saved");
+
+        let res_login = registry
+            .execute("Login", &mut state, &ctx, &serde_json::json!({}))
+            .await;
+        assert_eq!(res_login.unwrap()["status"], "session_saved");
+
+        let sync_empty = serde_json::to_value(sw_vault::SyncData::default()).unwrap();
+        let res_sd = registry
+            .execute("SyncData", &mut state, &ctx, &sync_empty)
+            .await;
+        assert_eq!(res_sd.unwrap()["status"], "synced");
+
+        let res_rv = registry
+            .execute("ReloadVault", &mut state, &ctx, &sync_empty)
+            .await;
+        assert_eq!(res_rv.unwrap()["status"], "synced");
+    }
 }
