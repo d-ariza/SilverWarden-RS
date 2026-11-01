@@ -12,6 +12,7 @@ pub use russh::keys::ssh_encoding::{Decode, Encode};
 pub use russh::keys::{PrivateKey, PublicKey};
 use sw_bitwarden_api::BitwardenApiClient;
 use sw_crypto::SymmetricKey;
+use sw_notify::Notifier;
 use sw_systemauth::{CallingContext, SessionStore, SessionType};
 use sw_vault::{VaultSshKey, VaultStore};
 use uuid::Uuid;
@@ -338,6 +339,7 @@ pub struct VaultAgentServer {
     session_store: Arc<RwLock<SessionStore>>,
     approval_provider: Arc<dyn ApprovalProvider>,
     api_client: Option<Arc<BitwardenApiClient>>,
+    notifier: Option<Arc<dyn Notifier>>,
 }
 
 impl std::fmt::Debug for VaultAgentServer {
@@ -348,6 +350,7 @@ impl std::fmt::Debug for VaultAgentServer {
                 &self.is_locked.load(std::sync::atomic::Ordering::Relaxed),
             )
             .field("has_api_client", &self.api_client.is_some())
+            .field("has_notifier", &self.notifier.is_some())
             .finish()
     }
 }
@@ -368,6 +371,7 @@ impl VaultAgentServer {
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             approval_provider: Arc::new(DefaultApprovalProvider::new()),
             api_client: None,
+            notifier: None,
         }
     }
 
@@ -380,6 +384,7 @@ impl VaultAgentServer {
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             approval_provider: Arc::new(DefaultApprovalProvider::new()),
             api_client: None,
+            notifier: None,
         }
     }
 
@@ -399,6 +404,17 @@ impl VaultAgentServer {
     pub fn with_api_client(mut self, client: Arc<BitwardenApiClient>) -> Self {
         self.api_client = Some(client);
         self
+    }
+
+    /// Sets an optional desktop notifier.
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Access to the optional notifier.
+    pub fn notifier(&self) -> Option<&Arc<dyn Notifier>> {
+        self.notifier.as_ref()
     }
 
     /// Access to the underlying session store.
@@ -901,6 +917,15 @@ impl VaultAgentServer {
         let mut sig_blob = Vec::new();
         sig.encode(&mut sig_blob)
             .map_err(|e| SshAgentError::EncodingError(e.to_string()))?;
+
+        if let Some(notifier) = &self.notifier {
+            let _ = notifier
+                .notify(
+                    "SilverWarden",
+                    &format!("Firma SSH con clave '{}'", key_name),
+                )
+                .await;
+        }
 
         Ok(sig_blob)
     }
@@ -3833,5 +3858,51 @@ OaGPv7jRnKvmNDiw==\n\
         assert!(keys_openssh
             .iter()
             .any(|s| s.contains(&pub_2) || pub_2.contains(s)));
+    }
+
+    #[tokio::test]
+    async fn test_sign_notifies_on_success() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        let agent = VaultAgentServer::with_key(vault, key)
+            .with_approval_provider(Arc::new(MockApprovalProvider::new(true)))
+            .with_notifier(mock_notifier.clone());
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let sig = agent
+            .sign_with_key_context(&key_blob, b"data_to_sign", 0, None)
+            .await
+            .unwrap();
+        assert!(!sig.is_empty());
+
+        let notifs = mock_notifier.notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0].0, "SilverWarden");
+        assert!(notifs[0].1.contains("Firma SSH con clave 'work-laptop'"));
+    }
+
+    #[tokio::test]
+    async fn test_sign_succeeds_even_if_notifier_fails() {
+        let key = make_test_key();
+        let (vault, (priv_1, _), _) = setup_test_vault_with_keys(&key).await;
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::failing());
+        let agent = VaultAgentServer::with_key(vault, key)
+            .with_approval_provider(Arc::new(MockApprovalProvider::new(true)))
+            .with_notifier(mock_notifier.clone());
+
+        let pk = PrivateKey::from_openssh(&priv_1).unwrap();
+        let mut key_blob = Vec::new();
+        pk.public_key().key_data().encode(&mut key_blob).unwrap();
+
+        let sig = agent
+            .sign_with_key_context(&key_blob, b"data_to_sign", 0, None)
+            .await
+            .expect("Signing should succeed even if notifier fails (silent fallback)");
+        assert!(!sig.is_empty());
+        assert!(mock_notifier.notifications().is_empty());
     }
 }

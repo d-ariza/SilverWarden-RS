@@ -232,4 +232,46 @@ Cada decisión se registra con:
 - **Evidencia:** `crates/sw-agent/src/lib.rs` (handlers de `Lock` y `PinUpdate`), tests `test_lock_clears_pin_cache`, `test_pin_update_clears_and_stores_new`.
 - **Estado:** Vigente.
 
+## D-M6-5 — Backend D-Bus Notifications (`org.freedesktop.Notifications`) y Notifier async
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Se requiere notificar al usuario en el escritorio Linux sobre eventos clave de seguridad. Se cuenta con `zbus 5.0` en dependencias del workspace.
+- **Decisión:** Implementar `DbusNotifier` en `sw-notify` conectándose al bus de sesión vía `org.freedesktop.Notifications`. El trait `Notifier` se evoluciona a `#[async_trait] pub trait Notifier: Send + Sync + std::fmt::Debug { async fn notify(&self, title: &str, body: &str) -> Result<(), NotifyError>; }` usando `async-trait 0.1` (estándar, mantenido, sin CVEs). El backend alternativo XDG Portal (`org.freedesktop.portal.Notification`) se pospone a post-MVP (DT-21) para evitar dependencias pesadas como `ashpd`.
+- **Alternativas:**
+  - (a) Mantener `Notifier` síncrono usando `zbus::blocking`. Rechazada: bloquea threads del runtime tokio de forma innecesaria en operaciones asíncronas.
+  - (b) Implementar XDG Portal inmediatamente con `ashpd`. Rechazada: introduce dependencias pesadas y complejidad innecesaria para el MVP.
+- **Evidencia:** `crates/sw-notify/src/lib.rs` (`DbusNotifier`, `Notifier`), `Cargo.toml`.
+- **Estado:** Vigente.
+
+## D-M6-6 — Inyección de dependencias `Arc<dyn Notifier>` en AgentState y VaultAgentServer
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Los tests unitarios y de integración deben ejecutarse sin depender de la presencia de un daemon D-Bus activo en el entorno (especialmente en CI o entornos headless).
+- **Decisión:** Inyectar `notifier: Arc<dyn Notifier>` en `AgentState` e inyectar `notifier: Option<Arc<dyn Notifier>>` en `VaultAgentServer`. Se implementa `MockNotifier` en `sw-notify` con contador de notificaciones en memoria protegida por `Mutex`, permitiendo simular éxito y fallos programados.
+- **Alternativas:**
+  - (a) Instanciar `DbusNotifier` directamente hardcodeado en los handlers. Rechazada: imposibilita pruebas unitarias fiables y rompe CI sin D-Bus.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`AgentState::with_notifier`), `crates/sw-ssh-agent/src/lib.rs` (`VaultAgentServer::with_notifier`).
+- **Estado:** Vigente.
+
+## D-M6-7 — Notificación restringida a firma SSH exitosa y bloqueo de vault con fallback silencioso
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Evitar saturar al usuario con notificaciones continuas (alerta por PIN erróneo, sync periódico, etc.) en esta fase.
+- **Decisión:** Notificar exclusivamente dos eventos en SW-053: (1) firma SSH completada con éxito indicando el nombre de la clave utilizada (`"Firma SSH con clave '{}'"`), y (2) bloqueo de la bóveda (`"Bóveda bloqueada"`). Ambos llamados implementan fallback silencioso: si el envío a D-Bus falla (ej. daemon caído o sin sesión), se ignora el error sin interrumpir ni fallar la operación principal (firma SSH o Lock).
+- **Alternativas:**
+  - (a) Interrumpir la firma SSH si falla la notificación. Rechazada: una falla en el bus de notificaciones no debe bloquear la capacidad operativa del usuario.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (`Lock`), `crates/sw-ssh-agent/src/lib.rs` (`sign_with_key_context`), tests `test_lock_succeeds_even_if_notifier_fails` y `test_sign_succeeds_even_if_notifier_fails`.
+- **Estado:** Vigente.
+
+## D-M6-8 — Pruebas unitarias con Mock y pruebas de integración D-Bus real aisladas en tests/
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Las pruebas que interactúan con un daemon D-Bus real (`test_dbus_notifier_smoke` y `test_dbus_notifier_returns_error_without_session`) no pueden garantizarse en CI y deben marcarse con `#[ignore]`. Si residen dentro de `src/lib.rs`, distorsionan el denominador de cobertura de `cargo llvm-cov`.
+- **Decisión:** Alojar los tests unitarios con `MockNotifier` y casos de error de dirección en `crates/sw-notify/src/lib.rs`, y aislar los tests con D-Bus real / manuales en `crates/sw-notify/tests/manual_dbus.rs` con `#[ignore]`.
+- **Alternativas:**
+  - (a) Dejar los tests `#[ignore]` dentro de `src/lib.rs`. Rechazada: genera un artefacto del denominador bajando la cobertura de líneas de producción del crate artificialmente.
+- **Evidencia:** `crates/sw-notify/tests/manual_dbus.rs`, cobertura `sw-notify` del 94.68% de líneas.
+- **Estado:** Vigente.
+
+
 

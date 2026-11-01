@@ -312,3 +312,11 @@ Estos principios deben ser la base de la v2 (si se hace). La v2 debería:
 
 **Verificación empírica 2026-11-01:** incidente durante el cierre documental de M5. La IA duplicó `## 8. Lecciones de M5` en `lecciones-aprendidas.md` tres veces consecutivas (3 intentos en total). Se detectó con `grep -c "^## 8"` (con anclaje) y se corrigió con `git checkout` + append manual. Lección aplicada a partir de ahora: **para docs largos, usar append atómico (`cat >> file << 'EOF'`), nunca edición in-place por IA.**
 
+### 8.9. Inyección de traits para tests sin D-Bus real
+
+**Problema:** Al implementar `sw-notify` y la integración con D-Bus (`org.freedesktop.Notifications`), los tests unitarios en entornos de integración continua (CI) o contenedores headless fallaban porque no existía un bus de sesión D-Bus activo ni un daemon de notificaciones (`org.freedesktop.Notifications`).
+
+**Solución:** Desacoplar la infraestructura mediante el trait `Notifier` e inyectar `Arc<dyn Notifier>` en `AgentState` y `Option<Arc<dyn Notifier>>` en `VaultAgentServer`. Proveer un `MockNotifier` en memoria con grabación atómica de eventos para verificar las llamadas sin I/O, y aislar los tests con D-Bus real en `crates/sw-notify/tests/manual_dbus.rs` marcados con `#[ignore]` para ejecución manual explícita.
+
+**Generalización:** Cualquier integración con servicios del sistema operativo (D-Bus, sockets del sistema, biometría, demonios de escritorio) debe interactuar a través de traits inyectables. Las pruebas automatizadas estándar deben ejecutarse 100% en memoria contra mocks; las pruebas reales deben ser pruebas de integración aisladas sin romper el pipeline de CI ni distorsionar la cobertura del código productivo.
+

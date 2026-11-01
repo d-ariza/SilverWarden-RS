@@ -5632,6 +5632,7 @@ dependencies = [
  "sw-config",
  "sw-crypto",
  "sw-ipc",
+ "sw-notify",
  "sw-ssh-agent",
  "sw-systemauth",
  "sw-vault",
@@ -5789,7 +5790,9 @@ dependencies = [
 name = "sw-notify"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "zbus",
 ]
@@ -5805,6 +5808,7 @@ dependencies = [
  "ssh-key 0.6.7",
  "sw-bitwarden-api",
  "sw-crypto",
+ "sw-notify",
  "sw-systemauth",
  "sw-vault",
  "tempfile",

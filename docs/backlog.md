@@ -841,7 +841,7 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 - Tests unitarios con mock del bus de notificaciones.
 - Cobertura ≥85%.
 
-**Depende de:** SW-040, SW-052 · **Estado:** Pendiente
+**Depende de:** SW-040, SW-050 · **Estado:** Hecho (2026-11-01)
 
 ---
 

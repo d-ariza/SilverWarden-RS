@@ -106,6 +106,13 @@
 - **Retoma:** M6+ (si se requiere determinismo temporal absoluto, introducir una abstracción `Clock` inyectable).
 - **Estado:** Abierta.
 
+### DT-21 — Backend XDG Desktop Portal para notificaciones (pospuesto a post-MVP)
+- **Descripción:** En SW-053 se implementó el backend D-Bus estándar (`org.freedesktop.Notifications`). Para compatibilidad con entornos confinados (Flatpak, Snap) donde el acceso al bus de notificaciones directo puede estar restringido por políticas sandbox, se debe añadir el backend de XDG Desktop Portal (`org.freedesktop.portal.Notification`).
+- **Impacto:** Bajo para MVP CLI/Daemon local (la inmensa mayoría de distribuciones Linux exponen `org.freedesktop.Notifications` en la sesión de usuario).
+- **Motivo:** Evitar dependencias adicionales pesadas (como `ashpd`) o complejidad de IPC en la fase M6.
+- **Retoma:** M10 (Portabilidad y Empaquetado).
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)

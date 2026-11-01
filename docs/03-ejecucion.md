@@ -1852,6 +1852,46 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 
 *Nota metodológica:* La medición aislada con `-p sw-agent` evalúa exclusivamente las pruebas internas del crate sin disparar los arneses de integración ni las llamadas IPC desde `sw-cli` o `sw-ssh-agent`, lo que deja sin ejercitar segmentos del daemon. La medición estándar y canónica del workspace (`--workspace --exclude sw-gui`) cubre todo el flujo operativo del agente alcanzando el **97.56%** en `sw-agent/src/lib.rs`.
 
+---
+
+### 6.2 [SW-053] Notificaciones de escritorio (D-Bus Notifications)
+
+**Fecha:** 2026-11-01  
+**Objetivo:** Implementar el subsistema de notificaciones de escritorio en `sw-notify` sobre el protocolo D-Bus (`org.freedesktop.Notifications`) e integrarlo en `sw-agent` y `sw-ssh-agent` para alertar sobre eventos críticos de seguridad (firma SSH exitosa con nombre de clave, y bloqueo explícito del vault), con degradación elegante y fallback silencioso si el daemon de escritorio no está disponible.
+
+#### Decisiones de diseño aplicadas
+- **D-M6-5:** `DbusNotifier` con `zbus 5.0` invocando `org.freedesktop.Notifications.Notify`. Trait `Notifier` evolucionado a asíncrono con `async-trait 0.1` (`#[async_trait] pub trait Notifier: Send + Sync + std::fmt::Debug`).
+- **D-M6-6:** Inyección de dependencias `Arc<dyn Notifier>` en `AgentState` e inyección opcional en `VaultAgentServer`. Implementación de `MockNotifier` en `sw-notify` para pruebas unitarias sin dependencias externas.
+- **D-M6-7:** Eventos restringidos a: firma SSH exitosa (`"Firma SSH con clave '{}'"`) y bloqueo del vault (`"Bóveda bloqueada"`). Fallback silencioso en ambos: el fallo en el envío de notificación no interrumpe ni invalida la operación principal.
+- **D-M6-8:** Aislamiento de tests: pruebas unitarias con mock en `crates/sw-notify/src/lib.rs` (94.68% de cobertura) y pruebas de integración con D-Bus real aisladas con `#[ignore]` en `crates/sw-notify/tests/manual_dbus.rs` para prevenir fallos en entornos de CI headless y evitar distorsionar el denominador de cobertura.
+
+#### Archivos modificados
+- `Cargo.toml`: dependencia de workspace `async-trait = "0.1"`.
+- `crates/sw-notify/Cargo.toml`: dependencias `async-trait`, `tokio` (dev).
+- `crates/sw-notify/src/lib.rs`: trait `Notifier`, backend `DbusNotifier`, struct `MockNotifier` y 5 tests unitarios.
+- `crates/sw-notify/tests/manual_dbus.rs`: 2 tests de integración D-Bus real marcados con `#[ignore]`.
+- `crates/sw-ssh-agent/Cargo.toml`: dependencia `sw-notify`.
+- `crates/sw-ssh-agent/src/lib.rs`: campo `notifier` en `VaultAgentServer`, builder `with_notifier`, llamada asíncrona tras firma exitosa en `sign_with_key_context`, y 2 tests unitarios.
+- `crates/sw-agent/Cargo.toml`: dependencia `sw-notify`.
+- `crates/sw-agent/src/lib.rs`: campo `notifier: Arc<dyn sw_notify::Notifier>` en `AgentState`, builder `with_notifier`, llamada en handler de acción `Lock`, y 2 tests unitarios.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-notify` | `cargo test -p sw-notify` | 5 pasan, 2 ignorados (`manual_dbus.rs`), 0 fallan |
+| Pruebas unitarias `sw-ssh-agent` | `cargo test -p sw-ssh-agent` | 43 pasan, 0 fallan (41 previos + 2 de notificación) |
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 57 pasan, 0 fallan (55 previos + 2 de notificación) |
+| Pruebas workspace completo | `cargo test --workspace --exclude sw-gui` | 429 pasan, 0 fallan, 1 ignorado (`test_sha3_hash_parity`) |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) |
+| Cobertura `sw-notify` | `cargo llvm-cov -p sw-notify --summary-only` | **94.68%** líneas / **96.80%** regiones (gate ≥85% ampliamente superado) |
+| Cobertura `sw-agent` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.58%** líneas / **97.21%** regiones (gate ≥85% superado) |
+| Cobertura `sw-ssh-agent` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **94.64%** líneas / **94.74%** regiones (gate ≥85% superado) |
+| Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.18%** líneas / **93.11%** regiones (gate ≥90% ampliamente superado) |
+
+
 
 
 

@@ -151,6 +151,7 @@ pub struct AgentState {
     pub config_directory: Option<PathBuf>,
     pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
     pub pin_cache: PinCache,
+    pub notifier: Arc<dyn sw_notify::Notifier>,
 }
 
 impl AgentState {
@@ -167,7 +168,14 @@ impl AgentState {
             config_directory: None,
             api_client: None,
             pin_cache: PinCache::new(pin_cache_ttl),
+            notifier: Arc::new(sw_notify::DbusNotifier::new()),
         }
+    }
+
+    /// Sets an injectable desktop notifier.
+    pub fn with_notifier(mut self, notifier: Arc<dyn sw_notify::Notifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     /// Sets an authenticated API client in state.
@@ -1207,10 +1215,13 @@ pub fn default_registry() -> ActionsRegistry {
             state.is_locked = true;
             state.sessions.wipe();
             let va = state.vault_agent.clone();
+            let notifier = state.notifier.clone();
             Box::pin(async move {
                 if let Some(agent) = va {
                     agent.lock().await;
                 }
+                // Notificar bloqueo (ignorar error, fallback silencioso)
+                let _ = notifier.notify("SilverWarden", "Bóveda bloqueada").await;
                 Ok(serde_json::json!({ "status": "locked" }))
             })
         },
@@ -4924,5 +4935,45 @@ mod tests {
         assert_eq!(unlock2["from_cache"], true);
         assert!(!state.is_locked);
         assert!(state.vault_agent.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lock_notifies_via_notifier() {
+        let registry = default_registry();
+        let (state, _temp_dir) = temp_state();
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
+        let mut state = state.with_notifier(mock_notifier.clone());
+        let ctx = test_ctx();
+
+        let lock_res = registry
+            .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_res["status"], "locked");
+        assert!(state.is_locked);
+
+        let notifs = mock_notifier.notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(
+            notifs[0],
+            ("SilverWarden".to_string(), "Bóveda bloqueada".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lock_succeeds_even_if_notifier_fails() {
+        let registry = default_registry();
+        let (state, _temp_dir) = temp_state();
+        let mock_notifier = Arc::new(sw_notify::MockNotifier::failing());
+        let mut state = state.with_notifier(mock_notifier.clone());
+        let ctx = test_ctx();
+
+        let lock_res = registry
+            .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .expect("Lock should succeed even if notifier fails (silent fallback)");
+        assert_eq!(lock_res["status"], "locked");
+        assert!(state.is_locked);
+        assert!(mock_notifier.notifications().is_empty());
     }
 }
