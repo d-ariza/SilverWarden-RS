@@ -162,3 +162,27 @@ Cada decisión se registra con:
 - **Alternativas:** Modificar variables globales de directorio de datos o asumir que el test corre en contenedor efímero (frágil y riesgoso para el entorno del desarrollador).
 - **Evidencia:** `crates/sw-bitwarden-api/src/websocket.rs`, test `test_websocket_sync_writes_to_injected_vault_path` que verifica que la escritura ocurre dentro del `TempDir` y que el archivo real del host permanece intacto.
 - **Estado:** Vigente.
+
+## D51 — Aceptación de la métrica estándar de cobertura para M5
+
+- **Fecha:** 2026-11-01
+- **Contexto:** La cobertura de `sw-cli` es **85.19%** según `cargo llvm-cov -p sw-cli --summary-only`, pero incluye líneas del módulo `mod tests` en el denominador. La cobertura de "producción pura" es menor y no se ha medido.
+- **Decisión:** Aceptar 85.19% como cumplimiento del gate ≥85% para M5, documentando la limitación metodológica en `deuda-tecnica.md` DT-18 y `lecciones-aprendidas.md` 8.7. La mejora de la métrica (separar tests o excluirlos) se pospone a M6.
+- **Alternativas:**
+  - (a) Bloquear M5 hasta tener cobertura de producción pura ≥85%. Rechazada: retrasaría M5 innecesariamente; el bug real (filtro de versión) ya está resuelto y verificado en runtime con `sync` y `ssh-add -L`.
+  - (b) Cambiar el gate a "cobertura de producción pura" retroactivamente. Rechazada: rompería todos los milestones anteriores que usaron la métrica estándar y exigiría re-medir M1-M4.
+- **Evidencia:** `cargo llvm-cov -p sw-cli --summary-only` → 85.19% líneas. Commits `7e70c8b` y `0eefb93`. Tests 104+10, 0 fallos. `$HOME` real intacto.
+- **Estado:** Vigente.
+
+## D52 — Ubicación canónica de las lecciones aprendidas
+
+- **Fecha:** 2026-11-01
+- **Contexto:** El commit `969fa84` ("docs: plan de M6") movió por error la sección `## 8. Lecciones de M5 (SSH Agent)` de `docs/lecciones-aprendidas.md` a `docs/deuda-tecnica.md`. Las lecciones aprendidas (patrones de diseño, metodología, seguridad) no son deuda técnica: son documentación de conocimiento que debe residir en `lecciones-aprendidas.md`.
+- **Decisión:** Las lecciones aprendidas de cada milestone van en `docs/lecciones-aprendidas.md`, bajo `## N. Lecciones de MX`. `docs/deuda-tecnica.md` es exclusivamente para deudas técnicas (`DT-NNN`), no para lecciones. Se revierte el movimiento de `969fa84` en el cierre de M5.
+- **Alternativas:**
+  - (a) Dejar la sección 8 en `deuda-tecnica.md` y añadir 8.7 allí. Rechazada: perpetúa el error de organización y mezcla conceptos (deuda vs. conocimiento).
+  - (b) Duplicar la sección 8 en ambos documentos. Rechazada: viola el principio DRY y crea dos fuentes de verdad que se desincronizan.
+- **Evidencia:** `docs/lecciones-aprendidas.md` (sección 8 completa 8.1-8.8), `docs/deuda-tecnica.md` (sin sección 8, solo DT-18), commits `969fa84` (movimiento erróneo) y el commit de cierre de M5 (reversión). `grep -c "## 8. Lecciones de M5" docs/lecciones-aprendidas.md` → 1; `grep -c "## 8. Lecciones de M5" docs/deuda-tecnica.md` → 0.
+- **Estado:** Vigente.
+
+

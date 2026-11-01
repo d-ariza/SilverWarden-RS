@@ -92,6 +92,14 @@
 - **Retoma:** M6/M7.
 - **Estado:** Abierta.
 
+### DT-18 — Cobertura de producción pura en `sw-cli` no medida
+
+- **Descripción:** La cobertura de `sw-cli` reportada por `cargo llvm-cov -p sw-cli --summary-only` es **85.19% de líneas**, pero incluye las líneas del módulo `mod tests` (que viven en `main.rs`) en el denominador. Al añadir 1815 líneas de tests en el commit `0eefb93`, el porcentaje subió parcialmente por artefacto del denominador. La cobertura de "producción pura" (excluyendo tests) **no se ha medido** y se estima inferior al 85%.
+- **Impacto:** Medio (metodológico). El gate del proyecto se cumple según la métrica estándar, pero la métrica es vulnerable a gaming.
+- **Motivo:** Los tests viven en `main.rs` por simplicidad. `cargo llvm-cov --ignore-filename-regex` no permite excluir módulos dentro de un archivo (el regex se aplica al nombre de archivo, no al contenido).
+- **Retoma:** M6. Opciones a evaluar: (a) mover tests a `tests/` (integración) y `src/tests.rs` (unitarios con `#[path]`) y usar `--ignore-filename-regex`; (b) usar `#[cfg_attr(coverage, coverage(off))]` en `mod tests` (requiere feature `coverage`); (c) adoptar `tarpaulin --ignore-tests`. Validar que la cobertura de producción pura ≥85% antes de cerrar M6.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
@@ -108,36 +116,3 @@
 ### DT-6 — Cobertura de `sw-ssh-agent` (87.48%)
 - **Estado:** Cerrada (commits `bcf8252` y `5be5e24`). Cobertura ahora 94.49% (SW-046).
 
----
-
-## 8. Lecciones de M5 (SSH Agent)
-
-### 8.1. El framing manual del protocolo SSH agent es viable (pero tiene límites)
-**Problema:** `russh::keys::agent::server::serve` mantiene un `KeyStore` interno que no soporta un backend externo (nuestro vault cifrado). Tuvimos que implementar el framing manual.
-**Lección:** Para `List` y `Sign` básicos, el framing manual es aceptable y funciona (`ssh-add -L`, `ssh-keygen -Y sign`, `git commit -S` pasan). Para `Add`/`Remove` y constraints, hay que parsear más tipos (Ed25519, RSA, ECDSA) y constraints (lifetime, confirm). Es más trabajo, pero viable.
-**Generalización:** Cuando una crate no soporta tu modelo de datos, implementar la capa de protocolo a mano es válido si usas los tipos de la crate (`PrivateKey`, `PublicKey`, `sign_with_hash_alg`) para no reinventar la criptografía.
-
-### 8.2. Los tests que generan claves RSA son lentos en debug
-**Problema:** Generar claves RSA-2048 en modo debug tarda ~35-40s por clave. Eso hacía que los tests de `sw-agent` tardaran 88s.
-**Solución:** Usar fixtures precargados (`TEST_RSA_PEM`) en tests, no generar claves en cada iteración.
-**Generalización:** En tests, usa fixtures para operaciones criptográficas costosas (RSA, Argon2 con memoria alta). Los tests deben correr en segundos, no en minutos.
-
-### 8.3. Nunca escribas en `$HOME` en tests
-**Problema:** Los tests de `sw-agent` escribieron en `~/.config/goldwarden/goldwarden.json` real, corrompiendo la configuración del usuario.
-**Solución:** Inyectar un `TempDir` como `ConfigDirectory` en tests. Nunca usar `std::env::set_var("HOME", ...)` (es inseguro en tests paralelos).
-**Generalización:** Cualquier test que toque el sistema de archivos debe usar un directorio temporal aislado. Añade un test de regresión que verifique que el archivo real no se toca.
-
-### 8.4. El bypass de seguridad solo en `#[cfg(test)]`
-**Problema:** El `DefaultApprovalProvider` tenía un bypass por variable de entorno (`SILVERWARDEN_SYSTEM_AUTH_DISABLED`). Si alguien la dejaba activa en producción, el agente firmaba sin aprobación.
-**Solución:** Mover el bypass a `#[cfg(test)]` y usar un método `with_bypass()` solo disponible en tests.
-**Generalización:** Nunca dejes un bypass de seguridad accesible en runtime. Si necesitas un bypass para tests, aíslalo con `#[cfg(test)]` o un feature flag de compilación.
-
-### 8.5. Documentar la interoperabilidad con el sistema de referencia
-**Problema:** No teníamos una matriz clara de qué features soporta silverWarden vs Goldwarden Go vs OpenSSH.
-**Solución:** Crear `docs/interop-ssh-agent.md` con una tabla comparativa y documentar las limitaciones conocidas (passphrase, DSA, hardware keys).
-**Generalización:** Si estás reescribiendo un sistema, documenta la matriz de interop. Ayuda a decidir qué priorizar y a detectar gaps.
-
-### 8.6. La deuda técnica debe revisarse al cerrar cada milestone
-**Problema:** Algunas deudas (DT-1, DT-3, DT-4, DT-6) se resolvieron durante M5, pero no se actualizó el documento hasta el final.
-**Solución:** Al cerrar cada milestone, revisar `deuda-tecnica.md` y marcar como "Cerrada" lo que se haya resuelto.
-**Generalización:** La deuda técnica es un documento vivo. Si no se revisa, se olvida y se convierte en un problema mayor.

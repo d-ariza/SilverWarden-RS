@@ -1758,6 +1758,55 @@ Secuencia ejecutada desde terminal contra Vaultwarden local con certificado auto
   ```
   *Resultado:* Intercepción de `ErrorKind::NotFound` y `ErrorKind::ConnectionRefused` con mensaje claro y accionable para el usuario.
 
+#### 5.7.1 Evidencia de cierre M5 (2026-10-31 / 2026-11-01)
+
+##### Verificación del filtro de versión de Vaultwarden (D49)
+
+Prueba con `curl` contra Vaultwarden local (`https://localhost`) usando un `access_token` válido obtenido de DevTools:
+
+- `Bitwarden-Client-Version: 0.0.1` → 6 items (3 logins, 1 nota, 1 tarjeta, 1 identidad; **0 claves SSH**).
+- `Bitwarden-Client-Version: 2024.12.0` → 8 items (3 logins, 1 nota, 1 tarjeta, 1 identidad, **2 claves SSH**).
+
+**Causa raíz confirmada:** Vaultwarden filtra `CipherType::SshKey` (tipo 5) del `/sync` si el cliente no reporta versión ≥ 2024.12.0. Fix en commit `7e70c8b`.
+
+##### Flujo end-to-end real
+
+```text
+$ silverwarden sync
+Sincronización completada: 8 elementos (3 logins, 2 claves SSH, 1 nota, 1 tarjeta, 1 identidad).
+
+$ ssh-add -L
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFUn50BXZBGhbC5e8uClv1+AIt6pEn/AVU+fWSXc+86i clave ssh
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKcEAgVJ19FeNTthdO7B5X6TP47KvhYAaSnbT63ALsNS ssh test
+```
+
+M5 (SSH Agent) verificado en runtime con Vaultwarden local real.
+
+##### Cobertura de sw-cli
+
+| Métrica | Antes | Después |
+|---|---|---|
+| Líneas (`cargo llvm-cov -p sw-cli --summary-only`) | 78.93% | 85.19% |
+| Regiones | 78.25% | 84.46% |
+| Tests unitarios | 74 | 104 |
+| Tests integración | 10 | 10 |
+
+Gate ≥85% cumplido según la métrica estándar del proyecto. Commit `0eefb93`.
+
+*Nota metodológica:* la métrica estándar incluye las líneas del módulo `mod tests` en el denominador (los tests viven en `main.rs`). La cobertura de "producción pura" (excluyendo `mod tests`) no se ha medido y se estima inferior. Ver `deuda-tecnica.md` DT-18.
+
+##### Calidad estática
+
+- `cargo test -p sw-cli` → 104 unitarios + 10 integración pasan, 0 fallan.
+- `cargo clippy -p sw-cli --tests -- -D warnings` → 0 warnings.
+- `cargo fmt --all -- --check` → 0 diffs.
+- `cargo audit` → 0 vulnerabilidades (1 warning RUSTSEC-2026-0386 en tokio 1.53.2, documentado en `.cargo/audit.toml`).
+
+##### Aislamiento de $HOME
+
+Verificado por `test_websocket_sync_writes_to_injected_vault_path` y por comparación de `mtime` de `~/.config/goldwarden/goldwarden.json` y `~/.local/share/silverwarden/vault.json` antes/después de la suite. Sin cambios.
+
+
 
 
 

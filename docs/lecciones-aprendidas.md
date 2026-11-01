@@ -257,3 +257,58 @@ Estos principios deben ser la base de la v2 (si se hace). La v2 debería:
 - Documentar la API pública de cada crate.
 - Añadir benchmarks de rendimiento.
 - Generalizar el documento de lecciones aprendidas para que sirva a cualquier proyecto (no solo a silverWarden).
+---
+
+## 8. Lecciones de M5 (SSH Agent)
+
+### 8.1. El framing manual del protocolo SSH agent es viable (pero tiene límites)
+**Problema:** `russh::keys::agent::server::serve` mantiene un `KeyStore` interno que no soporta un backend externo (nuestro vault cifrado). Tuvimos que implementar el framing manual.
+**Lección:** Para `List` y `Sign` básicos, el framing manual es aceptable y funciona (`ssh-add -L`, `ssh-keygen -Y sign`, `git commit -S` pasan). Para `Add`/`Remove` y constraints, hay que parsear más tipos (Ed25519, RSA, ECDSA) y constraints (lifetime, confirm). Es más trabajo, pero viable.
+**Generalización:** Cuando una crate no soporta tu modelo de datos, implementar la capa de protocolo a mano es válido si usas los tipos de la crate (`PrivateKey`, `PublicKey`, `sign_with_hash_alg`) para no reinventar la criptografía.
+
+### 8.2. Los tests que generan claves RSA son lentos en debug
+**Problema:** Generar claves RSA-2048 en modo debug tarda ~35-40s por clave. Eso hacía que los tests de `sw-agent` tardaran 88s.
+**Solución:** Usar fixtures precargados (`TEST_RSA_PEM`) en tests, no generar claves en cada iteración.
+**Generalización:** En tests, usa fixtures para operaciones criptográficas costosas (RSA, Argon2 con memoria alta). Los tests deben correr en segundos, no en minutos.
+
+### 8.3. Nunca escribas en `$HOME` en tests
+**Problema:** Los tests de `sw-agent` escribieron en `~/.config/goldwarden/goldwarden.json` real, corrompiendo la configuración del usuario.
+**Solución:** Inyectar un `TempDir` como `ConfigDirectory` en tests. Nunca usar `std::env::set_var("HOME", ...)` (es inseguro en tests paralelos).
+**Generalización:** Cualquier test que toque el sistema de archivos debe usar un directorio temporal aislado. Añade un test de regresión que verifique que el archivo real no se toca.
+
+### 8.4. El bypass de seguridad solo en `#[cfg(test)]`
+**Problema:** El `DefaultApprovalProvider` tenía un bypass por variable de entorno (`SILVERWARDEN_SYSTEM_AUTH_DISABLED`). Si alguien la dejaba activa en producción, el agente firmaba sin aprobación.
+**Solución:** Mover el bypass a `#[cfg(test)]` y usar un método `with_bypass()` solo disponible en tests.
+**Generalización:** Nunca dejes un bypass de seguridad accesible en runtime. Si necesitas un bypass para tests, aíslalo con `#[cfg(test)]` o un feature flag de compilación.
+
+### 8.5. Documentar la interoperabilidad con el sistema de referencia
+**Problema:** No teníamos una matriz clara de qué features soporta silverWarden vs Goldwarden Go vs OpenSSH.
+**Solución:** Crear `docs/interop-ssh-agent.md` con una tabla comparativa y documentar las limitaciones conocidas (passphrase, DSA, hardware keys).
+**Generalización:** Si estás reescribiendo un sistema, documenta la matriz de interop. Ayuda a decidir qué priorizar y a detectar gaps.
+
+### 8.6. La deuda técnica debe revisarse al cerrar cada milestone
+**Problema:** Algunas deudas (DT-1, DT-3, DT-4, DT-6) se resolvieron durante M5, pero no se actualizó el documento hasta el final.
+**Solución:** Al cerrar cada milestone, revisar `deuda-tecnica.md` y marcar como "Cerrada" lo que se haya resuelto.
+**Generalización:** La deuda técnica es un documento vivo. Si no se revisa, se olvida y se convierte en un problema mayor.
+
+### 8.7. La cobertura puede subir por artefacto del denominador
+
+**Problema:** En `sw-cli`, los tests unitarios viven en el mismo `main.rs` que la producción. Al añadir 1815 líneas de tests en el commit `0eefb93`, la cobertura de `cargo llvm-cov -p sw-cli --summary-only` subió de 78.93% a 85.19%. Pero parte de esa subida es porque las líneas de test (que se ejecutan al 100%) engordan el denominador, no porque se haya cubierto más producción. La cobertura de "producción pura" no se midió y se estima inferior al 85%.
+
+**Solución:** Para métricas honestas de cobertura de producción, mover los tests a archivos separados (`tests/` para integración, `src/tests.rs` para unitarios con `#[path]`) o usar una herramienta que excluya tests (`tarpaulin --ignore-tests`, o `llvm-cov` con `--ignore-filename-regex` apuntando a archivos separados). **No usar `--ignore-filename-regex '.*tests.*'` sobre un archivo único**: el regex se aplica al nombre del archivo, no al contenido, así que no excluye `mod tests` dentro de `main.rs` (verificado empíricamente: la métrica no cambió).
+
+**Generalización:** Mide la cobertura, pero entiende qué mide. Un 85% de líneas con tests en el mismo archivo no es lo mismo que un 85% de líneas con tests separados. La primera métrica es vulnerable a gaming; la segunda es más honesta. Si el gate del proyecto es "≥85% según `llvm-cov --summary-only`", se cumple; si el gate es "≥85% de producción pura", hay que medirlo con otra herramienta o estructura.
+
+### 8.8. Verificación empírica: la IA puede duplicar bloques al editar docs largos
+
+**Problema:** Al pedir a la IA que añadiera la subsección 8.7 a `lecciones-aprendidas.md`, la IA duplicó el bloque completo `## 8. Lecciones de M5` (con 8.1 a 8.7) **dos veces** en el mismo archivo. El error se detectó al revisar `git diff` (no `git diff --stat`, que solo mostraba `+44 líneas`).
+
+**Solución:** Cuando se pida a la IA editar un documento largo existente, exigir:
+1. Primero, `git diff` del archivo antes de cualquier `git add`.
+2. Verificar con `grep -c "^## <sección>"` (con anclaje `^`) que no hay duplicados.
+3. No commitear hasta que el humano revise el `git diff` completo, no solo el `--stat`.
+
+**Generalización:** `git diff --stat` miente por omisión: dice cuántas líneas cambiaron, no **qué** cambió. En documentos largos, la IA puede duplicar bloques enteros sin que el `--stat` lo delate (44 líneas duplicadas se ven como "44 líneas añadidas", no como "bloque duplicado"). La regla del proyecto "sin evidencia no hay aprobación" se aplica también a la edición de docs: **verificar el diff real, no el resumen**.
+
+**Verificación empírica 2026-11-01:** incidente durante el cierre documental de M5. La IA duplicó `## 8. Lecciones de M5` en `lecciones-aprendidas.md` tres veces consecutivas (3 intentos en total). Se detectó con `grep -c "^## 8"` (con anclaje) y se corrigió con `git checkout` + append manual. Lección aplicada a partir de ahora: **para docs largos, usar append atómico (`cat >> file << 'EOF'`), nunca edición in-place por IA.**
+

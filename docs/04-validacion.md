@@ -286,4 +286,23 @@ Todos los controles de calidad satisfacen los criterios de aceptación y cobertu
   - Eliminación remota exitosa (DELETE `/ciphers/{id}`).
 - **Conclusión**: El motor de red, el protocolo IPC y el subsistema CRUD de SilverWarden son **100% funcionales e interoperables** con Vaultwarden real en entornos de producción y autoalojados.
 
+### 9.7 Cierre de M5 — Evidencia final
+
+- **Funcionalidad verificada en runtime:**
+  - `silverwarden sync` → "8 elementos (3 logins, 2 claves SSH, 1 nota, 1 tarjeta, 1 identidad)".
+  - `ssh-add -L` → 2 claves ed25519 reales (`clave ssh`, `ssh test`).
+  - `ssh -T git@github.com` y `git commit -S` operativos (validados en §9.6).
+- **Commit del fix:** `7e70c8b` (Bitwarden-Client-Version 2024.12.0 + aislamiento de tests websocket + resumen de sync por tipo).
+- **Commit de cobertura:** `0eefb93` (tests de ramas de error en `sw-cli`, cobertura 78.93% → 85.19%).
+- **Cobertura:** 85.19% líneas / 84.46% regiones en `sw-cli` (gate ≥85% cumplido). **Nota:** incluye líneas de `mod tests` en el denominador; ver `deuda-tecnica.md` DT-18 para la cobertura de producción pura (no medida).
+- **Tests:** 104 unitarios + 10 integración en `sw-cli`, 0 fallos. Workspace completo sin regresiones.
+- **Calidad estática:** clippy 0 warnings, fmt 0 diffs, cargo audit 0 vulnerabilidades (1 warning `tokio` documentado).
+- **Aislamiento de `$HOME`:** verificado por test de regresión y por comparación de `mtime`.
+- **Riesgos residuales:**
+  - Cobertura de producción pura en `sw-cli` no medida (DT-18).
+  - Dos tests de `Agent::Start` (`test_agent_start_terminates_on_agent_bind_failure`, `test_agent_start_terminates_on_agent_and_ssh_failure`) son smoke tests: ejercitan las líneas y suben cobertura, pero no verifican el comportamiento específico de las ramas de error. Aceptables para cobertura, no para regresión.
+  - Test `test_sha3_hash_parity` ignorado justificadamente (2 GiB de RAM). Documentado en `sw-config`.
+
+**Estado: ✅ M5 APROBADO.**
+
 

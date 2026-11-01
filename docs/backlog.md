@@ -740,6 +740,20 @@ Una historia pasa a `Hecho` solo cuando:
 
 **Depende de:** SW-040, SW-041, SW-042, SW-043, SW-044, SW-045 · **Estado:** Completado (2026-10-27)
 
+### Estado de M5
+
+| Historia | Estado |
+|---|---|
+| SW-040 Servidor SSH Agent | ✅ Hecho |
+| SW-041 List de claves | ✅ Hecho |
+| SW-042 Sign + SignWithFlags | ✅ Hecho |
+| SW-043 Aprobación y sesiones SSH | ✅ Hecho |
+| SW-044 Add/Remove protocolo SSH | ✅ Hecho |
+| SW-045 Acciones IPC para GUI | ✅ Hecho |
+| SW-046 Interop y regresión | ✅ Hecho |
+
+**7 de 7 de M5 completadas. Milestone M5 (SSH Agent) 100% completado y verificado en runtime (2026-11-01).** Ver evidencia en `03-ejecucion.md` §5.7.1 y `04-validacion.md` §9.7.
+
 ---
 
 ## Post-MVP (P1 / P2 — se detallan cuando se aborden)
