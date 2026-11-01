@@ -2443,11 +2443,42 @@ mod tests {
         }
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: String,
+        old_val: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &str) -> Self {
+            Self {
+                key: key.to_string(),
+                old_val: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old_val {
+                    Some(val) => std::env::set_var(&self.key, val),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_check_goldwarden_go_conflict() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("HOME");
         let temp_dir = tempfile::tempdir().unwrap();
         let home_fake = temp_dir.path().to_path_buf();
-        std::env::set_var("HOME", &home_fake);
+        unsafe {
+            std::env::set_var("HOME", &home_fake);
+        }
 
         // Absent
         assert!(!check_goldwarden_go_conflict());
@@ -3926,5 +3957,254 @@ mod tests {
             saved_cfg.decrypt_client_secret(&config_key).unwrap(),
             client_secret
         );
+    }
+
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
+
+        fn read_line(&mut self, _buf: &mut String) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated flush failure"))
+        }
+    }
+
+    #[test]
+    fn test_resolve_ssh_socket_path_non_home_parent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let main_socket = temp_dir.path().join(".silverwarden.sock");
+        let expected = temp_dir.path().join(".silverwarden-ssh-agent.sock");
+        let resolved = resolve_ssh_socket_path(&main_socket);
+        assert_eq!(resolved, expected);
+        if let Ok(default_ssh) = sw_ssh_agent::default_ssh_agent_socket_path() {
+            assert_ne!(resolved, default_ssh);
+        }
+    }
+
+    #[test]
+    fn test_resolve_ssh_socket_path_home_parent() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h),
+            Err(_) => return,
+        };
+        let main_socket = home.join(".silverwarden.sock");
+        let resolved = resolve_ssh_socket_path(&main_socket);
+        let expected = sw_ssh_agent::default_ssh_agent_socket_path()
+            .unwrap_or_else(|_| PathBuf::from(".silverwarden-ssh-agent.sock"));
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn test_resolve_config_path_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("SILVERWARDEN_CONFIG_PATH");
+        unsafe {
+            std::env::set_var("SILVERWARDEN_CONFIG_PATH", "/tmp/test_override_config.json");
+        }
+        let resolved = resolve_config_path(None).expect("Should resolve override config path");
+        assert_eq!(resolved, PathBuf::from("/tmp/test_override_config.json"));
+    }
+
+    #[test]
+    fn test_parse_yes_no_variants() {
+        let positive = [
+            "s", "S", "si", "SI", "sí", "SÍ", "y", "Y", "yes", "YES", "Yes", " S ",
+        ];
+        for val in positive {
+            assert!(parse_yes_no(val), "Expected '{val}' to parse as true");
+        }
+
+        let negative = ["n", "N", "no", "NO", "No", "", " ", "xyz", "true", "false"];
+        for val in negative {
+            assert!(!parse_yes_no(val), "Expected '{val}' to parse as false");
+        }
+    }
+
+    #[test]
+    fn test_prompt_from_io_read_error() {
+        let mut reader = FailingReader;
+        let mut writer = Vec::<u8>::new();
+        let result = prompt_from_io(&mut reader, &mut writer, "Prompt: ");
+        match result {
+            Err(CliError::Io(msg)) => {
+                assert!(msg.contains("simulated read failure"));
+            }
+            other => panic!("Expected CliError::Io, got: {:?}", other),
+        }
+        assert_eq!(String::from_utf8(writer).unwrap(), "Prompt: ");
+    }
+
+    #[test]
+    fn test_resolve_config_path_missing_home() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _cfg_guard = EnvGuard::new("SILVERWARDEN_CONFIG_PATH");
+        let _home_guard = EnvGuard::new("HOME");
+
+        unsafe {
+            std::env::remove_var("SILVERWARDEN_CONFIG_PATH");
+            std::env::remove_var("HOME");
+        }
+
+        let result = resolve_config_path(None);
+        match result {
+            Err(CliError::Config(msg)) => {
+                assert!(msg.contains("No se pudo determinar $HOME"));
+            }
+            other => panic!(
+                "Expected CliError::Config when HOME is missing, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_prompt_from_io_write_error() {
+        let mut reader = std::io::Cursor::new(b"input\n");
+        let mut writer = FailingWriter;
+        let result = prompt_from_io(&mut reader, &mut writer, "Prompt: ");
+        match result {
+            Err(CliError::Io(msg)) => {
+                assert!(msg.contains("simulated write failure"));
+            }
+            other => panic!("Expected CliError::Io, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_config_path_custom_provided() {
+        let custom = PathBuf::from("/custom/config/path.json");
+        let resolved = resolve_config_path(Some(custom.clone())).unwrap();
+        assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    fn test_resolve_ssh_socket_path_no_parent() {
+        let path = Path::new("socket_without_parent");
+        let resolved = resolve_ssh_socket_path(path);
+        assert_eq!(resolved, PathBuf::from(".silverwarden-ssh-agent.sock"));
+    }
+
+    #[test]
+    fn test_check_goldwarden_go_conflict_no_home() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _home_guard = EnvGuard::new("HOME");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert!(!check_goldwarden_go_conflict());
+    }
+
+    #[test]
+    fn test_setup_config_flow_validation_errors() {
+        let mut cfg = sw_config::ConfigFile::default();
+
+        // Opción inválida
+        let res = setup_config_flow(|_| Ok("99".to_string()), &mut cfg);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("Opción inválida")),
+            e => panic!("Unexpected error: {:?}", e),
+        }
+
+        // Opción 2 con URL vacía
+        let mut step = 0;
+        let res = setup_config_flow(
+            |_| {
+                step += 1;
+                if step == 1 {
+                    Ok("2".to_string())
+                } else {
+                    Ok("   ".to_string())
+                }
+            },
+            &mut cfg,
+        );
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("URL del servidor no puede estar vacía")),
+            e => panic!("Unexpected error: {:?}", e),
+        }
+
+        // Opción 3 con Identity URL vacía
+        let mut step3 = 0;
+        let res = setup_config_flow(
+            |_| {
+                step3 += 1;
+                if step3 == 1 {
+                    Ok("3".to_string())
+                } else {
+                    Ok("".to_string())
+                }
+            },
+            &mut cfg,
+        );
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("Identity URL no puede estar vacía")),
+            e => panic!("Unexpected error: {:?}", e),
+        }
+
+        // Opción 3 con API URL vacía
+        let mut step3_api = 0;
+        let res = setup_config_flow(
+            |_| {
+                step3_api += 1;
+                match step3_api {
+                    1 => Ok("3".to_string()),
+                    2 => Ok("https://identity.example.com".to_string()),
+                    _ => Ok("".to_string()),
+                }
+            },
+            &mut cfg,
+        );
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => assert!(msg.contains("API URL no puede estar vacía")),
+            e => panic!("Unexpected error: {:?}", e),
+        }
+
+        // Opción 3 con Notifications URL vacía
+        let mut step3_notif = 0;
+        let res = setup_config_flow(
+            |_| {
+                step3_notif += 1;
+                match step3_notif {
+                    1 => Ok("3".to_string()),
+                    2 => Ok("https://identity.example.com".to_string()),
+                    3 => Ok("https://api.example.com".to_string()),
+                    _ => Ok("".to_string()),
+                }
+            },
+            &mut cfg,
+        );
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            CliError::Other(msg) => {
+                assert!(msg.contains("Notifications URL no puede estar vacía"))
+            }
+            e => panic!("Unexpected error: {:?}", e),
+        }
     }
 }
