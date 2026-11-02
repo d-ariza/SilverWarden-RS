@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+pub mod biometrics;
+pub use biometrics::*;
+
 /// Context identifying the caller process that connected to the agent socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallingContext {
@@ -258,6 +261,28 @@ pub fn get_process_info(pid: u32) -> Option<ProcessInfo> {
         name: process.name().to_string(),
         ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
     })
+}
+
+/// Reads the process start-time (in jiffies) from `/proc/<pid>/stat` (token index 19 after ')').
+pub fn get_process_start_time(pid: u32) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat_content) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some(close_paren) = stat_content.rfind(')') {
+                let remainder = &stat_content[close_paren + 1..];
+                let tokens: Vec<&str> = remainder.split_whitespace().collect();
+                if let Some(val_str) = tokens.get(19) {
+                    if let Ok(val) = val_str.parse::<u64>() {
+                        return val;
+                    }
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Resolves the full `CallingContext` given a UID, PID, username and process lookup function.
@@ -829,5 +854,16 @@ mod tests {
         assert!(store.is_empty());
         assert!(!store.verify_session(&ctx, SessionType::Pin));
         assert!(!store.verify_session(&ctx, SessionType::AccessVault));
+    }
+
+    #[test]
+    fn test_get_process_start_time() {
+        assert_eq!(get_process_start_time(0), 0);
+        #[cfg(target_os = "linux")]
+        {
+            let current_pid = std::process::id();
+            let start = get_process_start_time(current_pid);
+            assert!(start > 0);
+        }
     }
 }

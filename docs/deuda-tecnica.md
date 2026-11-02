@@ -48,7 +48,7 @@
 - **Impacto:** Medio. La experiencia de usuario es peor (hay que escribir el PIN siempre).
 - **Motivo:** Se pospuso a M6 (SW-051).
 - **Retoma:** M6.
-- **Estado:** Abierta.
+- **Estado:** Cerrada (SW-051, implementado trait `Biometrics`, `PolkitBiometrics` y desbloqueo biométrico alternativo condicionado a `PinCache`).
 
 ### DT-11 — Setup systemd no implementado
 - **Descripción:** El agente no se arranca automáticamente al login del usuario.
@@ -118,6 +118,13 @@
 - **Impacto:** Bajo. La lógica de bloqueo, limpieza de caché y notificaciones está cubierta al 100% en tests unitarios.
 - **Motivo:** Ausencia del bus de sistema de `systemd-logind` en runners CI estándar.
 - **Retoma:** M10 (CI e2e con contenedor o VM con bus de sistema activo).
+- **Estado:** Abierta.
+
+### DT-23 — Política de acción Polkit `org.silverwarden.unlock` no instalada en el sistema
+- **Descripción:** En SW-051 se utiliza el action ID estándar `org.freedesktop.policykit.exec` para la verificación de autorización en Polkit. La acción dedicada `org.silverwarden.unlock` con su archivo `.policy` específico no se encuentra instalada en `/usr/share/polkit-1/actions/`.
+- **Impacto:** Bajo para pruebas de desarrollo; funcionalmente Polkit delega la autenticación adecuadamente.
+- **Motivo:** La instalación de archivos en rutas del sistema (`/usr/share/polkit-1/actions/` o `/etc/polkit-1/rules.d/`) corresponde a la historia de empaquetado y aprovisionamiento del servicio.
+- **Retoma:** M6 (SW-054 durante la implementación de `setup-systemd`).
 - **Estado:** Abierta.
 
 ---

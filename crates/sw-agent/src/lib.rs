@@ -153,6 +153,7 @@ pub struct AgentState {
     pub pin_cache: PinCache,
     pub notifier: Arc<dyn sw_notify::Notifier>,
     pub last_activity: Arc<tokio::sync::RwLock<tokio::time::Instant>>,
+    pub biometrics: Arc<dyn sw_systemauth::Biometrics>,
 }
 
 impl AgentState {
@@ -171,6 +172,7 @@ impl AgentState {
             pin_cache: PinCache::new(pin_cache_ttl),
             notifier: Arc::new(sw_notify::DbusNotifier::new()),
             last_activity: Arc::new(tokio::sync::RwLock::new(tokio::time::Instant::now())),
+            biometrics: Arc::new(sw_systemauth::PolkitBiometrics::new()),
         }
     }
 
@@ -194,6 +196,12 @@ impl AgentState {
     /// Sets an injectable desktop notifier.
     pub fn with_notifier(mut self, notifier: Arc<dyn sw_notify::Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Sets an injectable biometrics backend.
+    pub fn with_biometrics(mut self, biometrics: Arc<dyn sw_systemauth::Biometrics>) -> Self {
+        self.biometrics = biometrics;
         self
     }
 
@@ -1065,33 +1073,47 @@ pub fn default_registry() -> ActionsRegistry {
             // 1. Si no hay PIN en el payload: intentar cache hit (evita Argon2i)
             if pin_opt.is_none() {
                 if let Some(config_key) = state.pin_cache.get() {
-                    state.is_locked = false;
-                    state
-                        .sessions
-                        .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
-                    state.sessions.create_session(
-                        ctx,
-                        SessionType::AccessVault,
-                        Duration::from_secs(3600),
-                    );
-
-                    if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
-                        if let Ok(token) = state.config.decrypt_token(&config_key) {
-                            state.api_client = Some(Arc::new(
-                                sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
-                                    state.config.identity_url.clone(),
-                                    state.config.api_url.clone(),
-                                    token,
-                                    state.config.danger_accept_invalid_certs,
-                                ),
-                            ));
-                        }
-                    }
-
+                    let biometrics_enabled = state.config.runtime_config.biometrics_enabled;
+                    let biometrics = state.biometrics.clone();
                     let va = state.vault_agent.clone();
                     let enc_sym = state.config.encrypted_user_symmetric_key.clone();
 
                     return Box::pin(async move {
+                        if biometrics_enabled {
+                            match biometrics
+                                .authenticate("Desbloquear SilverWarden", ctx)
+                                .await
+                            {
+                                Ok(true) => {}
+                                _ => return Err("Biometría cancelada o fallida".to_string()),
+                            }
+                        }
+
+                        state.is_locked = false;
+                        state.sessions.create_session(
+                            ctx,
+                            SessionType::Pin,
+                            Duration::from_secs(3600),
+                        );
+                        state.sessions.create_session(
+                            ctx,
+                            SessionType::AccessVault,
+                            Duration::from_secs(3600),
+                        );
+
+                        if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
+                            if let Ok(token) = state.config.decrypt_token(&config_key) {
+                                state.api_client = Some(Arc::new(
+                                    sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                                        state.config.identity_url.clone(),
+                                        state.config.api_url.clone(),
+                                        token,
+                                        state.config.danger_accept_invalid_certs,
+                                    ),
+                                ));
+                            }
+                        }
+
                         if let Some(agent) = va {
                             let sym_key = if !enc_sym.is_empty() {
                                 if let Ok(dec) = sw_config::decrypt_string(&enc_sym, &config_key) {
@@ -1122,7 +1144,11 @@ pub fn default_registry() -> ActionsRegistry {
                                 agent.unlock(sk).await;
                             }
                         }
-                        Ok(serde_json::json!({ "status": "unlocked", "from_cache": true }))
+                        Ok(serde_json::json!({
+                            "status": "unlocked",
+                            "from_cache": true,
+                            "biometrics": biometrics_enabled
+                        }))
                     });
                 } else {
                     return Box::pin(async {
@@ -5332,5 +5358,154 @@ mod tests {
         let _ = shutdown_tx.send(());
         let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_biometrics_trait_mock_ok() {
+        use sw_systemauth::biometrics::{Biometrics, MockBiometrics};
+        let mock = MockBiometrics::new(true);
+        let ctx = test_ctx();
+        let res = mock.authenticate("test", &ctx).await;
+        assert!(res.unwrap());
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_biometrics_trait_mock_fail() {
+        use sw_systemauth::biometrics::{Biometrics, BiometricsError, MockBiometrics};
+        let mock = MockBiometrics::failing();
+        let ctx = test_ctx();
+        let res = mock.authenticate("test", &ctx).await;
+        assert!(matches!(res, Err(BiometricsError::Failed(_))));
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_with_biometrics_success() {
+        let registry = default_registry();
+        let (state, _temp_dir) = temp_state();
+        let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(true));
+        let mut state = state.with_biometrics(mock_bio.clone());
+        state.config.runtime_config.biometrics_enabled = true;
+        let ctx = test_ctx();
+        let pin = "bio_pin_123";
+
+        let _ = registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+
+        let unlock1 = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock1["status"], "unlocked");
+        assert_eq!(mock_bio.call_count(), 0);
+
+        state.is_locked = true;
+
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert_eq!(unlock2["biometrics"], true);
+        assert!(!state.is_locked);
+        assert_eq!(mock_bio.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_with_biometrics_denied() {
+        let registry = default_registry();
+        let (state, _temp_dir) = temp_state();
+        let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(false));
+        let mut state = state.with_biometrics(mock_bio.clone());
+        state.config.runtime_config.biometrics_enabled = true;
+        let ctx = test_ctx();
+        let pin = "bio_pin_denied";
+
+        let _ = registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+
+        let _ = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+
+        state.is_locked = true;
+
+        let err = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Biometría cancelada o fallida");
+        assert!(state.is_locked);
+        assert_eq!(mock_bio.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unlock_with_biometrics_disabled() {
+        let registry = default_registry();
+        let (state, _temp_dir) = temp_state();
+        let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(true));
+        let mut state = state.with_biometrics(mock_bio.clone());
+        state.config.runtime_config.biometrics_enabled = false;
+        let ctx = test_ctx();
+        let pin = "bio_pin_disabled";
+
+        let _ = registry
+            .execute(
+                "PinSet",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+
+        let _ = registry
+            .execute(
+                "Unlock",
+                &mut state,
+                &ctx,
+                &serde_json::json!({ "pin": pin }),
+            )
+            .await
+            .unwrap();
+
+        state.is_locked = true;
+
+        let unlock2 = registry
+            .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(unlock2["status"], "unlocked");
+        assert_eq!(unlock2["from_cache"], true);
+        assert_eq!(unlock2["biometrics"], false);
+        assert!(!state.is_locked);
+        assert_eq!(mock_bio.call_count(), 0);
     }
 }

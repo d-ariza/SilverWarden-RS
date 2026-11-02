@@ -1942,3 +1942,45 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 | Cobertura `sw-config` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **95.99%** líneas / **94.97%** regiones (gate ≥85% ampliamente superado) |
 | Cobertura `sw-agent/src/lib.rs` (workspace) | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.19%** líneas / **96.96%** regiones (gate ≥85% ampliamente superado) |
 | Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.17%** líneas / **93.13%** regiones (gate ≥90% ampliamente superado) |
+
+---
+
+### 6.4 [SW-051] Biometría Polkit como desbloqueo alternativo del vault
+
+**Fecha:** 2026-11-01  
+**Objetivo:** Implementar la autenticación biométrica (huella dactilar) sobre Linux mediante el servicio Polkit del sistema (`org.freedesktop.PolicyKit1`) como método alternativo y rápido de desbloqueo, condicionado a que el `PinCache` en memoria bloqueada esté vigente y a que el usuario active voluntariamente `biometrics_enabled = true`.
+
+#### Decisiones de diseño aplicadas
+- **D-M6-13:** Biometría complementaria condicionada a `PinCache`. El PIN maestro es mandatorio como secreto raíz; la biometría únicamente habilita el uso de la `config_key` cacheada sin volver a escribir el PIN.
+- **D-M6-14:** Trait `Biometrics` con paso explícito de `&CallingContext` (`async fn authenticate(&self, reason: &str, ctx: &CallingContext) -> Result<bool, BiometricsError>`) para que Polkit verifique el PID y `start-time` del proceso cliente real que solicitó el desbloqueo, previniendo ataques de sustitución o reciclado de PID.
+- **D-M6-15:** Desacoplamiento de pruebas mediante `MockBiometrics` para validación determinista en memoria, y aislamiento de la prueba interactiva contra `PolicyKit1` real en `crates/sw-agent/tests/manual_polkit.rs` con `#[ignore]`.
+
+#### Archivos modificados
+- `crates/sw-config/src/lib.rs`: campo `biometrics_enabled: bool` en `RuntimeConfig`, default `false`, soporte de serde aliases `biometrics_enabled` y `biometricsEnabled`, y test `test_runtime_config_biometrics_enabled_default_and_roundtrip`.
+- `crates/sw-systemauth/Cargo.toml`: dependencias `async-trait`, `zbus`, `tracing`.
+- `crates/sw-systemauth/src/biometrics.rs`: módulo nuevo con enum `BiometricsError`, trait `Biometrics`, backend real `PolkitBiometrics` con `CheckAuthorization` vía `zbus 5.x`, mock en memoria `MockBiometrics` con conteo atómico de llamadas, y 4 tests unitarios.
+- `crates/sw-systemauth/src/lib.rs`: exportación pública de `biometrics`, función `get_process_start_time` leyendo `/proc/<pid>/stat` (campo 22 / token 19), y test unitario.
+- `crates/sw-agent/src/lib.rs`: campo `biometrics: Arc<dyn sw_systemauth::Biometrics>` en `AgentState`, constructor `with_biometrics`, validación biométrica en el handler `Unlock` para cache hits con `biometrics_enabled`, y 5 tests unitarios cubriendo éxito, rechazo, bypass y estado de bloqueo.
+- `crates/sw-agent/tests/manual_polkit.rs`: test de integración real Polkit marcado con `#[ignore]`.
+- `docs/decisiones.md`: decisiones registradas D-M6-13 a D-M6-15.
+- `docs/deuda-tecnica.md`: adición de DT-23; DT-10 marcada como cerrada.
+- `docs/backlog.md`: SW-051 marcado como `Hecho (2026-11-01)`.
+- `docs/lecciones-aprendidas.md`: lección 8.11 añadida.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-config` | `cargo test -p sw-config` | 32 pasan, 1 ignorado |
+| Pruebas unitarias `sw-systemauth` | `cargo test -p sw-systemauth` | 23 pasan, 0 fallan |
+| Pruebas unitarias `sw-agent` | `cargo test -p sw-agent` | 69 pasan, 2 ignorados (`manual_logind.rs`, `manual_polkit.rs`), 0 fallan |
+| Pruebas manuales Polkit real | `cargo test -p sw-agent --test manual_polkit -- --ignored` | 1 pasa, 0 fallan |
+| Pruebas workspace completo | `cargo test --workspace --exclude sw-gui` | 441 pasan, 0 fallan, 3 ignorados |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) |
+| Cobertura `sw-systemauth/biometrics.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **91.94%** líneas / **93.68%** regiones (gate ≥85% superado) |
+| Cobertura `sw-systemauth/lib.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **95.21%** líneas / **95.61%** regiones (gate ≥85% superado) |
+| Cobertura `sw-agent/src/lib.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.29%** líneas / **97.04%** regiones (gate ≥97.08% superado) |
+| Cobertura `sw-config/src/lib.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **96.08%** líneas / **95.11%** regiones (gate ≥85% superado) |
+| Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.21%** líneas / **93.19%** regiones (gate ≥90% superado) |

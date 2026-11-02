@@ -316,3 +316,33 @@ Cada decisión se registra con:
 
 
 
+
+## D-M6-13 — Biometría Polkit como desbloqueo alternativo condicionado al PinCache
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Se requiere permitir el desbloqueo rápido del vault mediante huella dactilar o autenticación biométrica en Linux sin comprometer la seguridad criptográfica.
+- **Decisión:** Implementar la biometría como un método alternativo de desbloqueo (Opción A). La biometría no reemplaza al PIN maestro ni puede derivar la `config_key` por sí misma; únicamente complementa el flujo cuando el `PinCache` en memoria bloqueada está vigente y el usuario ha activado explícitamente `biometrics_enabled = true`.
+- **Alternativas:**
+  - (a) Reemplazar el PIN por biometría almacenando la clave en el keyring del sistema. Rechazada: el PIN sigue siendo obligatorio como secreto raíz; el keyring expone la clave a procesos con privilegios de usuario.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (handler `Unlock`), tests `test_unlock_with_biometrics_success`, `test_unlock_with_biometrics_denied`, `test_unlock_with_biometrics_disabled`.
+- **Estado:** Vigente.
+
+## D-M6-14 — Trait `Biometrics` con paso de `CallingContext` y configuración opt-in
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Polkit requiere identificar el sujeto exacto a autorizar (`unix-process` con PID y start-time), el cual corresponde al proceso cliente que invocó al agente (no al agente mismo). Además, la biometría debe ser opt-in.
+- **Decisión:** Definir el trait `Biometrics` en `sw-systemauth` con la firma `async fn authenticate(&self, reason: &str, ctx: &CallingContext) -> Result<bool, BiometricsError>`. Proveer la implementación real `PolkitBiometrics` (usando `zbus 5.x` sobre `org.freedesktop.PolicyKit1.Authority.CheckAuthorization`) y `MockBiometrics` para pruebas. El parámetro `biometrics_enabled: bool` en `RuntimeConfig` tiene valor por defecto `false`.
+- **Alternativas:**
+  - (a) Autorizar el proceso del agente SilverWarden en Polkit. Rechazada: Polkit debe solicitar consentimiento al usuario identificando la aplicación cliente llamante.
+- **Evidencia:** `crates/sw-systemauth/src/biometrics.rs`, `crates/sw-config/src/lib.rs` (`biometrics_enabled`).
+- **Estado:** Vigente.
+
+## D-M6-15 — Pruebas unitarias en memoria con `MockBiometrics` y prueba Polkit real aislada con `#[ignore]`
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Polkit requiere interacción de usuario o políticas del sistema en `/usr/share/polkit-1/actions/`, las cuales fallan en entornos CI headless o no interactivos.
+- **Decisión:** Cubrir unitariamente al 100% las ramas de éxito, rechazo y desactivación de biometría en `sw-agent` y `sw-systemauth` usando `MockBiometrics`. Aislar la prueba de humo contra el servicio Polkit real en `crates/sw-agent/tests/manual_polkit.rs` marcada con `#[ignore]`.
+- **Alternativas:**
+  - (a) Ejecutar la prueba Polkit real en el suite de CI. Rechazada: produciría fallos espurios en runners automatizados sin entorno de sesión gráfico o de autorización activa.
+- **Evidencia:** `crates/sw-agent/src/lib.rs` (tests 1 a 5 de biometría), `crates/sw-agent/tests/manual_polkit.rs`.
+- **Estado:** Vigente.

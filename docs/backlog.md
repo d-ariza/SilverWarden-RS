@@ -791,7 +791,7 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 **Historia:** Como usuario en Linux, quiero poder desbloquear el vault o autorizar firmas usando biometría/huella digital vía Polkit para mayor comodidad.
 
 **Implementación / Tests:**
-- Definir trait `Biometrics` con método `authenticate(&self, reason: &str) -> Result<bool, BiometricsError>`.
+- Definir trait `Biometrics` con método `authenticate(&self, reason: &str, ctx: &CallingContext) -> Result<bool, BiometricsError>`.
 - Implementación Polkit para Linux sobre D-Bus / `sw-systemauth`.
 - Stubs de plataforma para macOS y Windows.
 - Fallback automático a diálogo de PIN si la autenticación biométrica falla o no está disponible.
@@ -802,7 +802,7 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 - Tests con mock del servicio Polkit.
 - Cobertura ≥85%.
 
-**Depende de:** SW-050 · **Estado:** Pendiente
+**Depende de:** SW-050 · **Estado:** Hecho (2026-11-01)
 
 ---
 

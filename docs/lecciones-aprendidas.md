@@ -332,3 +332,16 @@ Estos principios deben ser la base de la v2 (si se hace). La v2 debería:
 4. Desacoplar la lógica de procesamiento de eventos (`handle_logind_event`) en funciones directas sobre `Arc<RwLock<AgentState>>`, permitiendo pruebas unitarias deterministas en memoria y aislando los tests reales contra D-Bus en `tests/manual_logind.rs` con `#[ignore]`.
 
 **Generalización:** Las dependencias del sistema operativo para eventos de ciclo de vida (suspensión, bloqueo de pantalla) deben aislarse en monitores asíncronos con fallback tolerante a fallos. La lógica de negocio que responde a los eventos debe estar desacoplada de la capa de transporte que los recibe para garantizar la testabilidad unitaria en cualquier plataforma sin dependencias de infraestructura externa.
+
+### 8.11. Trait `Biometrics` y autorización Polkit con `CallingContext`
+
+**Problema:** Al integrar la autorización biométrica con Polkit (`org.freedesktop.PolicyKit1.Authority`), el demonio del agente no debe identificarse a sí mismo como sujeto de la autorización, sino al proceso cliente que solicitó la operación (por ejemplo, el CLI u otra aplicación). Si Polkit evalúa al demonio, la atribución de seguridad es errónea. Además, Polkit requiere tanto el PID como el `start-time` (en jiffies) del proceso cliente para prevenir vulnerabilidades de reutilización de PID (PID reuse / recycling attack). Por último, los tests de autorización interactiva no pueden ejecutarse en runners de CI headless.
+
+**Solución:**
+1. Diseñar el trait `Biometrics` pasando explícitamente el `&CallingContext` de la petición: `async fn authenticate(&self, reason: &str, ctx: &CallingContext) -> Result<bool, BiometricsError>`.
+2. Extraer el `start-time` del cliente leyendo `/proc/<pid>/stat` (campo 22, correspondiente al token 19 tras el último paréntesis de cierre) para construir el sujeto Polkit `("unix-process", {"pid": u32, "start-time": u64})`.
+3. Proveer una implementación `MockBiometrics` para verificar unitariamente todos los flujos de éxito, rechazo y bypass sin dependencias externas en tiempo de ejecución.
+4. Aislar la llamada real a `PolicyKit1` en `crates/sw-agent/tests/manual_polkit.rs` marcada con `#[ignore]`.
+5. Mantener la biometría como un método complementario y opt-in (`biometrics_enabled = true`): el PIN maestro sigue siendo obligatorio y la biometría únicamente habilita el uso de la `config_key` previamente cacheada en memoria bloqueada (`PinCache`).
+
+**Generalización:** Toda autorización delegada a través de un bus del sistema debe pasar las credenciales del llamante real autenticado por la capa IPC (`CallingContext`), nunca las del servidor intermedio. Los servicios que involucran interacción física o de usuario deben abstraerse rigurosamente detrás de traits para permitir cobertura determinista en pipelines automatizados.

@@ -206,6 +206,8 @@ pub struct RuntimeConfig {
         alias = "idleTtlSecs"
     )]
     pub idle_ttl_secs: u64,
+    #[serde(default, alias = "biometrics_enabled", alias = "biometricsEnabled")]
+    pub biometrics_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -226,6 +228,7 @@ impl Default for RuntimeConfig {
             daemon_auth_token: String::new(),
             pin_cache_ttl_secs: default_pin_cache_ttl_secs(),
             idle_ttl_secs: default_idle_ttl_secs(),
+            biometrics_enabled: false,
         }
     }
 }
@@ -1506,6 +1509,7 @@ mod tests {
                 daemon_auth_token: "token123".to_string(),
                 pin_cache_ttl_secs: 900,
                 idle_ttl_secs: 600,
+                biometrics_enabled: true,
             },
             danger_accept_invalid_certs: true,
             server_url: "https://vw.local".to_string(),
@@ -1554,6 +1558,7 @@ mod tests {
         assert!(rt_map.contains_key("SSHAgentSocketPath"));
         assert!(rt_map.contains_key("PinCacheTtlSecs"));
         assert!(rt_map.contains_key("IdleTtlSecs"));
+        assert!(rt_map.contains_key("BiometricsEnabled"));
 
         // Test reading from a Go sample without the 2 new fields or RuntimeConfig
         let go_json = r#"{
@@ -1660,6 +1665,42 @@ mod tests {
         };
         let serialized = serde_json::to_string(&custom).expect("serialize");
         assert!(serialized.contains(r#""IdleTtlSecs":1800"#));
+        let roundtrip: RuntimeConfig = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(custom, roundtrip);
+    }
+
+    #[test]
+    fn test_runtime_config_biometrics_enabled_default_and_roundtrip() {
+        // Default applies false
+        let default_rt = RuntimeConfig::default();
+        assert!(!default_rt.biometrics_enabled);
+
+        // Deserializing empty JSON object produces default false
+        let from_empty: RuntimeConfig = serde_json::from_str("{}").expect("empty json object");
+        assert!(!from_empty.biometrics_enabled);
+
+        // Deserializing with PascalCase key
+        let with_pascal: RuntimeConfig =
+            serde_json::from_str(r#"{"BiometricsEnabled": true}"#).expect("pascal json");
+        assert!(with_pascal.biometrics_enabled);
+
+        // Deserializing with alias snake_case
+        let with_snake: RuntimeConfig =
+            serde_json::from_str(r#"{"biometrics_enabled": true}"#).expect("snake json");
+        assert!(with_snake.biometrics_enabled);
+
+        // Deserializing with alias camelCase
+        let with_camel: RuntimeConfig =
+            serde_json::from_str(r#"{"biometricsEnabled": true}"#).expect("camel json");
+        assert!(with_camel.biometrics_enabled);
+
+        // Roundtrip serialization
+        let custom = RuntimeConfig {
+            biometrics_enabled: true,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&custom).expect("serialize");
+        assert!(serialized.contains(r#""BiometricsEnabled":true"#));
         let roundtrip: RuntimeConfig = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(custom, roundtrip);
     }
