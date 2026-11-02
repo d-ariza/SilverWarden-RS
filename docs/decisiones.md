@@ -346,3 +346,36 @@ Cada decisión se registra con:
   - (a) Ejecutar la prueba Polkit real en el suite de CI. Rechazada: produciría fallos espurios en runners automatizados sin entorno de sesión gráfico o de autorización activa.
 - **Evidencia:** `crates/sw-agent/src/lib.rs` (tests 1 a 5 de biometría), `crates/sw-agent/tests/manual_polkit.rs`.
 - **Estado:** Vigente.
+
+## D-M6-16 — Instalación de systemd user unit y Polkit policy en directorios de usuario sin root
+
+- **Fecha:** 2026-11-01
+- **Contexto:** El daemon de SilverWarden corre como agente del usuario. La instalación de servicios y políticas debe poder realizarse de forma autónoma sin privilegios de root (`sudo`).
+- **Decisión:** Instalar la unidad systemd en `~/.config/systemd/user/silverwarden.service` (con permisos `0600` y directorio `0700`) y la política de Polkit en `~/.local/share/polkit-1/actions/org.silverwarden.unlock.policy` (permisos `0600` y directorio `0700`). Polkit soporta la lectura de acciones locales de usuario en dicho path para sesiones de escritorio modernas.
+- **Alternativas:**
+  - (a) Requerir instalación en `/etc/systemd/system/` y `/usr/share/polkit-1/actions/` con root. Rechazada: violaría el principio de menor privilegio y dificultaría instalaciones portables o sin sudo.
+- **Evidencia:** `crates/sw-cli/src/systemd.rs`, `crates/sw-cli/src/main.rs` (`Commands::SetupSystemd`).
+- **Estado:** Vigente.
+
+## D-M6-17 — Comando `silverwarden setup-systemd` con flags `--dry-run` y `--no-enable`
+
+- **Fecha:** 2026-11-01
+- **Contexto:** Los usuarios y empaquetadores requieren flexibilidad al configurar el servicio de usuario de systemd: algunos desean inspeccionar los archivos antes de escribir, otros empaquetan sin habilitar inmediatamente el servicio, y otros desean el flujo completo en un solo comando.
+- **Decisión:** Implementar el subcomando `silverwarden setup-systemd` con soporte para:
+  - `--dry-run`: renderiza e imprime el contenido de la unidad systemd y la política Polkit con sus rutas destino sin escribir en disco.
+  - `--no-enable`: escribe los archivos con permisos estrictos pero omite la invocación a `systemctl --user daemon-reload` y `enable --now`.
+  - Modo por defecto: instala archivos, valida sintaxis con `systemd-analyze verify`, ejecuta `systemctl --user daemon-reload` y arranca con `systemctl --user enable --now silverwarden.service`.
+- **Alternativas:**
+  - (a) Proveer solo scripts bash externos fuera del binario CLI. Rechazada: el binario es auto-contenido y conoce su ruta absoluta de ejecución.
+- **Evidencia:** `crates/sw-cli/src/main.rs`, tests `test_setup_systemd_dry_run_does_not_write`, `test_setup_systemd_no_enable_writes_files`, `test_setup_systemd_with_enable`.
+- **Estado:** Vigente.
+
+## D-M6-18 — Fallback no bloqueante en validación y gestión de systemctl / systemd-analyze
+
+- **Fecha:** 2026-11-01
+- **Contexto:** En contenedores, sesiones SSH sin socket de bus de usuario de systemd, o entornos sin systemd (ej. WSL sin soporte nativo o Alpine Linux), las llamadas a `systemd-analyze verify` o `systemctl --user` pueden fallar o no existir.
+- **Decisión:** Tratar la validación de sintaxis con `systemd-analyze verify` y las operaciones de `systemctl` como pasos auxiliares no fatales. Si las herramientas no están presentes o fallan, capturar el error/warning e incluirlo en el reporte de salida del CLI sin retornar error `Err(CliError)`.
+- **Alternativas:**
+  - (a) Abortar la instalación con error si `systemctl` falla. Rechazada: impediría la preparación de configuraciones en chroot o entornos de aprovisionamiento previo al inicio de sesión.
+- **Evidencia:** `crates/sw-cli/src/main.rs` (`Commands::SetupSystemd`), tests `test_setup_systemd_missing_systemctl_and_systemd_analyze`, `test_setup_systemd_mock_binaries_warning_and_failure`.
+- **Estado:** Vigente.

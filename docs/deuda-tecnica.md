@@ -120,16 +120,14 @@
 - **Retoma:** M10 (CI e2e con contenedor o VM con bus de sistema activo).
 - **Estado:** Abierta.
 
-### DT-23 — Política de acción Polkit `org.silverwarden.unlock` no instalada en el sistema
-- **Descripción:** En SW-051 se utiliza el action ID estándar `org.freedesktop.policykit.exec` para la verificación de autorización en Polkit. La acción dedicada `org.silverwarden.unlock` con su archivo `.policy` específico no se encuentra instalada en `/usr/share/polkit-1/actions/`.
-- **Impacto:** Bajo para pruebas de desarrollo; funcionalmente Polkit delega la autenticación adecuadamente.
-- **Motivo:** La instalación de archivos en rutas del sistema (`/usr/share/polkit-1/actions/` o `/etc/polkit-1/rules.d/`) corresponde a la historia de empaquetado y aprovisionamiento del servicio.
-- **Retoma:** M6 (SW-054 durante la implementación de `setup-systemd`).
-- **Estado:** Abierta.
-
 ---
 
 ## Items Cerrados (Histórico)
+
+### DT-23 — Política de acción Polkit `org.silverwarden.unlock` no instalada en el sistema
+- **Descripción:** En SW-051 se utilizaba el action ID placeholder `org.freedesktop.policykit.exec`.
+- **Resolución:** En SW-054 se añadió la plantilla canónica `POLKIT_POLICY_TEMPLATE`, se actualizó `sw-systemauth` para usar `"org.silverwarden.unlock"`, y se implementó `silverwarden setup-systemd` para instalar el archivo de política en `~/.local/share/polkit-1/actions/org.silverwarden.unlock.policy`.
+- **Estado:** Cerrada (SW-054).
 
 ### DT-1 — Bypass de aprobación por variable de entorno (SW-043)
 - **Estado:** Cerrada (commit `2aa6e36`). Movido a `#[cfg(test)]`.

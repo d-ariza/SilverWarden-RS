@@ -68,9 +68,8 @@ impl Biometrics for PolkitBiometrics {
         let flags: u32 = 0x1; // AllowUserInteraction
         let cancellation_id = "";
 
-        // Action ID: org.freedesktop.policykit.exec is standard across Linux distributions.
-        // In SW-054, a dedicated action "org.silverwarden.unlock" will be installed with Polkit rules (DT-23).
-        let action_id = "org.freedesktop.policykit.exec";
+        // Action ID: org.silverwarden.unlock installed via `silverwarden setup-systemd` (SW-054).
+        let action_id = "org.silverwarden.unlock";
 
         let result: (bool, bool, HashMap<String, String>) = proxy
             .call(
@@ -172,5 +171,11 @@ mod tests {
 
         let err3 = BiometricsError::ServiceUnavailable("no dbus".into());
         assert_eq!(err3.to_string(), "Polkit service unavailable: no dbus");
+    }
+
+    #[test]
+    fn test_polkit_biometrics_uses_silverwarden_action_id() {
+        let code = include_str!("biometrics.rs");
+        assert!(code.contains(r#"let action_id = "org.silverwarden.unlock";"#));
     }
 }

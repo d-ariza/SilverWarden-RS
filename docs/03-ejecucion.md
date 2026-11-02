@@ -1984,3 +1984,38 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 | Cobertura `sw-agent/src/lib.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **97.29%** líneas / **97.04%** regiones (gate ≥97.08% superado) |
 | Cobertura `sw-config/src/lib.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **96.08%** líneas / **95.11%** regiones (gate ≥85% superado) |
 | Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **93.21%** líneas / **93.19%** regiones (gate ≥90% superado) |
+
+### 6.5 [SW-054] Setup Systemd + Polkit policy para el agente de usuario
+
+**Fecha:** 2026-11-01  
+**Objetivo:** Implementar la instalación y arranque automático del daemon del agente de SilverWarden como servicio de usuario de systemd (`silverwarden.service`) y su política de autorización de Polkit (`org.silverwarden.unlock.policy`), operando 100% en el espacio de usuario sin requerir elevación de privilegios (`sudo`). Actualizar el action ID de `sw-systemauth` al identificador canónico `org.silverwarden.unlock`.
+
+#### Decisiones de diseño aplicadas
+- **D-M6-16:** Instalación de archivos de servicio y políticas exclusivamente en directorios de usuario (`~/.config/systemd/user/silverwarden.service` y `~/.local/share/polkit-1/actions/org.silverwarden.unlock.policy`) con permisos restrictivos (`0700` para directorios, `0600` para archivos). Polkit lee acciones de usuario en dicho path en escritorios modernos.
+- **D-M6-17:** Subcomando `silverwarden setup-systemd` en `sw-cli` con banderas `--dry-run` (renderizado e impresión de archivos sin escrituras en disco) y `--no-enable` (escritura de archivos sin invocar `systemctl`).
+- **D-M6-18:** Fallback no bloqueante en validación y arranque. Si `systemd-analyze` o `systemctl` fallan o no están presentes en el host (ej. contenedores, entornos headless o chroot), se emiten avisos/warnings en la salida estándar pero la operación del CLI culmina exitosamente sin abortar con `Err(CliError)`.
+
+#### Archivos modificados
+- `crates/sw-cli/src/systemd.rs`: nuevo módulo con las plantillas embebidas `SYSTEMD_UNIT_TEMPLATE` y `POLKIT_POLICY_TEMPLATE`, y funciones de renderizado `render_systemd_unit` (con interpolación del path del binario actual) y `render_polkit_policy`.
+- `crates/sw-cli/src/main.rs`: adición del subcomando `Commands::SetupSystemd { dry_run: bool, no_enable: bool }`, integración en el despachador `handle_command`, y suite de tests unitarios cubriendo parseo CLI, renderizado, dry-run, no-enable, ausencia de $HOME, invocación con enable y manejo de utilidades no disponibles.
+- `crates/sw-systemauth/src/biometrics.rs`: reemplazo del placeholder `"org.freedesktop.policykit.exec"` por el action ID definitivo `"org.silverwarden.unlock"` y test contractual `test_polkit_biometrics_uses_silverwarden_action_id`.
+- `docs/decisiones.md`: adición de decisiones D-M6-16 a D-M6-18.
+- `docs/deuda-tecnica.md`: cierre de DT-23.
+- `docs/backlog.md`: SW-054 marcado como `Hecho (2026-11-01)`.
+- `docs/lecciones-aprendidas.md`: adición de la lección 8.12.
+- `docs/03-ejecucion.md`: adición de la sección §6.5.
+
+#### Controles obligatorios y resultados reales
+
+| Control | Comando | Resultado real |
+|---|---|---|
+| Pruebas unitarias `sw-systemauth` | `cargo test -p sw-systemauth` | 24 pasan, 0 fallan |
+| Pruebas unitarias `sw-cli` | `cargo test -p sw-cli` | 131 pasan (121 unitarios + 10 integración), 0 fallan |
+| Pruebas workspace completo | `cargo test --workspace --exclude sw-gui` | 467 pasan, 0 fallan, 3 ignorados (`manual_logind`, `manual_polkit`, `test_sha3_hash_parity`) |
+| Linter | `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` | 0 warnings |
+| Formato | `cargo fmt --all -- --check` | 0 diffs |
+| Auditoría | `cargo audit` | 0 vulnerabilidades (1 advertencia permitida tokio) |
+| Cobertura `sw-cli/src/main.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **85.01%** líneas (gate ≥85% superado) |
+| Cobertura `sw-cli/src/systemd.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **100.00%** líneas / **100.00%** regiones |
+| Cobertura `sw-systemauth` | `cargo llvm-cov -p sw-systemauth --summary-only` | **94.77%** líneas / **95.32%** regiones (gate ≥85% superado) |
+| Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **92.91%** líneas / **92.97%** regiones (gate ≥90% superado) |

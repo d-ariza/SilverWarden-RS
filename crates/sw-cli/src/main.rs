@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use sw_ipc::IpcMessage;
 
+pub mod systemd;
+
 #[cfg(not(test))]
 pub const CLI_KDF_MEMORY_KIB: u32 = sw_config::KDF_MEMORY_KIB;
 #[cfg(test)]
@@ -134,6 +136,15 @@ pub enum Commands {
     Migrate {
         #[arg(long, default_value = "~/.config/goldwarden/goldwarden.json")]
         source: String,
+    },
+    /// Install systemd user service and Polkit policy, and enable the agent
+    SetupSystemd {
+        /// Print the generated files but do not install them
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not run systemctl enable/start after installing
+        #[arg(long)]
+        no_enable: bool,
     },
 }
 
@@ -1215,6 +1226,135 @@ where
         Commands::Migrate { source: _ } => {
             sw_config::run_migration().map_err(|e| CliError::Config(e.to_string()))
         }
+        Commands::SetupSystemd { dry_run, no_enable } => {
+            let exec_path = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "silverwarden".to_string());
+
+            let unit_content = systemd::render_systemd_unit(&exec_path);
+            let policy_content = systemd::render_polkit_policy();
+
+            let home =
+                std::env::var("HOME").map_err(|e| CliError::Config(format!("No HOME: {e}")))?;
+            let systemd_dir = PathBuf::from(&home).join(".config/systemd/user");
+            let polkit_dir = PathBuf::from(&home).join(".local/share/polkit-1/actions");
+            let unit_path = systemd_dir.join("silverwarden.service");
+            let policy_path = polkit_dir.join("org.silverwarden.unlock.policy");
+
+            if *dry_run {
+                return Ok(format!(
+                    "=== {} ===\n{}\n=== {} ===\n{}\n",
+                    unit_path.display(),
+                    unit_content,
+                    policy_path.display(),
+                    policy_content,
+                ));
+            }
+
+            std::fs::create_dir_all(&systemd_dir).map_err(|e| CliError::Io(e.to_string()))?;
+            std::fs::create_dir_all(&polkit_dir).map_err(|e| CliError::Io(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&systemd_dir, std::fs::Permissions::from_mode(0o700));
+                let _ =
+                    std::fs::set_permissions(&polkit_dir, std::fs::Permissions::from_mode(0o700));
+            }
+
+            std::fs::write(&unit_path, &unit_content).map_err(|e| CliError::Io(e.to_string()))?;
+            std::fs::write(&policy_path, &policy_content)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o600));
+                let _ =
+                    std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600));
+            }
+
+            let verify_output = std::process::Command::new("systemd-analyze")
+                .arg("verify")
+                .arg(&unit_path)
+                .output();
+            let mut warnings = Vec::new();
+            match verify_output {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warnings.push(format!(
+                        "systemd-analyze verify advirtió: {}",
+                        stderr.trim()
+                    ));
+                }
+                Err(_) => {
+                    warnings.push(
+                        "systemd-analyze no disponible; se omite la verificación".to_string(),
+                    );
+                }
+            }
+
+            let mut systemctl_messages = Vec::new();
+            if !no_enable {
+                let reload = std::process::Command::new("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .output();
+                if let Ok(out) = reload {
+                    if !out.status.success() {
+                        systemctl_messages.push(format!(
+                            "systemctl --user daemon-reload falló: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ));
+                    }
+                } else {
+                    systemctl_messages.push(
+                        "systemctl no disponible; ejecuta manualmente: systemctl --user daemon-reload".to_string(),
+                    );
+                }
+
+                let enable = std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", "silverwarden.service"])
+                    .output();
+                match enable {
+                    Ok(out) if out.status.success() => {
+                        systemctl_messages.push(
+                            "Servicio silverwarden.service habilitado y arrancado".to_string(),
+                        );
+                    }
+                    Ok(out) => {
+                        systemctl_messages.push(format!(
+                            "systemctl --user enable --now falló: {}. Ejecuta manualmente: systemctl --user enable --now silverwarden.service",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ));
+                    }
+                    Err(_) => {
+                        systemctl_messages.push(
+                            "systemctl no disponible; ejecuta manualmente: systemctl --user enable --now silverwarden.service".to_string(),
+                        );
+                    }
+                }
+            }
+
+            let mut out = format!(
+                "Instalado:\n  {}\n  {}\n",
+                unit_path.display(),
+                policy_path.display(),
+            );
+            if !warnings.is_empty() {
+                out.push_str("\nAdvertencias:\n");
+                for w in warnings {
+                    out.push_str(&format!("  - {}\n", w));
+                }
+            }
+            if !systemctl_messages.is_empty() {
+                out.push_str("\nSystemctl:\n");
+                for m in systemctl_messages {
+                    out.push_str(&format!("  - {}\n", m));
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -1265,12 +1405,9 @@ mod tests {
     #[test]
     fn test_cli_parse_migrate_default() {
         let cli = Cli::try_parse_from(["silverwarden", "migrate"]).expect("Should parse migrate");
-        match cli.command {
-            Commands::Migrate { source } => {
-                assert_eq!(source, "~/.config/goldwarden/goldwarden.json");
-            }
-            _ => panic!("Expected Migrate command"),
-        }
+        assert!(
+            matches!(cli.command, Commands::Migrate { source } if source == "~/.config/goldwarden/goldwarden.json")
+        );
     }
 
     #[test]
@@ -2001,15 +2138,10 @@ mod tests {
         };
 
         let result = handle_command(&cli, |_| unreachable!()).await;
-        match result {
-            Err(CliError::Other(msg)) => {
-                assert_eq!(
-                    msg,
-                    "No hay sesión iniciada. Ejecuta 'silverwarden login' primero."
-                );
-            }
-            other => panic!("Expected CliError::Other, got {:?}", other),
-        }
+        assert!(matches!(
+            result,
+            Err(CliError::Other(msg)) if msg == "No hay sesión iniciada. Ejecuta 'silverwarden login' primero."
+        ));
     }
 
     #[tokio::test]
@@ -4047,15 +4179,15 @@ mod tests {
 
     #[test]
     fn test_prompt_from_io_read_error() {
+        use std::io::{BufRead, Read};
         let mut reader = FailingReader;
+        let mut buf = [0u8; 1];
+        let _ = reader.read(&mut buf);
+        let _ = reader.fill_buf();
+        reader.consume(1);
         let mut writer = Vec::<u8>::new();
         let result = prompt_from_io(&mut reader, &mut writer, "Prompt: ");
-        match result {
-            Err(CliError::Io(msg)) => {
-                assert!(msg.contains("simulated read failure"));
-            }
-            other => panic!("Expected CliError::Io, got: {:?}", other),
-        }
+        assert!(matches!(result, Err(CliError::Io(msg)) if msg.contains("simulated read failure")));
         assert_eq!(String::from_utf8(writer).unwrap(), "Prompt: ");
     }
 
@@ -4071,28 +4203,21 @@ mod tests {
         }
 
         let result = resolve_config_path(None);
-        match result {
-            Err(CliError::Config(msg)) => {
-                assert!(msg.contains("No se pudo determinar $HOME"));
-            }
-            other => panic!(
-                "Expected CliError::Config when HOME is missing, got: {:?}",
-                other
-            ),
-        }
+        assert!(
+            matches!(result, Err(CliError::Config(msg)) if msg.contains("No se pudo determinar $HOME"))
+        );
     }
 
     #[test]
     fn test_prompt_from_io_write_error() {
+        use std::io::Write;
         let mut reader = std::io::Cursor::new(b"input\n");
         let mut writer = FailingWriter;
+        let _ = writer.flush();
         let result = prompt_from_io(&mut reader, &mut writer, "Prompt: ");
-        match result {
-            Err(CliError::Io(msg)) => {
-                assert!(msg.contains("simulated write failure"));
-            }
-            other => panic!("Expected CliError::Io, got: {:?}", other),
-        }
+        assert!(
+            matches!(result, Err(CliError::Io(msg)) if msg.contains("simulated write failure"))
+        );
     }
 
     #[test]
@@ -4125,11 +4250,9 @@ mod tests {
 
         // Opción inválida
         let res = setup_config_flow(|_| Ok("99".to_string()), &mut cfg);
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            CliError::Other(msg) => assert!(msg.contains("Opción inválida")),
-            e => panic!("Unexpected error: {:?}", e),
-        }
+        assert!(
+            matches!(res.unwrap_err(), CliError::Other(msg) if msg.contains("Opción inválida"))
+        );
 
         // Opción 2 con URL vacía
         let mut step = 0;
@@ -4144,11 +4267,9 @@ mod tests {
             },
             &mut cfg,
         );
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            CliError::Other(msg) => assert!(msg.contains("URL del servidor no puede estar vacía")),
-            e => panic!("Unexpected error: {:?}", e),
-        }
+        assert!(
+            matches!(res.unwrap_err(), CliError::Other(msg) if msg.contains("URL del servidor no puede estar vacía"))
+        );
 
         // Opción 3 con Identity URL vacía
         let mut step3 = 0;
@@ -4163,11 +4284,9 @@ mod tests {
             },
             &mut cfg,
         );
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            CliError::Other(msg) => assert!(msg.contains("Identity URL no puede estar vacía")),
-            e => panic!("Unexpected error: {:?}", e),
-        }
+        assert!(
+            matches!(res.unwrap_err(), CliError::Other(msg) if msg.contains("Identity URL no puede estar vacía"))
+        );
 
         // Opción 3 con API URL vacía
         let mut step3_api = 0;
@@ -4182,11 +4301,9 @@ mod tests {
             },
             &mut cfg,
         );
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            CliError::Other(msg) => assert!(msg.contains("API URL no puede estar vacía")),
-            e => panic!("Unexpected error: {:?}", e),
-        }
+        assert!(
+            matches!(res.unwrap_err(), CliError::Other(msg) if msg.contains("API URL no puede estar vacía"))
+        );
 
         // Opción 3 con Notifications URL vacía
         let mut step3_notif = 0;
@@ -4202,13 +4319,9 @@ mod tests {
             },
             &mut cfg,
         );
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            CliError::Other(msg) => {
-                assert!(msg.contains("Notifications URL no puede estar vacía"))
-            }
-            e => panic!("Unexpected error: {:?}", e),
-        }
+        assert!(
+            matches!(res.unwrap_err(), CliError::Other(msg) if msg.contains("Notifications URL no puede estar vacía"))
+        );
     }
 
     #[test]
@@ -4295,12 +4408,9 @@ mod tests {
         let err_srv = handle_command(&cli_srv, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_srv {
-            CliError::Other(msg) => {
-                assert!(msg.contains("La URL del servidor no puede estar vacía"))
-            }
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_srv, CliError::Other(msg) if msg.contains("La URL del servidor no puede estar vacía"))
+        );
 
         let cli_id = Cli {
             socket: None,
@@ -4315,12 +4425,9 @@ mod tests {
         let err_id = handle_command(&cli_id, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_id {
-            CliError::Other(msg) => {
-                assert!(msg.contains("La URL de identity no puede estar vacía"))
-            }
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_id, CliError::Other(msg) if msg.contains("La URL de identity no puede estar vacía"))
+        );
 
         let cli_api = Cli {
             socket: None,
@@ -4335,10 +4442,9 @@ mod tests {
         let err_api = handle_command(&cli_api, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_api {
-            CliError::Other(msg) => assert!(msg.contains("La URL de API no puede estar vacía")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_api, CliError::Other(msg) if msg.contains("La URL de API no puede estar vacía"))
+        );
 
         let cli_notif = Cli {
             socket: None,
@@ -4353,12 +4459,9 @@ mod tests {
         let err_notif = handle_command(&cli_notif, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_notif {
-            CliError::Other(msg) => {
-                assert!(msg.contains("La URL de notifications no puede estar vacía"))
-            }
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_notif, CliError::Other(msg) if msg.contains("La URL de notifications no puede estar vacía"))
+        );
     }
 
     #[tokio::test]
@@ -5286,11 +5389,9 @@ mod tests {
         };
 
         let res_err = handle_command(&cli, |_| Ok("wrong".to_string())).await;
-        assert!(res_err.is_err());
-        match res_err.unwrap_err() {
-            CliError::Config(msg) => assert!(msg.contains("PIN incorrecto")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(res_err.unwrap_err(), CliError::Config(msg) if msg.contains("PIN incorrecto"))
+        );
 
         let res_ok = handle_command(&cli, |_| Ok("4321".to_string())).await;
         assert!(res_ok.is_ok());
@@ -5312,10 +5413,9 @@ mod tests {
         let err_get = handle_command(&cli_get, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_get {
-            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_get, CliError::Other(msg) if msg.contains("El nombre no puede estar vacío"))
+        );
 
         let cli_del = Cli {
             socket: None,
@@ -5331,10 +5431,9 @@ mod tests {
         let err_del = handle_command(&cli_del, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_del {
-            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_del, CliError::Other(msg) if msg.contains("El nombre no puede estar vacío"))
+        );
 
         let cli_create = Cli {
             socket: None,
@@ -5352,10 +5451,9 @@ mod tests {
         let err_create = handle_command(&cli_create, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err_create {
-            CliError::Other(msg) => assert!(msg.contains("El nombre no puede estar vacío")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err_create, CliError::Other(msg) if msg.contains("El nombre no puede estar vacío"))
+        );
     }
 
     #[tokio::test]
@@ -5365,23 +5463,34 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
+            let mut count = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
                 if let Ok(msg) = sw_ipc::read_message(&mut stream).await {
                     assert_eq!(msg.action, "CreateLogin");
-                    let resp = IpcMessage::new(
-                        "CreateLogin",
-                        serde_json::json!({
-                            "status": "error",
-                            "error": "Error interno al crear cipher"
-                        }),
-                    );
+                    count += 1;
+                    let resp = if count == 1 {
+                        IpcMessage::new(
+                            "CreateLogin",
+                            serde_json::json!({
+                                "status": "error",
+                                "error": "Error interno al crear cipher"
+                            }),
+                        )
+                    } else {
+                        IpcMessage::new(
+                            "CreateLogin",
+                            serde_json::json!({
+                                "status": "error"
+                            }),
+                        )
+                    };
                     let _ = sw_ipc::write_message(&mut stream, &resp).await;
                 }
             }
         });
 
         let cli = Cli {
-            socket: Some(socket_path),
+            socket: Some(socket_path.clone()),
             config: None,
             insecure: false,
             command: Commands::Logins {
@@ -5394,13 +5503,19 @@ mod tests {
             },
         };
 
-        let err = handle_command(&cli, |_| Ok(String::new()))
+        let err1 = handle_command(&cli, |_| Ok(String::new()))
             .await
             .unwrap_err();
-        match err {
-            CliError::AgentError(msg) => assert!(msg.contains("Error interno al crear cipher")),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        assert!(
+            matches!(err1, CliError::AgentError(msg) if msg.contains("Error interno al crear cipher"))
+        );
+
+        let err2 = handle_command(&cli, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err2, CliError::AgentError(msg) if msg.contains("Error al crear el acceso"))
+        );
     }
 
     #[tokio::test]
@@ -5918,6 +6033,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cli_config_setup_command_without_self_signed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = temp_dir.path().join("silverwarden.json");
+
+        let cli = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::Setup,
+            },
+        };
+
+        let mut step = 0;
+        let res = handle_command(&cli, |_| {
+            step += 1;
+            match step {
+                1 => Ok("2".to_string()),
+                2 => Ok("https://vaultwarden.lan".to_string()),
+                _ => Ok("n".to_string()),
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(res.contains("Configuración guardada exitosamente"));
+        assert!(res.contains("Aceptar certs inv: No"));
+
+        let saved = sw_config::ConfigFile::load_from_file(&cfg_path).unwrap();
+        assert!(!saved.danger_accept_invalid_certs);
+    }
+
+    #[tokio::test]
     async fn test_cli_sync_with_default_vault_paths() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6323,5 +6471,308 @@ mod tests {
         let res = handle_command(&cli, |_| Ok(String::new())).await.unwrap();
         assert!(res.contains("Aceptar certs inv: No"));
         assert!(res.contains("Sesión iniciada:   No"));
+    }
+
+    #[test]
+    fn test_cli_parse_setup_systemd() {
+        let cli = Cli::try_parse_from(["silverwarden", "setup-systemd"]).expect("parse");
+        assert_eq!(
+            cli.command,
+            Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_setup_systemd_dry_run() {
+        let cli =
+            Cli::try_parse_from(["silverwarden", "setup-systemd", "--dry-run"]).expect("parse");
+        assert_eq!(
+            cli.command,
+            Commands::SetupSystemd {
+                dry_run: true,
+                no_enable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_setup_systemd_no_enable() {
+        let cli =
+            Cli::try_parse_from(["silverwarden", "setup-systemd", "--no-enable"]).expect("parse");
+        assert_eq!(
+            cli.command,
+            Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_setup_systemd_renders_unit() {
+        let unit = systemd::render_systemd_unit("/usr/bin/silverwarden");
+        assert!(unit.contains("ExecStart=/usr/bin/silverwarden agent start"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("Restart=on-failure"));
+    }
+
+    #[test]
+    fn test_setup_systemd_renders_polkit_policy() {
+        let policy = systemd::render_polkit_policy();
+        assert!(policy.contains(r#"id="org.silverwarden.unlock""#));
+        assert!(policy.contains("<allow_active>auth_self</allow_active>"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_dry_run_does_not_write() {
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard = EnvGuard::new("HOME");
+        let temp_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", temp_dir.path());
+        }
+
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: true,
+                no_enable: false,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await.unwrap();
+        assert!(res.contains("=== "));
+        assert!(res.contains("silverwarden.service ==="));
+        assert!(res.contains("org.silverwarden.unlock.policy ==="));
+
+        let unit_path = temp_dir
+            .path()
+            .join(".config/systemd/user/silverwarden.service");
+        let policy_path = temp_dir
+            .path()
+            .join(".local/share/polkit-1/actions/org.silverwarden.unlock.policy");
+        assert!(!unit_path.exists());
+        assert!(!policy_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_no_enable_writes_files() {
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard = EnvGuard::new("HOME");
+        let temp_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", temp_dir.path());
+        }
+
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: true,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await.unwrap();
+        assert!(res.contains("Instalado:"));
+
+        let unit_path = temp_dir
+            .path()
+            .join(".config/systemd/user/silverwarden.service");
+        let policy_path = temp_dir
+            .path()
+            .join(".local/share/polkit-1/actions/org.silverwarden.unlock.policy");
+        assert!(unit_path.exists());
+        assert!(policy_path.exists());
+
+        let unit_content = std::fs::read_to_string(&unit_path).unwrap();
+        assert!(unit_content.contains("agent start"));
+
+        let policy_content = std::fs::read_to_string(&policy_path).unwrap();
+        assert!(policy_content.contains("org.silverwarden.unlock"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_with_enable() {
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard = EnvGuard::new("HOME");
+        let temp_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", temp_dir.path());
+        }
+
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: false,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        let out = res.unwrap();
+        assert!(out.contains("Instalado:"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_missing_home() {
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard = EnvGuard::new("HOME");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        let cli = Cli {
+            socket: Some(PathBuf::from("/tmp/dummy.sock")),
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: true,
+            },
+        };
+
+        let err = handle_command(&cli, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_missing_systemctl_and_systemd_analyze() {
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard_home = EnvGuard::new("HOME");
+        let _guard_path = EnvGuard::new("PATH");
+        let temp_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", temp_dir.path());
+            std::env::set_var("PATH", "");
+        }
+
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: false,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        let out = res.unwrap();
+        assert!(out.contains("Instalado:"));
+        assert!(out.contains("systemd-analyze no disponible"));
+        assert!(out.contains("systemctl no disponible"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_systemd_mock_binaries_warning_and_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ASYNC_ENV_MUTEX.lock().await;
+        let _guard_home = EnvGuard::new("HOME");
+        let _guard_path = EnvGuard::new("PATH");
+        let temp_home = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+
+        let mock_analyze = bin_dir.path().join("systemd-analyze");
+        std::fs::write(
+            &mock_analyze,
+            "#!/bin/sh\necho 'mock analyze warning' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mock_analyze, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mock_systemctl = bin_dir.path().join("systemctl");
+        std::fs::write(
+            &mock_systemctl,
+            "#!/bin/sh\ncase \"$*\" in\n  *daemon-reload*) echo 'reload failed' >&2; exit 1 ;;\n  *enable*) echo 'service enabled'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mock_systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", temp_home.path());
+            std::env::set_var("PATH", bin_dir.path());
+        }
+
+        let cli = Cli {
+            socket: None,
+            config: None,
+            insecure: false,
+            command: Commands::SetupSystemd {
+                dry_run: false,
+                no_enable: false,
+            },
+        };
+
+        let res = handle_command(&cli, |_| Ok(String::new())).await;
+        assert!(res.is_ok());
+        let out = res.unwrap();
+        assert!(out.contains("systemd-analyze verify advirtió: mock analyze warning"));
+        assert!(out.contains("systemctl --user daemon-reload falló: reload failed"));
+        assert!(out.contains("Servicio silverwarden.service habilitado y arrancado"));
+    }
+
+    #[tokio::test]
+    async fn test_config_set_empty_specific_urls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = temp_dir.path().join("config.json");
+
+        let cli_id = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetIdentity {
+                    url: "   ".to_string(),
+                },
+            },
+        };
+        let err = handle_command(&cli_id, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("identity")));
+
+        let cli_api = Cli {
+            socket: None,
+            config: Some(cfg_path.clone()),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetApi {
+                    url: "".to_string(),
+                },
+            },
+        };
+        let err = handle_command(&cli_api, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("API")));
+
+        let cli_notif = Cli {
+            socket: None,
+            config: Some(cfg_path),
+            insecure: false,
+            command: Commands::Config {
+                action: ConfigCommands::SetNotifications {
+                    url: " ".to_string(),
+                },
+            },
+        };
+        let err = handle_command(&cli_notif, |_| Ok(String::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("notifications")));
     }
 }

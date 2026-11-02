@@ -859,7 +859,7 @@ Estos milestones **no** forman parte del cierre del MVP. Se listan para no perde
 - Instalación y arranque exitoso en el entorno de usuario.
 - Cobertura de tests del comando de setup CLI y generación de archivos.
 
-**Depende de:** SW-050, SW-051 · **Estado:** Pendiente
+**Depende de:** SW-050, SW-051 · **Estado:** Hecho (2026-11-01)
 
 ### M7 — GUI Tauri (P1)
 

@@ -345,3 +345,15 @@ Estos principios deben ser la base de la v2 (si se hace). La v2 debería:
 5. Mantener la biometría como un método complementario y opt-in (`biometrics_enabled = true`): el PIN maestro sigue siendo obligatorio y la biometría únicamente habilita el uso de la `config_key` previamente cacheada en memoria bloqueada (`PinCache`).
 
 **Generalización:** Toda autorización delegada a través de un bus del sistema debe pasar las credenciales del llamante real autenticado por la capa IPC (`CallingContext`), nunca las del servidor intermedio. Los servicios que involucran interacción física o de usuario deben abstraerse rigurosamente detrás de traits para permitir cobertura determinista en pipelines automatizados.
+
+### 8.12. Instalación de servicios systemd y políticas Polkit a nivel de usuario sin privilegios root
+
+**Problema:** Configurar un demonio de seguridad como servicio persistente suele delegarse a scripts de instalación con privilegios de superusuario (`sudo`), o a instrucciones manuales propensas a errores. Al mismo tiempo, en entornos sin `systemd` (ej. contenedores Docker, CI o chroot), los comandos `systemctl` o `systemd-analyze` fallan o no existen, lo que no debe impedir la generación o verificación de las plantillas ni romper el proceso de configuración del CLI.
+
+**Solución:**
+1. Embeber las plantillas canónicas de la unidad systemd (`silverwarden.service`) y la política de Polkit (`org.silverwarden.unlock.policy`) directamente en el binario del CLI (`sw-cli/src/systemd.rs`), permitiendo interpolar dinámicamente la ruta del ejecutable en tiempo de ejecución.
+2. Instalar exclusivamente en rutas de usuario: `~/.config/systemd/user/` y `~/.local/share/polkit-1/actions/` con permisos estrictos (`0700` directorios, `0600` archivos), eliminando por completo la necesidad de elevación de privilegios (`sudo`).
+3. Diseñar el comando `silverwarden setup-systemd` con flags desacoplados (`--dry-run` para previsualización sin I/O, `--no-enable` para instalación estática sin arranque).
+4. Implementar degradación no bloqueante ante la invocación de utilidades del sistema (`systemd-analyze verify`, `systemctl --user daemon-reload`, `systemctl --user enable --now`): capturar warnings y salidas de error sin abortar la ejecución con `Err(CliError)`, garantizando portabilidad en entornos headless o no gestionados por systemd.
+
+**Generalización:** Las herramientas CLI modernas deben ser capaces de aprovisionar sus propios servicios de fondo en el espacio de usuario sin asumir la disponibilidad de `root` ni la presencia forzosa de subsistemas específicos del host. La automatización del setup debe ser idempotente, inspeccionable (`--dry-run`) y tolerante a la ausencia de daemons de control del sistema en etapas de empaquetado o CI.
