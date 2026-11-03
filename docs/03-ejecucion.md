@@ -2019,3 +2019,15 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 | Cobertura `sw-cli/src/systemd.rs` | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **100.00%** líneas / **100.00%** regiones |
 | Cobertura `sw-systemauth` | `cargo llvm-cov -p sw-systemauth --summary-only` | **94.77%** líneas / **95.32%** regiones (gate ≥85% superado) |
 | Cobertura global workspace | `cargo llvm-cov --workspace --exclude sw-gui --summary-only` | **92.91%** líneas / **92.97%** regiones (gate ≥90% superado) |
+
+## 7. Smoke Test Integral M1–M6
+
+Ver `docs/smoke-test-m1-m6.md` para el procedimiento completo y la tabla de ejecución.
+
+**Estado:** [PENDIENTE DE EJECUCIÓN POR EL HUMANO]
+
+**Última ejecución:** [FECHA]
+
+**Resultado:** [OK / FALLOS]
+
+**Evidencia:** [salida de comandos, capturas si aplica]

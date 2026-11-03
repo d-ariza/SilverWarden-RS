@@ -341,3 +341,43 @@ Tanto `sw-agent` (92.46%) como `sw-cli` (95.97%) superan holgadamente el gate de
 **Estado: ✅ M5 APROBADO.**
 
 
+
+## 10. Validación de M6 — Seguridad de sesión
+
+### Resumen ejecutivo
+M6 aprobado. 5 historias implementadas y verificadas, 467 tests pasando (0 fallados, 3 ignorados), 92.91% de cobertura global de líneas en el workspace.
+
+### Tabla de historias
+
+| Historia | Título | Commit | Cobertura |
+|---|---|---|---|
+| SW-050 | PIN cache | 21c66f5 | sw-agent 97.18% |
+| SW-053 | Notificaciones D-Bus | 5a0b68a | sw-notify 94.68% |
+| SW-052 | Lock por inactividad | 0c7c476 | sw-agent 97.08% |
+| SW-051 | Biometría Polkit | fb3205e | sw-systemauth 92.42% |
+| SW-054 | Setup Systemd + Polkit | 5a996e4 | sw-cli 85.10% |
+
+### Matriz de controles
+
+| Control | Criterio | Resultado | Estado |
+|---|---|---|---|
+| Tests unitarios | 100% pasando | 467 pasados, 0 fallados, 3 ignorados (`manual_logind`, `manual_polkit`, `test_sha3_hash_parity`) | ✅ Superado |
+| Clippy | 0 warnings (`-D warnings`) | 0 warnings en todo el workspace | ✅ Superado |
+| Formato | `cargo fmt -- --check` | 0 diferencias | ✅ Superado |
+| Auditoría de dependencias | 0 vulnerabilidades | 0 vulnerabilidades (1 advertencia permitida de tokio) | ✅ Superado |
+| Cobertura global workspace | ≥90% | **92.91%** líneas / **92.97%** regiones | ✅ Superado |
+| Cobertura `sw-agent` | ≥90% | **97.29%** líneas (`src/lib.rs`) | ✅ Superado |
+| Cobertura `sw-systemauth` | ≥85% | **94.77%** líneas (biometrics 92.42%, lib 95.21%) | ✅ Superado |
+| Cobertura `sw-cli` | ≥85% | **85.05%** líneas (`main.rs` 85.01%, `systemd.rs` 100%) | ✅ Superado |
+| Cobertura `sw-notify` | ≥85% | **94.68%** líneas | ✅ Superado |
+
+### Riesgos residuales
+
+- **DT-19:** CLI no consulta `Status` antes de `Unlock` para omitir prompt de PIN (el `PinCache` funciona pero el CLI sigue pidiendo PIN si el usuario no pasa nada o en flujos interactivos).
+- **DT-20:** `PinCache` usa sleep real en tests de TTL (no determinista al 100%, pendiente virtualización temporal en suite de pruebas).
+- **DT-21:** Backend XDG Portal para notificaciones pospuesto a M10.
+- **DT-22:** Integración D-Bus logind no testeada en CI (solo manual `#[ignore]`).
+- **DT-23:** Cerrada (action_id `org.silverwarden.unlock` instalado por SW-054 en `~/.local/share/polkit-1/actions/`).
+- **DT-24:** `manual_polkit.rs` y `manual_logind.rs` requieren D-Bus real (marcados con `#[ignore]` en CI).
+
+**Estado: ✅ M6 APROBADO.**

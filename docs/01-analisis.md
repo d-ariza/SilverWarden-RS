@@ -60,7 +60,7 @@ Aplicación Rust+Tauri con **paridad 1:1** funcional respecto al Goldwarden actu
 - **M3 — Agente + IPC:** ✅ **Completado.** Protocolo IPC propio, socket Unix (`~/.silverwarden.sock`), CallingContext con `SO_PEERCRED` y anclaje Git, session store endurecido, actions registry, CLI con clap.
 - **M4 — Vault + API Bitwarden:** ✅ **Completado.** (Login, Sync, CRUD, WebSocket y 2FA terminados).
 - **M5 — SSH agent:** ✅ **Completado.** (Agente SSH, Add/Remove, GUI actions e interop terminados y validados).
-- **M6 — Seguridad de sesión:** ⏳ **Post-MVP.**
+- **M6 — Seguridad de sesión:** ✅ **Completado (2026-11-01).** PIN cache (SW-050), notificaciones D-Bus (SW-053), lock por inactividad/suspensión (SW-052), biometría Polkit (SW-051), setup systemd + Polkit policy (SW-054).
 - **M7 — GUI Tauri:** ⏳ **Pendiente.** Ver sección 4.4 (nueva).
 - **M8–M10 — Post-MVP.**
 

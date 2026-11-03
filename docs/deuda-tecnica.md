@@ -29,34 +29,6 @@
 - **Retoma:** Cuando tokio publique un parche.
 - **Estado:** Abierta.
 
-### DT-8 — `sw-notify` como stub
-- **Descripción:** El crate `sw-notify` no tiene implementación real. Las notificaciones del agente SSH (firma exitosa) no se muestran al usuario.
-- **Impacto:** Bajo (funcionalidad, no seguridad).
-- **Motivo:** Se pospuso a M6 (SW-053).
-- **Retoma:** M6.
-- **Estado:** Cerrada (SW-053, backend D-Bus Notifications implementado con fallback silencioso).
-
-### DT-9 — Lock por inactividad no implementado
-- **Descripción:** El agente no bloquea el vault automáticamente si el sistema está inactivo.
-- **Impacto:** Medio. Un usuario que deja la sesión abierta podría tener el vault expuesto.
-- **Motivo:** Se pospuso a M6 (SW-052).
-- **Retoma:** M6.
-- **Estado:** Cerrada (SW-052, implementado contador de inactividad configurable y monitoreo de PrepareForSleep/Lock de logind).
-
-### DT-10 — Biometría (polkit) no implementada
-- **Descripción:** El agente no usa biometría para desbloquear el vault.
-- **Impacto:** Medio. La experiencia de usuario es peor (hay que escribir el PIN siempre).
-- **Motivo:** Se pospuso a M6 (SW-051).
-- **Retoma:** M6.
-- **Estado:** Cerrada (SW-051, implementado trait `Biometrics`, `PolkitBiometrics` y desbloqueo biométrico alternativo condicionado a `PinCache`).
-
-### DT-11 — Setup systemd no implementado
-- **Descripción:** El agente no se arranca automáticamente al login del usuario.
-- **Impacto:** Bajo (usabilidad).
-- **Motivo:** Se pospuso a M6 (SW-054).
-- **Retoma:** M6.
-- **Estado:** Abierta.
-
 ### DT-12 — Comando `silverwarden ssh import/add` en el CLI
 - **Descripción:** El agente tiene la lógica IPC implementada (`ImportSSHKey`, `NewSSHKey`), pero el CLI (`sw-cli`) no expone el subcomando para que el usuario pueda importar claves SSH directamente desde la terminal (actualmente solo se puede vía IPC/GUI o `ssh-add`).
 - **Impacto:** Bajo (usabilidad de terminal; viable vía `ssh-add` estándar).
@@ -120,9 +92,36 @@
 - **Retoma:** M10 (CI e2e con contenedor o VM con bus de sistema activo).
 - **Estado:** Abierta.
 
+### DT-24 — Tests manuales D-Bus (`manual_polkit.rs` y `manual_logind.rs`) requieren bus real (no CI)
+- **Descripción:** Los tests de integración con servicios del sistema (`manual_polkit.rs` para Polkit y `manual_logind.rs` para systemd-logind) requieren un bus D-Bus de sistema y de sesión activo y permisos de interacción. En entornos CI headless o contenedores estándar, estas pruebas deben mantenerse marcadas con `#[ignore]`.
+- **Impacto:** Bajo. La lógica funcional está 100% cubierta con mocks unitarios en memoria.
+- **Motivo:** Aislamiento de infraestructura en entornos de integración continua automatizados.
+- **Retoma:** M10 (Infraestructura de CI con VM o bus simulado).
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
+
+### DT-8 — `sw-notify` como stub
+- **Descripción:** El crate `sw-notify` no tenía implementación real.
+- **Resolución:** En SW-053 se implementó el backend D-Bus Notifications (`org.freedesktop.Notifications`) con fallback silencioso e inyección en `sw-agent`.
+- **Estado:** Cerrada (SW-053).
+
+### DT-9 — Lock por inactividad no implementado
+- **Descripción:** El agente no bloqueaba el vault automáticamente por inactividad ni al suspender o bloquear pantalla.
+- **Resolución:** En SW-052 se implementó el contador de inactividad configurable (`RuntimeConfig.idle_ttl_secs`), el monitoreo de señales `PrepareForSleep` y `Lock` de `systemd-logind`, y el bloqueo con limpieza de sesiones y PinCache.
+- **Estado:** Cerrada (SW-052).
+
+### DT-10 — Biometría (polkit) no implementada
+- **Descripción:** El agente no contaba con desbloqueo biométrico.
+- **Resolución:** En SW-051 se implementó el trait `Biometrics`, el backend `PolkitBiometrics` con paso de `CallingContext` (PID + start-time), y el desbloqueo alternativo condicionado al `PinCache`.
+- **Estado:** Cerrada (SW-051).
+
+### DT-11 — Setup systemd no implementado
+- **Descripción:** El agente no arrancaba automáticamente al login del usuario y requería configuración manual.
+- **Resolución:** En SW-054 se añadió la plantilla `silverwarden.service` para `systemd --user`, la política Polkit `org.silverwarden.unlock.policy`, y el subcomando `silverwarden setup-systemd` con flags `--dry-run` y `--no-enable`.
+- **Estado:** Cerrada (SW-054).
 
 ### DT-23 — Política de acción Polkit `org.silverwarden.unlock` no instalada en el sistema
 - **Descripción:** En SW-051 se utilizaba el action ID placeholder `org.freedesktop.policykit.exec`.
