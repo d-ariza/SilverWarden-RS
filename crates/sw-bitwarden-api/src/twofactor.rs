@@ -55,8 +55,13 @@ pub fn parse_two_factor_error(body: &str) -> Option<(Vec<i32>, String)> {
         for item in arr {
             if let Some(n) = item.as_i64() {
                 providers.push(n as i32);
+            } else if let Some(s) = item.as_str() {
+                if let Ok(n) = s.parse::<i32>() {
+                    providers.push(n);
+                }
             }
         }
+        providers.sort_unstable();
     } else {
         let map = val
             .get("TwoFactorProviders2")
@@ -71,7 +76,8 @@ pub fn parse_two_factor_error(body: &str) -> Option<(Vec<i32>, String)> {
         .get("TwoFactorToken")
         .or_else(|| val.get("twoFactorToken"))
         .or_else(|| val.get("authRequest"))
-        .and_then(|v| v.as_str())?
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
         .to_string();
 
     Some((providers, token))
@@ -271,9 +277,9 @@ mod tests {
     async fn test_login_two_factor_unrecognized_format_returns_status() {
         let server = MockServer::start().await;
 
-        // Contains "TwoFactor" but is missing TwoFactorToken
+        // Contains "TwoFactor" but has unrecognized format (missing TwoFactorProviders and TwoFactorProviders2)
         let bad_body = serde_json::json!({
-            "TwoFactorProviders": [0, 1]
+            "TwoFactor": true
         });
 
         Mock::given(method("POST"))
@@ -472,8 +478,23 @@ mod tests {
 
         // Missing fields or no TwoFactor
         assert!(parse_two_factor_error(r#"{"error":"invalid_grant"}"#).is_none());
-        assert!(parse_two_factor_error(r#"{"TwoFactorProviders":[0]}"#).is_none());
+        assert!(parse_two_factor_error(r#"{"TwoFactor":true}"#).is_none());
         assert!(parse_two_factor_error("not json").is_none());
+    }
+
+    #[test]
+    fn test_parse_two_factor_error_without_token() {
+        // Vaultwarden/Disroot: 2FA required but no TwoFactorToken in body
+        let body = r#"{
+        "MasterPasswordPolicy":{"Object":"masterPasswordPolicy"},
+        "TwoFactorProviders":["1","0"],
+        "TwoFactorProviders2":{"0":null,"1":{"Email":"da****@disroot.org"}},
+        "error":"invalid_grant",
+        "error_description":"Two factor required."
+    }"#;
+        let (providers, token) = parse_two_factor_error(body).expect("should parse");
+        assert_eq!(providers, vec![0, 1]); // sorted
+        assert_eq!(token, ""); // empty token
     }
 
     #[tokio::test]
