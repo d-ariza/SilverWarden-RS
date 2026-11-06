@@ -106,9 +106,23 @@
 - **Retoma:** M7 o cuando se requiera.
 - **Estado:** Abierta.
 
+### DT-26 — Listado unificado y paginado por tipo en el CLI
+- **Descripción:** El comando `logins list` solo muestra logins, ocultando notas, tarjetas y claves SSH. Para usuarios con bóvedas grandes (ej. Disroot con 274 logins), la salida puede inundar la terminal sin paginación.
+- **Impacto:** Medio (UX).
+- **Motivo:** Prioridad en el MVP para gestión de logins. El resto de tipos se accede vía SSH agent o API.
+- **Retoma:** M7 (junto con la GUI). Implementar `silverwarden list --type <logins|notes|cards|identities|ssh-keys>` con paginación (`--limit`, `--page`).
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
+
+### DT-27 — Correcciones de sintaxis en scripts de smoke test
+- **Descripción:** El script original del smoke test usaba `--name` para `logins delete` (debería ser posicional) y `ssh-keygen -Y sign` apuntaba incorrectamente al archivo de texto en lugar de la clave.
+- **Impacto:** Bajo (documentación).
+- **Motivo:** Errores de redacción en el documento de pruebas, no en el código del CLI.
+- **Retoma:** Inmediato (corregido en la Acción 2 de esta tarea).
+- **Estado:** Cerrada.
 
 ### DT-8 — `sw-notify` como stub
 - **Descripción:** El crate `sw-notify` no tenía implementación real.

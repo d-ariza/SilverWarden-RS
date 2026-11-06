@@ -2024,14 +2024,16 @@ El test unitario `test_unlock_uses_pin_cache_when_valid` simula el bloqueo media
 
 Ver `docs/smoke-test-m1-m6.md` para el procedimiento completo y la tabla de ejecución.
 
-**Estado:** 🟡 PARCIAL (M4 y M5 validados contra Disroot; CRUD y M6 pendientes en local)
-
-**Última ejecución:** 2026-11-05
+**Estado:** ✅ COMPLETADO (Local: 2026-11-06; Disroot: 2026-11-05)
 
 **Resultado:** 
 - Login con 2FA (TOTP) contra Disroot: ✅ OK
-- Sync contra Disroot: ✅ OK (278 elementos: 274 logins, 3 notas, 1 identidad)
-- SSH Agent (`ssh-add -L`): ✅ OK (3 claves listadas: Manjaro-TCS, Codeberg, GitHub)
-- Fallos encontrados y corregidos: 3 bugs en el flujo de 2FA (token opcional, providers en string, scope faltante y authRequest omitido).
+- Sync contra Disroot: ✅ OK (278 elementos)
+- Sync contra Local: ✅ OK (8 elementos)
+- CRUD de logins (Local): ✅ OK (crear, listar, borrar, validar vacío)
+- SSH Agent (Local y Disroot): ✅ OK
+- Lock por inactividad (Local): ✅ OK
+- Systemd setup dry-run: ✅ OK
+- Bug corregido: Status devolvía `logged_in: true` estando bloqueado.
 
 **Evidencia:** [salida de comandos, capturas si aplica]

@@ -998,7 +998,8 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register(
         "Status",
         |state: &mut AgentState, _ctx: &CallingContext, _payload: &serde_json::Value| {
-            let logged_in = state.config.is_logged_in() || state.api_client.is_some();
+            let logged_in =
+                !state.is_locked && (state.config.is_logged_in() || state.api_client.is_some());
             Ok(serde_json::json!({
                 "locked": state.is_locked,
                 "has_pin": state.has_pin,
@@ -2702,12 +2703,14 @@ mod tests {
         };
 
         // Status with logged_in
+        state.is_locked = false;
         state.config.encrypted_token = "some_encrypted_token".into();
         let st = registry
             .execute("Status", &mut state, &ctx, &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(st["logged_in"], true);
+        state.is_locked = true;
 
         // Unlock without PIN configured
         assert!(registry
@@ -5507,5 +5510,40 @@ mod tests {
         assert_eq!(unlock2["biometrics"], false);
         assert!(!state.is_locked);
         assert_eq!(mock_bio.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_status_logged_in_false_when_locked() {
+        let registry = default_registry();
+        let (mut state, _temp_dir) = temp_state();
+        let ctx = test_ctx();
+
+        // Configurado como logueado
+        state.config.encrypted_token = "some_encrypted_token".into();
+
+        // 1. Desbloqueado: Status reporta logged_in: true
+        state.is_locked = false;
+        let st_unlocked = registry
+            .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st_unlocked["locked"], false);
+        assert_eq!(st_unlocked["logged_in"], true);
+
+        // 2. Ejecutar Lock
+        let lock_res = registry
+            .execute("Lock", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(lock_res["status"], "locked");
+        assert!(state.is_locked);
+
+        // 3. Bloqueado: Status reporta logged_in: false aunque config.encrypted_token exista
+        let st_locked = registry
+            .execute("Status", &mut state, &ctx, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(st_locked["locked"], true);
+        assert_eq!(st_locked["logged_in"], false);
     }
 }

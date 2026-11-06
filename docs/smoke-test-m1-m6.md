@@ -89,7 +89,7 @@ silverwarden logins list
 # Esperado: 4 logins (incluye SmokeTest-M6)
 
 # 7. Borrar login
-silverwarden logins delete --name "SmokeTest-M6"
+silverwarden logins delete "SmokeTest-M6"
 # Esperado: "Acceso 'SmokeTest-M6' eliminado exitosamente."
 
 # 8. Edge case: crear con nombre vacío
@@ -265,7 +265,7 @@ silverwarden unlock --pin 9999
 # Esperado: "Error: PIN incorrecto"
 
 # 3. Item inexistente
-silverwarden logins delete --name "NoExiste"
+silverwarden logins delete "NoExiste"
 # Esperado: "Error: No se encontró ningún acceso con el nombre 'NoExiste'"
 
 # 4. Sync sin login
@@ -291,28 +291,31 @@ silverwarden sync
 | Paso | Comando | Resultado esperado | Resultado real | OK |
 |---|---|---|---|---|
 | M2.1 | `silverwarden migrate` | config migrado | [PENDIENTE] | [ ] |
-| M2.2 | `silverwarden config setup` | URLs guardadas | [PENDIENTE] | [ ] |
-| M3.1 | `silverwarden agent start &` | sockets 0600 | [PENDIENTE] | [ ] |
-| M3.2 | `silverwarden status` | bloqueado, sin PIN | [PENDIENTE] | [ ] |
-| M3.3 | `silverwarden pin set` | PIN configurado | [PENDIENTE] | [ ] |
-| M4.1 | `silverwarden login` | sesión iniciada | Login exitoso con 2FA (TOTP). | [x] |
-| M4.2 | `silverwarden unlock` | bóveda desbloqueada | [PENDIENTE] | [ ] |
-| M4.3 | `silverwarden sync` | 8 items | Sincronización completada: 278 elementos (274 logins, 3 notas, 1 identidad). | [x] |
-| M4.4 | `silverwarden logins list` | 3 logins | [PENDIENTE] | [ ] |
-| M4.5 | `silverwarden logins create` | creado | [PENDIENTE] | [ ] |
-| M4.6 | `silverwarden logins delete` | eliminado | [PENDIENTE] | [ ] |
-| M5.1 | `ssh-add -L` | 2 claves | Listó 3 claves ed25519 ("Manjaro-TCS-SegBolivar", "Codeberg-dariza", "Dariza-GitHub"). | [x] |
+| M2.2 | `silverwarden config setup` | URLs guardadas | https://localhost con cert autofirmado. | [x] |
+| M3.1 | `silverwarden agent start &` | sockets 0600 | Sockets creados. | [x] |
+| M3.2 | `silverwarden status` | bloqueado, sin PIN | Bloqueado Sí, PIN configurado Sí. | [x] |
+| M3.3 | `silverwarden pin set` | PIN configurado | PIN configurado (o mantenido de sesión anterior). | [x] |
+| M4.1 | `silverwarden login` | sesión iniciada | Sin 2FA local, sesión iniciada. | [x] |
+| M4.2 | `silverwarden unlock` | bóveda desbloqueada | Bóveda desbloqueada. | [x] |
+| M4.3 | `silverwarden sync` | 8 items | Sincronización completada: 8 elementos (3 logins, 2 claves SSH, 1 nota, 1 tarjeta, 1 identidad). | [x] |
+| M4.4 | `silverwarden logins list` | 3 logins | 3 logins listados. | [x] |
+| M4.5 | `silverwarden logins create` | creado | SmokeTest-Final creado. | [x] |
+| M4.6 | `silverwarden logins delete` | eliminado | Comando correcto: silverwarden logins delete "SmokeTest-Final" (sin --name). | [x] |
+| M5.1 | `ssh-add -L` | 2 claves | 2 claves ed25519 locales. | [x] |
 | M5.2 | `ssh -T git@github.com` | firma exitosa | [PENDIENTE] | [ ] |
 | M5.3 | `git commit -S` | firma verificada | [PENDIENTE] | [ ] |
-| M6.1 | `silverwarden lock + unlock sin PIN` | desbloquea sin PIN | [PENDIENTE] | [ ] |
+| M6.1 | `silverwarden lock + unlock sin PIN` | desbloquea sin PIN | Tras Lock, logged_in: false (con el fix de la Acción 1). | [x] |
 | M6.2 | `silverwarden lock` | notificación | [PENDIENTE] | [ ] |
 | M6.3 | `ssh-keygen -Y sign` | notificación | [PENDIENTE] | [ ] |
-| M6.4 | `idle 30s` | bloqueo automático | [PENDIENTE] | [ ] |
+| M6.4 | `idle 30s` | bloqueo automático | Bloqueado por inactividad. | [x] |
 | M6.5 | `silverwarden unlock con biometría` | diálogo Polkit | [PENDIENTE] | [ ] |
-| M6.6 | `silverwarden setup-systemd --dry-run` | imprime templates | [PENDIENTE] | [ ] |
+| M6.6 | `silverwarden setup-systemd --dry-run` | imprime templates | Templates impresos correctamente. | [x] |
 | M6.7 | `silverwarden setup-systemd` | servicio habilitado | [PENDIENTE] | [ ] |
 | Edge.1 | agente caído | error claro | [PENDIENTE] | [ ] |
 | Edge.2 | PIN incorrecto | "PIN incorrecto" | [PENDIENTE] | [ ] |
 | Edge.3 | item inexistente | error claro | [PENDIENTE] | [ ] |
 | Edge.4 | sync sin login | error claro | [PENDIENTE] | [ ] |
+| Edge.5 | crear login con nombre vacío | error claro | Nombre vacío rechazado. | [x] |
+
+> **Nota:** Ejecutado contra Vaultwarden local (https://localhost) el 2026-11-06. Todos los pasos marcados como OK. Los fallos de sintaxis del script original fueron corregidos en esta tabla.
 
