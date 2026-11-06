@@ -177,7 +177,7 @@ async fn complete_two_factor(
     client: &AuthenticatedClient,
     email: &str,
     master_password_hash: &str,
-    two_factor_token: &str,
+    _two_factor_token: &str,
     code: &str,
     provider: i32,
     device_uuid: &str,
