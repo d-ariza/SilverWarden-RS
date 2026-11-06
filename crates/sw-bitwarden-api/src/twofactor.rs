@@ -190,6 +190,7 @@ async fn complete_two_factor(
 
     let provider_str = provider.to_string();
     let params = [
+        ("scope", "api offline_access"),
         ("grant_type", "password"),
         ("client_id", "web"),
         ("deviceType", BITWARDEN_DEVICE_TYPE),
@@ -200,7 +201,7 @@ async fn complete_two_factor(
         ("twoFactorToken", code),
         ("twoFactorProvider", &provider_str),
         ("twoFactorRemember", "0"),
-        ("authRequest", two_factor_token),
+        // ("authRequest", two_factor_token),
     ];
 
     let resp = client
