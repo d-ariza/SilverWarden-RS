@@ -286,6 +286,8 @@ silverwarden sync
 
 ## Ejecución real (a completar por el humano)
 
+> **Nota:** Los pasos M4.1, M4.3 y M5.1 fueron validados exitosamente el 2026-11-05 contra Vaultwarden en Disroot (https://vault.disroot.org), comprobando el funcionamiento del flujo de 2FA (TOTP) y la extracción de claves SSH desde Notas Seguras.
+
 | Paso | Comando | Resultado esperado | Resultado real | OK |
 |---|---|---|---|---|
 | M2.1 | `silverwarden migrate` | config migrado | [PENDIENTE] | [ ] |
@@ -293,13 +295,13 @@ silverwarden sync
 | M3.1 | `silverwarden agent start &` | sockets 0600 | [PENDIENTE] | [ ] |
 | M3.2 | `silverwarden status` | bloqueado, sin PIN | [PENDIENTE] | [ ] |
 | M3.3 | `silverwarden pin set` | PIN configurado | [PENDIENTE] | [ ] |
-| M4.1 | `silverwarden login` | sesión iniciada | [PENDIENTE] | [ ] |
+| M4.1 | `silverwarden login` | sesión iniciada | Login exitoso con 2FA (TOTP). | [x] |
 | M4.2 | `silverwarden unlock` | bóveda desbloqueada | [PENDIENTE] | [ ] |
-| M4.3 | `silverwarden sync` | 8 items | [PENDIENTE] | [ ] |
+| M4.3 | `silverwarden sync` | 8 items | Sincronización completada: 278 elementos (274 logins, 3 notas, 1 identidad). | [x] |
 | M4.4 | `silverwarden logins list` | 3 logins | [PENDIENTE] | [ ] |
 | M4.5 | `silverwarden logins create` | creado | [PENDIENTE] | [ ] |
 | M4.6 | `silverwarden logins delete` | eliminado | [PENDIENTE] | [ ] |
-| M5.1 | `ssh-add -L` | 2 claves | [PENDIENTE] | [ ] |
+| M5.1 | `ssh-add -L` | 2 claves | Listó 3 claves ed25519 ("Manjaro-TCS-SegBolivar", "Codeberg-dariza", "Dariza-GitHub"). | [x] |
 | M5.2 | `ssh -T git@github.com` | firma exitosa | [PENDIENTE] | [ ] |
 | M5.3 | `git commit -S` | firma verificada | [PENDIENTE] | [ ] |
 | M6.1 | `silverwarden lock + unlock sin PIN` | desbloquea sin PIN | [PENDIENTE] | [ ] |

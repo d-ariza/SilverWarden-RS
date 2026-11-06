@@ -99,6 +99,13 @@
 - **Retoma:** M10 (Infraestructura de CI con VM o bus simulado).
 - **Estado:** Abierta.
 
+### DT-25 — Manejo de 2FA en Vaultwarden (TOTP) verificado, Email pendiente
+- **Descripción:** El flujo de 2FA con TOTP ha sido verificado contra Disroot. El flujo de 2FA con Email (provider 1) está implementado pero no se ha probado end-to-end contra Disroot.
+- **Impacto:** Bajo. TOTP cubre el caso de uso principal.
+- **Motivo:** El usuario tiene configurado TOTP como método principal.
+- **Retoma:** M7 o cuando se requiera.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
