@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 sw-ipc = { workspace = true }
+sw-client = { workspace = true }
 sw-config = { workspace = true }
 sw-crypto = { workspace = true }
 sw-vault = { workspace = true }
