@@ -868,11 +868,26 @@ impl VaultStore {
                     continue;
                 }
             }
+
+            let cipher_key_owned = if let Some(ref enc_k) = cipher.key {
+                if !enc_k.is_null() {
+                    match sw_crypto::decrypt_with(enc_k, key) {
+                        Ok(kb) => SymmetricKey::from_bytes(&kb).ok(),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cipher_key = cipher_key_owned.as_ref().unwrap_or(key);
+
             if let Some(expected_name) = name {
                 if cipher.name.is_null() {
                     continue;
                 }
-                match sw_crypto::decrypt_with(&cipher.name, key) {
+                match sw_crypto::decrypt_with(&cipher.name, cipher_key) {
                     Ok(bytes) => {
                         if let Ok(dec_name) = String::from_utf8(bytes) {
                             if dec_name != expected_name {
@@ -889,7 +904,7 @@ impl VaultStore {
                 let login_match = match &cipher.login {
                     Some(login) => match &login.username {
                         Some(enc_un) if !enc_un.is_null() => {
-                            match sw_crypto::decrypt_with(enc_un, key) {
+                            match sw_crypto::decrypt_with(enc_un, cipher_key) {
                                 Ok(bytes) => match String::from_utf8(bytes) {
                                     Ok(dec_un) => dec_un == expected_username,
                                     Err(_) => false,
@@ -952,11 +967,26 @@ impl VaultStore {
                     continue;
                 }
             }
+
+            let cipher_key_owned = if let Some(ref enc_k) = cipher.key {
+                if !enc_k.is_null() {
+                    match sw_crypto::decrypt_with(enc_k, key) {
+                        Ok(kb) => SymmetricKey::from_bytes(&kb).ok(),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cipher_key = cipher_key_owned.as_ref().unwrap_or(key);
+
             if let Some(expected_name) = name {
                 if cipher.name.is_null() {
                     continue;
                 }
-                match sw_crypto::decrypt_with(&cipher.name, key) {
+                match sw_crypto::decrypt_with(&cipher.name, cipher_key) {
                     Ok(bytes) => {
                         if let Ok(dec_name) = String::from_utf8(bytes) {
                             if dec_name != expected_name {
@@ -981,12 +1011,26 @@ impl VaultStore {
         cipher: &Cipher,
         key: &SymmetricKey,
     ) -> Result<DecryptedCipher, VaultError> {
+        let cipher_key_owned = if let Some(ref enc_k) = cipher.key {
+            if !enc_k.is_null() {
+                match sw_crypto::decrypt_with(enc_k, key) {
+                    Ok(kb) => SymmetricKey::from_bytes(&kb).ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cipher_key = cipher_key_owned.as_ref().unwrap_or(key);
+
         if cipher.name.is_null() {
             return Err(VaultError::Other(
                 "Cipher name is missing or empty".to_string(),
             ));
         }
-        let name_bytes = sw_crypto::decrypt_with(&cipher.name, key)?;
+        let name_bytes = sw_crypto::decrypt_with(&cipher.name, cipher_key)?;
         let name = String::from_utf8(name_bytes)?;
 
         let mut username = None;
@@ -997,20 +1041,25 @@ impl VaultStore {
         if let Some(ref login) = cipher.login {
             if let Some(ref enc_un) = login.username {
                 if !enc_un.is_null() {
-                    let bytes = sw_crypto::decrypt_with(enc_un, key)?;
-                    username = Some(String::from_utf8(bytes)?);
+                    if let Ok(bytes) = sw_crypto::decrypt_with(enc_un, cipher_key) {
+                        username = String::from_utf8(bytes).ok();
+                    }
                 }
             }
             if let Some(ref enc_pw) = login.password {
                 if !enc_pw.is_null() {
-                    let bytes = sw_crypto::decrypt_with(enc_pw, key)?;
-                    password = Some(String::from_utf8(bytes)?);
+                    if let Ok(bytes) = sw_crypto::decrypt_with(enc_pw, cipher_key) {
+                        password = String::from_utf8(bytes).ok();
+                    }
                 }
             }
             if let Some(ref enc_uri) = login.uri {
                 if !enc_uri.is_null() {
-                    let bytes = sw_crypto::decrypt_with(enc_uri, key)?;
-                    uri = Some(String::from_utf8(bytes)?);
+                    if let Ok(bytes) = sw_crypto::decrypt_with(enc_uri, cipher_key) {
+                        uri = String::from_utf8(bytes).ok();
+                    } else {
+                        uri = login.uris.first().and_then(|u| u.uri.clone());
+                    }
                 } else {
                     uri = login.uris.first().and_then(|u| u.uri.clone());
                 }
@@ -1019,8 +1068,9 @@ impl VaultStore {
             }
             if let Some(ref enc_totp) = login.totp {
                 if !enc_totp.is_null() {
-                    let bytes = sw_crypto::decrypt_with(enc_totp, key)?;
-                    totp = Some(String::from_utf8(bytes)?);
+                    if let Ok(bytes) = sw_crypto::decrypt_with(enc_totp, cipher_key) {
+                        totp = String::from_utf8(bytes).ok();
+                    }
                 }
             }
         }
@@ -1028,8 +1078,9 @@ impl VaultStore {
         let mut notes = None;
         if let Some(ref enc_notes) = cipher.notes {
             if !enc_notes.is_null() {
-                let bytes = sw_crypto::decrypt_with(enc_notes, key)?;
-                notes = Some(String::from_utf8(bytes)?);
+                if let Ok(bytes) = sw_crypto::decrypt_with(enc_notes, cipher_key) {
+                    notes = String::from_utf8(bytes).ok();
+                }
             }
         }
 
@@ -2136,6 +2187,53 @@ mod tests {
 
         let res = VaultStore::decrypt_cipher(&cipher, &key);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_cipher_with_organization_cipher_key() {
+        let user_key = make_test_key();
+        let org_cipher_key = SymmetricKey::from_bytes(&[0x99u8; 64]).unwrap();
+        let cipher_id = Uuid::new_v4();
+
+        // Encrypt the cipher key with user key
+        let enc_cipher_key = encrypt_with(
+            &org_cipher_key.bytes(),
+            EncStringType::AesCbc256HmacSha256B64,
+            &user_key,
+        )
+        .unwrap();
+
+        // Encrypt name and username with the org_cipher_key
+        let enc_name = encrypt_with(
+            b"Org Item",
+            EncStringType::AesCbc256HmacSha256B64,
+            &org_cipher_key,
+        )
+        .unwrap();
+        let enc_user = encrypt_with(
+            b"org_user",
+            EncStringType::AesCbc256HmacSha256B64,
+            &org_cipher_key,
+        )
+        .unwrap();
+
+        let cipher = Cipher {
+            id: Some(cipher_id),
+            r#type: CipherType::Login,
+            key: Some(enc_cipher_key),
+            name: enc_name,
+            login: Some(LoginCipher {
+                username: Some(enc_user),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let dec = VaultStore::decrypt_cipher(&cipher, &user_key)
+            .expect("Should decrypt using cipher.key");
+        assert_eq!(dec.id, cipher_id);
+        assert_eq!(dec.name, "Org Item");
+        assert_eq!(dec.username.as_deref(), Some("org_user"));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use crate::error::CryptoError;
 use crate::mem::{LockedBuffer, MemLockedBuffer};
 use base64::Engine;
 use rand::rngs::OsRng;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
@@ -62,12 +63,53 @@ impl AsymmetricKey {
     }
 }
 
+impl Clone for AsymmetricKey {
+    fn clone(&self) -> Self {
+        self.try_clone().unwrap_or_else(|_| {
+            Self::from_pkcs8(self.private_bytes()).expect("AsymmetricKey clone must succeed")
+        })
+    }
+}
+
 impl fmt::Debug for AsymmetricKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsymmetricKey")
             .field(&"[REDACTED ASYMMETRIC KEY]")
             .finish()
     }
+}
+
+/// Attempts to parse an RSA private key from PKCS#8 DER, PKCS#1 DER, PKCS#8 PEM, or PKCS#1 PEM.
+pub fn asymmetric_key_from_bytes(bytes: &[u8]) -> Result<AsymmetricKey, CryptoError> {
+    if let Ok(key) = AsymmetricKey::from_pkcs8(bytes) {
+        return Ok(key);
+    }
+    if let Ok(priv_key) = RsaPrivateKey::from_pkcs1_der(bytes) {
+        if let Ok(der) = priv_key.to_pkcs8_der() {
+            if let Ok(key) = AsymmetricKey::from_pkcs8(der.as_bytes()) {
+                return Ok(key);
+            }
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Ok(priv_key) = RsaPrivateKey::from_pkcs8_pem(s) {
+            if let Ok(der) = priv_key.to_pkcs8_der() {
+                if let Ok(key) = AsymmetricKey::from_pkcs8(der.as_bytes()) {
+                    return Ok(key);
+                }
+            }
+        }
+        if let Ok(priv_key) = RsaPrivateKey::from_pkcs1_pem(s) {
+            if let Ok(der) = priv_key.to_pkcs8_der() {
+                if let Ok(key) = AsymmetricKey::from_pkcs8(der.as_bytes()) {
+                    return Ok(key);
+                }
+            }
+        }
+    }
+    Err(CryptoError::InvalidAsymmetricKey(
+        "Could not parse private key".into(),
+    ))
 }
 
 /// Encrypts plaintext using RSAES-OAEP with SHA-1 and returns standard Bitwarden wire format (`"4." + base64`).
@@ -268,5 +310,37 @@ mod tests {
 
         let decrypted = decrypt_with_asymmetric(&encrypted, &key).expect("decrypt failed");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_asymmetric_key_from_bytes_pkcs8_der() {
+        let key = AsymmetricKey::generate().expect("generate");
+        let der = key.private_bytes();
+        let parsed = asymmetric_key_from_bytes(der).expect("parse PKCS#8 DER");
+        assert_eq!(
+            key.public_bytes().expect("pub"),
+            parsed.public_bytes().expect("pub")
+        );
+    }
+
+    #[test]
+    fn test_asymmetric_key_from_bytes_invalid_input() {
+        // Bytes vacíos
+        let empty = asymmetric_key_from_bytes(&[]);
+        assert!(matches!(empty, Err(CryptoError::InvalidAsymmetricKey(_))));
+
+        // Bytes aleatorios (no es una clave)
+        let random = asymmetric_key_from_bytes(b"this is not a key");
+        assert!(matches!(random, Err(CryptoError::InvalidAsymmetricKey(_))));
+    }
+
+    #[test]
+    fn test_asymmetric_key_clone_preserves_public_bytes() {
+        let key = AsymmetricKey::generate().expect("generate");
+        let cloned = key.clone();
+        assert_eq!(
+            key.public_bytes().expect("pub"),
+            cloned.public_bytes().expect("pub")
+        );
     }
 }

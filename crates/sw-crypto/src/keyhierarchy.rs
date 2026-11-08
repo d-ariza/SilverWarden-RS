@@ -89,6 +89,14 @@ impl SymmetricKey {
     }
 }
 
+impl Clone for SymmetricKey {
+    fn clone(&self) -> Self {
+        self.try_clone().unwrap_or_else(|_| {
+            Self::from_bytes(&self.bytes()).expect("SymmetricKey clone must succeed")
+        })
+    }
+}
+
 impl fmt::Debug for SymmetricKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SymmetricKey")
@@ -128,7 +136,9 @@ pub fn stretch_key(master_key: &MasterKey) -> Result<SymmetricKey, CryptoError> 
 pub struct Keyring {
     is_locked: bool,
     account_key: Option<SymmetricKey>,
+    asymmetric_private_key: Option<crate::asymmetric::AsymmetricKey>,
     organization_keys: HashMap<String, String>,
+    decrypted_organization_keys: HashMap<String, SymmetricKey>,
 }
 
 impl Keyring {
@@ -137,7 +147,9 @@ impl Keyring {
         Self {
             is_locked: true,
             account_key: None,
+            asymmetric_private_key: None,
             organization_keys: HashMap::new(),
+            decrypted_organization_keys: HashMap::new(),
         }
     }
 
@@ -152,6 +164,12 @@ impl Keyring {
         if let Some(mut key) = self.account_key.take() {
             key.wipe();
         }
+        if let Some(mut asym) = self.asymmetric_private_key.take() {
+            asym.wipe();
+        }
+        for (_, mut k) in self.decrypted_organization_keys.drain() {
+            k.wipe();
+        }
         self.organization_keys.clear();
     }
 
@@ -159,6 +177,11 @@ impl Keyring {
     pub fn unlock_with_account_key(&mut self, key: SymmetricKey) {
         self.is_locked = false;
         self.account_key = Some(key);
+    }
+
+    /// Sets the user's asymmetric private key.
+    pub fn set_asymmetric_private_key(&mut self, key: crate::asymmetric::AsymmetricKey) {
+        self.asymmetric_private_key = Some(key);
     }
 
     /// Returns a reference to the active account symmetric key, if unlocked.
@@ -176,14 +199,66 @@ impl Keyring {
         self.organization_keys = keys;
     }
 
-    /// Stub for organization key decryption (Opción A, implemented in SW-006).
+    /// Stores a pre-decrypted organization symmetric key.
+    pub fn add_decrypted_organization_key(&mut self, org_id: String, key: SymmetricKey) {
+        self.decrypted_organization_keys.insert(org_id, key);
+    }
+
+    /// Decrypts an encrypted organization key string.
+    pub fn decrypt_org_key_string(&self, enc_key_str: &str) -> Result<SymmetricKey, CryptoError> {
+        let trimmed = enc_key_str.trim();
+        // 1. If RSA-encrypted (type 4):
+        if trimmed.starts_with("4.") {
+            let priv_key = self.asymmetric_private_key.as_ref().ok_or_else(|| {
+                CryptoError::InvalidAsymmetricKey(
+                    "User asymmetric private key not loaded in Keyring".to_string(),
+                )
+            })?;
+            let pt = crate::asymmetric::decrypt_with_asymmetric(trimmed.as_bytes(), priv_key)?;
+            return SymmetricKey::from_bytes(&pt);
+        }
+
+        // 2. If EncString (type 0, 1, 2 etc):
+        if trimmed.contains('.') {
+            let acct_key = self.account_key.as_ref().ok_or_else(|| {
+                CryptoError::InvalidKeyLength("Account key not unlocked in Keyring".to_string())
+            })?;
+            use std::str::FromStr;
+            let enc = crate::encstring::EncString::from_str(trimmed)?;
+            let pt = crate::cipher::decrypt_with(&enc, acct_key)?;
+            return SymmetricKey::from_bytes(&pt);
+        }
+
+        // 3. Fallback: Base64-encoded 64-byte key
+        use base64::Engine;
+        if let Ok(b64) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
+            if b64.len() == 64 {
+                return SymmetricKey::from_bytes(&b64);
+            }
+        }
+
+        Err(CryptoError::InvalidCiphertext(
+            "Unsupported organization key format".to_string(),
+        ))
+    }
+
+    /// Returns the decrypted symmetric key for the given organization UUID.
     pub fn get_symmetric_key_for_organization(
         &self,
-        _uuid: &str,
+        uuid: &str,
     ) -> Result<SymmetricKey, CryptoError> {
-        Err(CryptoError::NotImplemented(
-            "get_symmetric_key_for_organization requires SW-006".into(),
-        ))
+        if self.is_locked {
+            return Err(CryptoError::DecryptionFailed("Keyring is locked".into()));
+        }
+        if let Some(key) = self.decrypted_organization_keys.get(uuid) {
+            return key.try_clone();
+        }
+        if let Some(enc_key_str) = self.organization_keys.get(uuid) {
+            return self.decrypt_org_key_string(enc_key_str);
+        }
+        Err(CryptoError::DecryptionFailed(format!(
+            "Organization key not found for {uuid}"
+        )))
     }
 }
 
@@ -229,11 +304,22 @@ pub fn init_keyring_from_user_symmetric_key(
     org_keys: HashMap<String, String>,
 ) -> Result<(), CryptoError> {
     if !account_private_key.is_null() && !account_private_key.ct.is_empty() {
-        let _ = crate::decrypt_with(account_private_key, &account_key);
+        if let Ok(dec_bytes) = crate::cipher::decrypt_with(account_private_key, &account_key) {
+            if let Ok(asym_key) = crate::asymmetric::asymmetric_key_from_bytes(&dec_bytes) {
+                keyring.set_asymmetric_private_key(asym_key);
+            }
+        }
     }
 
     keyring.unlock_with_account_key(account_key);
-    keyring.set_organization_keys(org_keys);
+    keyring.set_organization_keys(org_keys.clone());
+
+    // Pre-decrypt all organization keys
+    for (org_id, enc_str) in org_keys {
+        if let Ok(org_sym) = keyring.decrypt_org_key_string(&enc_str) {
+            keyring.add_decrypted_organization_key(org_id, org_sym);
+        }
+    }
 
     Ok(())
 }
@@ -408,7 +494,7 @@ mod tests {
 
         assert!(matches!(
             keyring.get_symmetric_key_for_organization("org-1"),
-            Err(CryptoError::NotImplemented(_))
+            Err(CryptoError::DecryptionFailed(_))
         ));
         assert_eq!(keyring.is_locked(), was_locked);
         assert_eq!(keyring.account_key().is_some(), had_account_key);
@@ -445,5 +531,32 @@ mod tests {
         assert!(!keyring.is_locked());
         assert!(keyring.account_key().is_some());
         assert_eq!(keyring.organization_keys().get("org-1").unwrap(), "key-1");
+    }
+
+    #[test]
+    fn test_keyring_organization_key_decryption() {
+        let mut keyring = Keyring::new();
+        let user_key = SymmetricKey::from_bytes(&[0x44u8; 64]).unwrap();
+        let org_key = SymmetricKey::from_bytes(&[0x77u8; 64]).unwrap();
+
+        // Encrypt org_key using user_key as an EncString
+        let enc_org_key = crate::cipher::encrypt_with_to_string(
+            &org_key.bytes(),
+            crate::EncStringType::AesCbc256HmacSha256B64,
+            &user_key,
+        )
+        .unwrap();
+
+        let mut org_map = HashMap::new();
+        org_map.insert("org-uuid-1".to_string(), enc_org_key);
+
+        let empty_priv_key = crate::EncString::default();
+        init_keyring_from_user_symmetric_key(&mut keyring, user_key, &empty_priv_key, org_map)
+            .unwrap();
+
+        let resolved = keyring
+            .get_symmetric_key_for_organization("org-uuid-1")
+            .unwrap();
+        assert_eq!(resolved.bytes(), org_key.bytes());
     }
 }

@@ -134,6 +134,27 @@
 - **Retoma:** Fase 1.3 del plan de cierre arquitectónico.
 - **Estado:** Abierta.
 
+### DT-36 — `impl Clone for AsymmetricKey` con `expect` en ruta de producción
+- **Descripción:** La implementación manual de `Clone` para `AsymmetricKey` usa `expect("AsymmetricKey clone must succeed")` como fallback cuando `try_clone()` falla. Esto puede panickar en producción si `mlock` no está disponible (contenedores, entornos restringidos) y el re-parseo también falla.
+- **Impacto:** Bajo (el camino feliz funciona y hay fallback), pero viola P9 ("Cero `unwrap()` en rutas de producción").
+- **Motivo:** Compatibilidad con código existente que espera `Clone` (por ejemplo, `Keyring` o `VaultStore` clonan claves).
+- **Retoma:** Tarea de refactor de `AsymmetricKey` (post-M7), sustituyendo `impl Clone` por `try_clone() -> Result` y propagando el error a los consumidores.
+- **Estado:** Abierta.
+
+### DT-37 — `impl Clone for SymmetricKey` con `expect` en ruta de producción
+- **Descripción:** La implementación manual de `Clone` para `SymmetricKey` usa `expect("SymmetricKey clone must succeed")` como fallback cuando `try_clone()` falla. Esto puede panickar en producción si `mlock` no está disponible (contenedores, entornos restringidos) y el re-parseo también falla.
+- **Impacto:** Bajo (el camino feliz funciona y hay fallback), pero viola P9 ("Cero `unwrap()` en rutas de producción").
+- **Motivo:** Compatibilidad con código existente que espera `Clone` (por ejemplo, `Keyring`, `VaultStore` o `sw-agent` clonan claves simétricas).
+- **Retoma:** Tarea de refactor de `SymmetricKey` (post-M7), sustituyendo `impl Clone` por `try_clone() -> Result` y propagando el error a los consumidores.
+- **Estado:** Abierta.
+
+### DT-38 — Lógica duplicada de resolución de `cipher.key` en `sw-vault`
+- **Descripción:** La lógica para descifrar `cipher.key` (clave de organización) y usarla para descifrar los campos del cipher está duplicada 3 veces en `sw-vault/src/lib.rs` (en `get_login_by_filter`, `search`, y `decrypt_cipher`). Viola DRY y P6 (una sola razón de cambio).
+- **Impacto:** Bajo (funciona, pero es frágil ante cambios futuros).
+- **Motivo:** Implementación incremental para resolver el bug de las Organizaciones (los 274 logins de Disroot) sin refactorizar los 3 sitios a la vez.
+- **Retoma:** Fase 3.1.4 del plan de cierre (handlers tipados) o tarea de refactor de `sw-vault` (post-M7). Extraer `fn resolve_cipher_key(cipher: &Cipher, user_key: &SymmetricKey) -> Option<SymmetricKey>`.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)

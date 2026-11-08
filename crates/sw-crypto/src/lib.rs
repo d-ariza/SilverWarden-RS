@@ -6,7 +6,9 @@ pub mod kdf;
 pub mod keyhierarchy;
 pub mod mem;
 
-pub use asymmetric::{decrypt_with_asymmetric, encrypt_with_asymmetric, AsymmetricKey};
+pub use asymmetric::{
+    asymmetric_key_from_bytes, decrypt_with_asymmetric, encrypt_with_asymmetric, AsymmetricKey,
+};
 pub use cipher::{decrypt_with, encrypt_with, encrypt_with_to_string, pkcs7_pad, pkcs7_unpad};
 pub use encstring::{EncString, EncStringType};
 pub use error::CryptoError;
