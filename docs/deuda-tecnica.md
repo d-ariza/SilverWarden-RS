@@ -155,6 +155,13 @@
 - **Retoma:** Fase 3.1.4 del plan de cierre (handlers tipados) o tarea de refactor de `sw-vault` (post-M7). Extraer `fn resolve_cipher_key(cipher: &Cipher, user_key: &SymmetricKey) -> Option<SymmetricKey>`.
 - **Estado:** Abierta.
 
+### DT-39 — Tests de `sw-cli` dependen de `$HOME` y usan `ENV_MUTEX` global
+- **Descripción:** Varios tests de `sw-cli` (`test_resolve_socket_path`, `test_check_goldwarden_go_conflict`, `test_setup_systemd_missing_home`, etc.) leen o modifican `$HOME` y se serializan con un `ENV_MUTEX` global. Esto viola P8 ("Nunca escribe en `$HOME`... Nunca depende del entorno") y es frágil: si un test futuro toca `$HOME` sin el lock, la condición de carrera vuelve (ver el fallo de `test_resolve_socket_path` en la sesión de commits del plan de cierre).
+- **Impacto:** Medio (tests frágiles, no deterministas).
+- **Motivo:** El refactor para inyectar `$HOME` como parámetro (como el `Clock`) es grande y afecta a muchos tests.
+- **Retoma:** Tarea de refactor de tests de `sw-cli` (post-M7). Extraer `$HOME` a un parámetro inyectable (`HomeDir` trait o similar) y eliminar el `ENV_MUTEX`.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)

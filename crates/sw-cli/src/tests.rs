@@ -1162,6 +1162,7 @@ async fn test_cli_logins_get_and_delete() {
 
 #[test]
 fn test_resolve_socket_path() {
+    let _lock = ENV_MUTEX.lock().unwrap();
     let custom = PathBuf::from("/custom/path.sock");
     assert_eq!(resolve_socket_path(Some(custom.clone())).unwrap(), custom);
 
