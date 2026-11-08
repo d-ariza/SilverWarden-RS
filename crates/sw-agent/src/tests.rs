@@ -26,25 +26,14 @@ async fn test_agent_socket_actions_flow() {
     let daemon_clone = daemon.clone();
     let agent_socket = socket_path.clone();
 
+    let listener = bind_socket(&socket_path).await.unwrap();
     let agent_task = tokio::spawn(async move {
-        run_agent_daemon_with_shutdown(&agent_socket, daemon_clone, std::future::pending()).await
+        accept_loop(listener, daemon_clone, &agent_socket, std::future::pending()).await
     });
 
-    // Wait for socket to become available
-    let mut stream = None;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(s) = UnixStream::connect(&socket_path).await {
-            stream = Some(s);
-            break;
-        }
-    }
-
-    assert!(
-        stream.is_some(),
-        "Client should successfully connect to agent socket"
-    );
-    let mut stream = stream.unwrap();
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("Client should successfully connect to agent socket");
 
     // 1. Send Status request
     let status_req = Request::Status;
@@ -317,22 +306,18 @@ async fn test_agent_corrupted_message_handled() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let agent_socket = socket_path.clone();
 
+    let listener = bind_socket(&socket_path).await.unwrap();
     let handle = tokio::spawn(async move {
-        let _ = run_agent_with_shutdown(&agent_socket, async {
+        let daemon = AgentDaemon::new();
+        let _ = accept_loop(listener, daemon, &agent_socket, async {
             let _ = shutdown_rx.await;
         })
         .await;
     });
 
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if let Ok(mut stream) = UnixStream::connect(&socket_path).await {
-            let _ = stream.write_all(&[0, 0, 0, 10, 1, 2]).await;
-            break;
-        }
-    }
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let _ = stream.write_all(&[0, 0, 0, 10, 1, 2]).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 }
@@ -759,20 +744,17 @@ async fn test_run_agent_with_shutdown_signal_clean() {
     let socket_path = temp_dir.path().join("clean_shutdown.sock");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
+    let listener = bind_socket(&socket_path).await.unwrap();
+    assert!(socket_path.exists());
     let sock = socket_path.clone();
     let handle = tokio::spawn(async move {
-        run_agent_with_shutdown(&sock, async {
+        let daemon = AgentDaemon::new();
+        accept_loop(listener, daemon, &sock, async {
             let _ = rx.await;
         })
         .await
     });
 
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if socket_path.exists() {
-            break;
-        }
-    }
     let _ = tx.send(());
     let res = handle.await.unwrap();
     assert!(res.is_ok());
@@ -1400,25 +1382,21 @@ async fn test_agent_write_message_failure_on_closed_client() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let agent_socket = socket_path.clone();
 
+    let listener = bind_socket(&socket_path).await.unwrap();
     let handle = tokio::spawn(async move {
-        let _ = run_agent_with_shutdown(&agent_socket, async {
+        let daemon = AgentDaemon::new();
+        let _ = accept_loop(listener, daemon, &agent_socket, async {
             let _ = shutdown_rx.await;
         })
         .await;
     });
 
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if let Ok(mut stream) = UnixStream::connect(&socket_path).await {
-            let req = Request::Status;
-            let _ = write_message(&mut stream, &req).await;
-            let _ = stream.shutdown().await;
-            drop(stream);
-            break;
-        }
-    }
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    let req = Request::Status;
+    let _ = write_message(&mut stream, &req).await;
+    let _ = stream.shutdown().await;
+    drop(stream);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 }
@@ -1428,15 +1406,15 @@ async fn test_run_agent_ipc_shutdown() {
     let temp_dir = tempfile::tempdir().unwrap();
     let sock = temp_dir.path().join("run_agent_ipc.sock");
     let s = sock.clone();
-    let handle = tokio::spawn(async move { run_agent(&s).await });
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if let Ok(mut stream) = UnixStream::connect(&sock).await {
-            let req = Request::AgentShutdown;
-            let _ = write_message(&mut stream, &req).await;
-            break;
-        }
-    }
+    let listener = bind_socket(&sock).await.unwrap();
+    let handle = tokio::spawn(async move {
+        let daemon = AgentDaemon::new();
+        accept_loop(listener, daemon, &s, std::future::pending()).await
+    });
+
+    let mut stream = UnixStream::connect(&sock).await.unwrap();
+    let req = Request::AgentShutdown;
+    let _ = write_message(&mut stream, &req).await;
     let res = handle.await.unwrap();
     assert!(res.is_ok());
 }
@@ -3388,13 +3366,15 @@ async fn test_idle_monitor_locks_after_ttl() {
     *state_arc.read().await.last_activity.write().await = past;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let monitor_handle = spawn_idle_monitor(
         state_arc.clone(),
         shutdown_tx.subscribe(),
         Duration::from_millis(10),
+        Some(ready_tx),
     );
 
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    ready_rx.await.unwrap();
     let _ = shutdown_tx.send(());
     let _ = monitor_handle.await;
 
@@ -3425,13 +3405,15 @@ async fn test_idle_monitor_resets_on_activity() {
     state_arc.read().await.touch_activity().await;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let monitor_handle = spawn_idle_monitor(
         state_arc.clone(),
         shutdown_tx.subscribe(),
         Duration::from_millis(10),
+        Some(ready_tx),
     );
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    ready_rx.await.unwrap();
     let _ = shutdown_tx.send(());
     let _ = monitor_handle.await;
 
@@ -3500,12 +3482,14 @@ async fn test_idle_monitor_does_not_lock_when_already_locked() {
         std::time::Instant::now() - Duration::from_secs(10);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let monitor_handle = spawn_idle_monitor(
         state_arc.clone(),
         shutdown_tx.subscribe(),
         Duration::from_millis(10),
+        Some(ready_tx),
     );
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    ready_rx.await.unwrap();
     let _ = shutdown_tx.send(());
     let _ = monitor_handle.await;
 

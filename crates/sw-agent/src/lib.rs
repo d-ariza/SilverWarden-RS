@@ -544,14 +544,19 @@ pub fn spawn_idle_monitor(
     state: Arc<RwLock<AgentState>>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     check_interval: Duration,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut ready_tx = ready_tx;
         let mut interval = tokio::time::interval(check_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let state_guard = state.read().await;
                     if state_guard.is_locked {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(());
+                        }
                         continue;
                     }
                     let idle = state_guard.idle_duration().await;
@@ -560,6 +565,9 @@ pub fn spawn_idle_monitor(
                     if idle >= ttl {
                         let mut state_guard = state.write().await;
                         if state_guard.is_locked {
+                            if let Some(tx) = ready_tx.take() {
+                                let _ = tx.send(());
+                            }
                             continue;
                         }
                         state_guard.pin_cache.clear();
@@ -571,6 +579,9 @@ pub fn spawn_idle_monitor(
 
                         va.lock().await;
                         let _ = notifier.notify("SilverWarden", "Bóveda bloqueada por inactividad").await;
+                    }
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
                     }
                 }
                 _ = shutdown_rx.recv() => break,
@@ -652,20 +663,24 @@ pub fn spawn_logind_monitor(
     })
 }
 
-/// Runs the agent server using a custom daemon instance and a shutdown future.
-pub async fn run_agent_daemon_with_shutdown<F>(
-    socket_path: &Path,
+/// Binds the Unix domain socket, cleans up orphans, and sets 0600 permissions.
+pub async fn bind_socket(socket_path: &Path) -> Result<tokio::net::UnixListener, AgentError> {
+    check_and_prepare_socket(socket_path).await?;
+    let listener = tokio::net::UnixListener::bind(socket_path)?;
+    set_permissions_unix(socket_path, 0o600)?;
+    Ok(listener)
+}
+
+/// Runs the accept loop with shutdown handling and cleanup.
+pub async fn accept_loop<F>(
+    listener: tokio::net::UnixListener,
     daemon: AgentDaemon,
+    socket_path: &Path,
     shutdown_signal: F,
 ) -> Result<(), AgentError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    check_and_prepare_socket(socket_path).await?;
-
-    let listener = tokio::net::UnixListener::bind(socket_path)?;
-    set_permissions_unix(socket_path, 0o600)?;
-
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     {
         let mut state = daemon.state.write().await;
@@ -696,6 +711,7 @@ where
         daemon.state.clone(),
         monitor_shutdown_tx.subscribe(),
         Duration::from_secs(5),
+        None,
     );
     let logind_handle = spawn_logind_monitor(daemon.state.clone(), monitor_shutdown_tx.subscribe());
 
@@ -741,6 +757,19 @@ where
     // Clean up socket file on shutdown
     let _ = std::fs::remove_file(socket_path);
     Ok(())
+}
+
+/// Runs the agent server using a custom daemon instance and a shutdown future.
+pub async fn run_agent_daemon_with_shutdown<F>(
+    socket_path: &Path,
+    daemon: AgentDaemon,
+    shutdown_signal: F,
+) -> Result<(), AgentError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = bind_socket(socket_path).await?;
+    accept_loop(listener, daemon, socket_path, shutdown_signal).await
 }
 
 #[cfg(test)]

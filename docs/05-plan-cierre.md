@@ -115,7 +115,7 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Verificación: `cargo test -p sw-agent pin_cache`.
   - DoD: `PinCache` no llama a `Instant::now()` directamente.
 
-- [ ] **1.1.3 — Inyectar `Clock` en el idle monitor**
+- [x] **1.1.3 — Inyectar `Clock` en el idle monitor**
   - Objetivo: que `spawn_idle_monitor` no dependa del reloj real.
   - Pasos:
     - Pasar `Arc<dyn Clock>` a `spawn_idle_monitor`.
@@ -132,7 +132,7 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Verificación: `grep -n "sleep" crates/sw-agent/src/tests.rs` no muestra líneas en los tests de `PinCache`.
   - DoD: los tests de TTL pasan 50 veces seguidas sin fallos.
 
-- [ ] **1.1.5 — Sustituir los `sleep` de sincronización de IPC**
+- [x] **1.1.5 — Sustituir los `sleep` de sincronización de IPC**
   - Objetivo: que los tests no esperen a que “arranque algo”.
   - Pasos:
     - Identificar los `sleep` que esperan a que el servidor/cliente esté listo (14 en `sw-agent`, 8 en `sw-cli`).
