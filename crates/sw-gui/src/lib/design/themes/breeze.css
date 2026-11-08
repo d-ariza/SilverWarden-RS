@@ -1,0 +1,40 @@
+/* Tema Breeze (KDE Plasma) */
+[data-theme="breeze"] {
+  --color-bg: #eff0f1;
+  --color-bg-alt: #ffffff;
+  --color-text: #232629;
+  --color-text-muted: #7f8c8d;
+  --color-border: #bdc3c7;
+  
+  --color-primary: #3daee9;
+  --color-primary-hover: #2980b9;
+  --color-primary-text: #ffffff;
+  --color-danger: #da4453;
+  --color-success: #27ae60;
+  
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.1);
+  --shadow-md: 0 3px 8px rgba(0,0,0,0.12);
+  
+  --font-family: 'Noto Sans', 'Ubuntu', system-ui, sans-serif;
+  --color-skeleton: #d5d8db;
+}
+
+[data-theme="breeze"][data-mode="dark"] {
+  --color-bg: #232629;
+  --color-bg-alt: #2d2f31;
+  --color-text: #eff0f1;
+  --color-text-muted: #9aa0a6;
+  --color-border: #3f4144;
+  
+  --color-primary: #3daee9;
+  --color-primary-hover: #5bc0f0;
+  --color-primary-text: #ffffff;
+  --color-danger: #da4453;
+  --color-success: #27ae60;
+  
+  --color-skeleton: #3f4144;
+}
