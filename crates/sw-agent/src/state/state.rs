@@ -10,6 +10,12 @@ use sw_systemauth::SessionStore;
 
 use crate::ports::{Clock, SystemClock};
 
+impl std::fmt::Debug for dyn Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Clock")
+    }
+}
+
 /// In-memory cache for the derived 32-byte config key (in locked RAM).
 /// Protects against repeated Argon2i executions (which consume ~2-5s and 2 GiB RAM).
 /// Does NOT store the user's PIN or the user symmetric key.
@@ -140,7 +146,8 @@ pub struct AgentState {
     pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
     pub pin_cache: PinCache,
     pub notifier: Arc<dyn sw_notify::Notifier>,
-    pub last_activity: Arc<tokio::sync::RwLock<tokio::time::Instant>>,
+    pub last_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+    pub clock: Arc<dyn Clock>,
     pub biometrics: Arc<dyn sw_systemauth::Biometrics>,
     pub keyring: Arc<tokio::sync::RwLock<sw_crypto::Keyring>>,
 }
@@ -160,7 +167,8 @@ impl AgentState {
             api_client: None,
             pin_cache: PinCache::new(pin_cache_ttl),
             notifier: Arc::new(sw_notify::DbusNotifier::new()),
-            last_activity: Arc::new(tokio::sync::RwLock::new(tokio::time::Instant::now())),
+            last_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+            clock: Arc::new(SystemClock),
             biometrics: Arc::new(sw_systemauth::PolkitBiometrics::new()),
             keyring: Arc::new(tokio::sync::RwLock::new(sw_crypto::Keyring::new())),
         }
@@ -169,13 +177,13 @@ impl AgentState {
     /// Touches the last activity timestamp, resetting the inactivity counter.
     pub async fn touch_activity(&self) {
         let mut guard = self.last_activity.write().await;
-        *guard = tokio::time::Instant::now();
+        *guard = self.clock.now();
     }
 
     /// Returns the duration elapsed since the last IPC or user activity.
     pub async fn idle_duration(&self) -> Duration {
         let guard = self.last_activity.read().await;
-        tokio::time::Instant::now().saturating_duration_since(*guard)
+        self.clock.now().saturating_duration_since(*guard)
     }
 
     /// Returns the configured idle time-to-live before automatic lock.
@@ -191,7 +199,8 @@ impl AgentState {
 
     /// Sets an injectable clock for deterministic time in pin cache and timeout operations.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.pin_cache = PinCache::with_clock(self.pin_cache.ttl(), clock);
+        self.pin_cache = PinCache::with_clock(self.pin_cache.ttl(), clock.clone());
+        self.clock = clock;
         self
     }
 

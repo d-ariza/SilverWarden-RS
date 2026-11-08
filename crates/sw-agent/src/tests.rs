@@ -3362,7 +3362,7 @@ async fn test_last_activity_updates_on_ipc() {
     let daemon = AgentDaemon::with_state(state);
     let ctx = test_ctx();
 
-    let past = tokio::time::Instant::now() - Duration::from_secs(60);
+    let past = std::time::Instant::now() - Duration::from_secs(60);
     *daemon.state.read().await.last_activity.write().await = past;
 
     let idle_before = daemon.state.read().await.idle_duration().await;
@@ -3384,7 +3384,7 @@ async fn test_idle_monitor_locks_after_ttl() {
     state.config.runtime_config.idle_ttl_secs = 10;
     let state_arc = Arc::new(RwLock::new(state));
 
-    let past = tokio::time::Instant::now() - Duration::from_secs(20);
+    let past = std::time::Instant::now() - Duration::from_secs(20);
     *state_arc.read().await.last_activity.write().await = past;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
@@ -3420,7 +3420,7 @@ async fn test_idle_monitor_resets_on_activity() {
     let state_arc = Arc::new(RwLock::new(state));
 
     *state_arc.read().await.last_activity.write().await =
-        tokio::time::Instant::now() - Duration::from_secs(50);
+        std::time::Instant::now() - Duration::from_secs(50);
 
     state_arc.read().await.touch_activity().await;
 
@@ -3497,7 +3497,7 @@ async fn test_idle_monitor_does_not_lock_when_already_locked() {
     let state_arc = Arc::new(RwLock::new(state));
 
     *state_arc.read().await.last_activity.write().await =
-        tokio::time::Instant::now() - Duration::from_secs(10);
+        std::time::Instant::now() - Duration::from_secs(10);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
     let monitor_handle = spawn_idle_monitor(
