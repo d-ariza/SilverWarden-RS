@@ -113,6 +113,27 @@
 - **Retoma:** M7 (junto con la GUI). Implementar `silverwarden list --type <logins|notes|cards|identities|ssh-keys>` con paginación (`--limit`, `--page`).
 - **Estado:** Abierta.
 
+### DT-33 — `impl From<String> for AgentError` con `contains()` (antipatrón P4)
+- **Descripción:** La conversión `From<String>` para `AgentError` inspecciona subcadenas con `.contains()` para deducir variantes de error tipadas (`InvalidPin`, `Locked`), violando el principio P4 (errores como datos, no strings).
+- **Impacto:** Bajo/Medio (fragilidad en la taxonomía de errores del daemon).
+- **Motivo:** Facilita la transición gradual mientras los handlers aún retornan strings en ciertas rutas internas.
+- **Retoma:** Fase 3.1.4 del plan de cierre arquitectónico (contrato completamente tipado en handlers).
+- **Estado:** Abierta.
+
+### DT-34 — `dispatch_request` construye `serde_json::json!` para pasar a handlers
+- **Descripción:** `AgentDaemon::dispatch_request` desempaqueta variantes del enum tipado `Request` y reconstruye objetos `serde_json::Value` sueltos (`json!({...})`) para invocarlos en los handlers del registry, en lugar de pasar directamente los structs tipados.
+- **Impacto:** Medio (degradación temporal de tipado en la frontera interna de la aplicación).
+- **Motivo:** Permitir el desacoplamiento progresivo sin reescribir simultáneamente las 19 funciones de manejo.
+- **Retoma:** Fase 3.1.4 del plan de cierre arquitectónico.
+- **Estado:** Abierta.
+
+### DT-35 — `tokio::runtime::Handle::try_current()` en constructor síncrono de `AgentDaemon`
+- **Descripción:** `AgentDaemon::new()` es una función síncrona que intenta obtener el runtime asíncrono actual mediante `tokio::runtime::Handle::try_current()` para tareas en background, en lugar de recibir explícitamente el handle o estructurarse como un constructor asíncrono o inyectado.
+- **Impacto:** Bajo (puede fallar si se instancia fuera de un runtime activo de Tokio).
+- **Motivo:** Conveniencia para entrypoints existentes en el CLI y daemon.
+- **Retoma:** Fase 1.3 del plan de cierre arquitectónico.
+- **Estado:** Abierta.
+
 ---
 
 ## Items Cerrados (Histórico)
