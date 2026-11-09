@@ -307,12 +307,6 @@ pub struct AgentDaemon {
 }
 
 impl AgentDaemon {
-    pub fn new() -> Self {
-        let va = Arc::new(VaultAgentServer::default());
-        let state = AgentState::load_or_default_with(va.clone());
-        Self::with_vault_agent(state, va)
-    }
-
     pub fn with_state(state: AgentState) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -449,7 +443,9 @@ impl AgentDaemon {
 
 impl Default for AgentDaemon {
     fn default() -> Self {
-        Self::new()
+        let va = Arc::new(VaultAgentServer::default());
+        let state = AgentState::load_or_default_with(va.clone());
+        Self::with_vault_agent(state, va)
     }
 }
 
@@ -488,19 +484,26 @@ pub async fn check_and_prepare_socket(socket_path: &Path) -> Result<(), AgentErr
 }
 
 /// Runs the agent server on the specified Unix domain socket path indefinitely.
-pub async fn run_agent(socket_path: &Path) -> Result<(), AgentError> {
-    run_agent_with_shutdown(socket_path, std::future::pending()).await
+pub async fn run_agent(
+    socket_path: &Path,
+    vault_agent: Arc<VaultAgentServer>,
+) -> Result<(), AgentError> {
+    run_agent_with_shutdown(socket_path, vault_agent, std::future::pending()).await
 }
 
 /// Runs the agent server on the specified Unix domain socket path with a shutdown future.
 pub async fn run_agent_with_shutdown<F>(
     socket_path: &Path,
+    vault_agent: Arc<VaultAgentServer>,
     shutdown_signal: F,
 ) -> Result<(), AgentError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let daemon = AgentDaemon::new();
+    let daemon = AgentDaemon::with_vault_agent(
+        AgentState::new(ConfigFile::default(), vault_agent.clone()),
+        vault_agent,
+    );
     run_agent_daemon_with_shutdown(socket_path, daemon, shutdown_signal).await
 }
 

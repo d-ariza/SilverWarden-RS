@@ -976,23 +976,6 @@ impl SshAgentServer {
     ) -> Result<(), SshAgentError> {
         serve_with_shutdown(&self.socket_path, self.agent.clone(), shutdown_rx).await
     }
-
-    /// Creates an SSH agent server bound to the shared singleton `VaultAgentServer`.
-    pub fn for_shared_agent(socket_path: impl Into<PathBuf>) -> Self {
-        Self::new(socket_path, (*shared_vault_agent()).clone())
-    }
-}
-
-static SHARED_VAULT_AGENT: std::sync::OnceLock<Arc<VaultAgentServer>> = std::sync::OnceLock::new();
-
-/// Returns a shared, singleton `VaultAgentServer` instance.
-pub fn shared_vault_agent() -> Arc<VaultAgentServer> {
-    SHARED_VAULT_AGENT
-        .get_or_init(|| {
-            let vault = Arc::new(VaultStore::new());
-            Arc::new(VaultAgentServer::new(vault))
-        })
-        .clone()
 }
 
 /// Returns the default SSH agent socket path `~/.silverwarden-ssh-agent.sock` for a specific home or falling back to `$HOME`.

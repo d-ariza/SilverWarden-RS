@@ -297,7 +297,11 @@ async fn test_agent_daemon_handle_message() {
 
 #[tokio::test]
 async fn test_run_agent_entrypoint_error() {
-    let res = run_agent(Path::new("/proc/impossible/agent.sock")).await;
+    let res = run_agent(
+        Path::new("/proc/impossible/agent.sock"),
+        Arc::new(VaultAgentServer::default()),
+    )
+    .await;
     assert!(res.is_err());
 }
 
@@ -310,7 +314,7 @@ async fn test_agent_corrupted_message_handled() {
 
     let listener = bind_socket(&socket_path).await.unwrap();
     let handle = tokio::spawn(async move {
-        let daemon = AgentDaemon::new();
+        let daemon = AgentDaemon::default();
         let _ = accept_loop(listener, daemon, &agent_socket, async {
             let _ = shutdown_rx.await;
         })
@@ -750,7 +754,7 @@ async fn test_run_agent_with_shutdown_signal_clean() {
     assert!(socket_path.exists());
     let sock = socket_path.clone();
     let handle = tokio::spawn(async move {
-        let daemon = AgentDaemon::new();
+        let daemon = AgentDaemon::default();
         accept_loop(listener, daemon, &sock, async {
             let _ = rx.await;
         })
@@ -1117,7 +1121,7 @@ async fn test_agent_edge_cases_and_validations() {
     assert_eq!(lock_no_va["status"], "locked");
 
     // Constructors coverage
-    let d = AgentDaemon::new();
+    let d = AgentDaemon::default();
     assert!(d.state.read().await.session.is_locked);
     let d_state = AgentDaemon::with_state(AgentState::default());
     assert!(d_state.state.read().await.session.is_locked);
@@ -1382,7 +1386,7 @@ async fn test_agent_write_message_failure_on_closed_client() {
 
     let listener = bind_socket(&socket_path).await.unwrap();
     let handle = tokio::spawn(async move {
-        let daemon = AgentDaemon::new();
+        let daemon = AgentDaemon::default();
         let _ = accept_loop(listener, daemon, &agent_socket, async {
             let _ = shutdown_rx.await;
         })
@@ -1406,7 +1410,7 @@ async fn test_run_agent_ipc_shutdown() {
     let s = sock.clone();
     let listener = bind_socket(&sock).await.unwrap();
     let handle = tokio::spawn(async move {
-        let daemon = AgentDaemon::new();
+        let daemon = AgentDaemon::default();
         accept_loop(listener, daemon, &s, std::future::pending()).await
     });
 
@@ -3890,4 +3894,63 @@ async fn test_list_logins_resolves_organization_key_via_keyring() {
     assert_eq!(get_res["name"], "Secret Org System");
     assert_eq!(get_res["username"], "admin@org.com");
     assert_eq!(get_res["password"], "SuperSecretPassword");
+}
+
+#[tokio::test]
+async fn test_shared_vault_between_daemon_and_ssh_agent() {
+    use sw_crypto::SymmetricKey;
+    use sw_ssh_agent::SshAgentServer;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _agent_sock = temp_dir.path().join("agent.sock");
+    let ssh_sock = temp_dir.path().join("ssh.sock");
+
+    // 1. Instancia compartida única de VaultAgentServer
+    let vault_agent = Arc::new(VaultAgentServer::default());
+    let key = SymmetricKey::from_bytes(&[88u8; 64]).unwrap();
+    vault_agent.unlock(key).await;
+
+    // 2. Composición: el daemon y el SSH agent reciben la misma instancia
+    let state = AgentState::default().with_vault_agent(vault_agent.clone());
+    let daemon = AgentDaemon::with_vault_agent(state, vault_agent.clone());
+    let ssh_server = SshAgentServer::new(&ssh_sock, (*vault_agent).clone());
+
+    // Verificar identidad en memoria: ambos apuntan al mismo VaultStore subyacente
+    assert!(Arc::ptr_eq(
+        daemon.state.read().await.services.vault_agent.vault(),
+        ssh_server.agent().vault()
+    ));
+
+    // 3. Crear una clave SSH a través del daemon (IPC)
+    let ctx = CallingContext {
+        username: "tester".into(),
+        process_name: "test".into(),
+        parent_process_name: "test_runner".into(),
+        grandparent_process_name: "cargo".into(),
+        process_pid: 10,
+        parent_process_pid: 5,
+        grandparent_process_pid: 1,
+        error: false,
+        authenticated: true,
+    };
+    let new_key_req = Request::NewSshKey {
+        name: "shared-agent-key".into(),
+        key_type: "Ed25519".into(),
+    };
+    let resp = daemon.handle_message(&ctx, new_key_req).await;
+    assert!(resp.is_ok());
+
+    // 4. El SSH agent ve la clave inmediatamente a través del VaultStore compartido
+    let identities = ssh_server.agent().request_identities().await.unwrap();
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].comment(), "shared-agent-key");
+
+    // 5. El daemon bloquea el vault_agent compartido
+    let lock_resp = daemon.handle_message(&ctx, Request::Lock).await;
+    assert!(lock_resp.is_ok());
+
+    // El SSH agent ahora está bloqueado y no lista identidades
+    assert!(ssh_server.agent().is_locked());
+    let locked_ids = ssh_server.agent().request_identities().await.unwrap();
+    assert_eq!(locked_ids.len(), 0);
 }
