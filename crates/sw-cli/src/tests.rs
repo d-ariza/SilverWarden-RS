@@ -1174,6 +1174,7 @@ fn test_resolve_socket_path() {
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static ASYNC_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PATH_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvGuard {
     key: String,
@@ -1265,6 +1266,7 @@ fn test_cli_error_display() {
 
 #[tokio::test]
 async fn test_agent_start_launches_both_sockets() {
+    let _lock = PATH_MUTEX.lock().await;
     let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
     let main_sock = temp_dir.path().join(".silverwarden.sock");
     let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
@@ -1292,6 +1294,15 @@ async fn test_agent_start_launches_both_sockets() {
     assert!(both_exist, "Both sockets should exist after agent start");
 
     // Verify ssh-add -L against the SSH agent socket responds with "no identities" (exit code 1)
+    let ssh_add_available = std::env::var("PATH")
+        .map(|p| p.split(':').any(|dir| std::path::Path::new(dir).join("ssh-add").exists()))
+        .unwrap_or(false);
+    if !ssh_add_available {
+        eprintln!("ssh-add not found in PATH, skipping the rest of the test");
+        handle.abort();
+        return;
+    }
+
     let output = tokio::process::Command::new("ssh-add")
         .arg("-L")
         .env("SSH_AUTH_SOCK", &ssh_sock)
@@ -5228,6 +5239,7 @@ async fn test_setup_systemd_missing_home() {
 #[tokio::test]
 async fn test_setup_systemd_missing_systemctl_and_systemd_analyze() {
     let _lock = ASYNC_ENV_MUTEX.lock().await;
+    let _path_lock = PATH_MUTEX.lock().await;
     let _guard_home = EnvGuard::new("HOME");
     let _guard_path = EnvGuard::new("PATH");
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5259,6 +5271,7 @@ async fn test_setup_systemd_mock_binaries_warning_and_failure() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = ASYNC_ENV_MUTEX.lock().await;
+    let _path_lock = PATH_MUTEX.lock().await;
     let _guard_home = EnvGuard::new("HOME");
     let _guard_path = EnvGuard::new("PATH");
     let temp_home = tempfile::tempdir().unwrap();
