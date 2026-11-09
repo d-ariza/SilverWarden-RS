@@ -93,7 +93,7 @@ async fn test_agent_socket_actions_flow() {
 async fn test_actions_registry_direct() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut state = AgentState::default().with_config_directory(temp_dir.path());
-    assert!(!state.has_pin);
+    assert!(!state.session.has_pin);
 
     let registry = default_registry();
     let ctx = CallingContext {
@@ -127,7 +127,7 @@ async fn test_actions_registry_direct() {
         .await
         .unwrap();
     assert_eq!(pin_set_res["status"], "pin_set");
-    assert!(state.has_pin);
+    assert!(state.session.has_pin);
 
     // Second PinSet should fail
     assert!(registry
@@ -162,8 +162,9 @@ async fn test_actions_registry_direct() {
         .await
         .unwrap();
     assert_eq!(unlock_res["status"], "unlocked");
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(state
+        .session
         .sessions
         .verify_session(&ctx, SessionType::AccessVault));
 
@@ -210,8 +211,9 @@ async fn test_actions_registry_direct() {
         .await
         .unwrap();
     assert_eq!(lock_res["status"], "locked");
-    assert!(state.is_locked);
+    assert!(state.session.is_locked);
     assert!(!state
+        .session
         .sessions
         .verify_session(&ctx, SessionType::AccessVault));
 
@@ -708,29 +710,29 @@ async fn test_agent_state_load_or_default_and_save_config() {
     assert!(config_file.exists());
 
     let loaded_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_eq!(loaded_state.config.device_uuid, "test-device-uuid-123");
+    assert_eq!(loaded_state.services.config.device_uuid, "test-device-uuid-123");
 
     // Test with invalid json in config file
     std::fs::write(&config_file, b"not json").unwrap();
     let fallback_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_ne!(fallback_state.config.device_uuid, "test-device-uuid-123");
+    assert_ne!(fallback_state.services.config.device_uuid, "test-device-uuid-123");
 
     // Test when config path is a directory (read_to_string fails)
     let _ = std::fs::remove_file(&config_file);
     std::fs::create_dir(&config_file).unwrap();
     let dir_fallback = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_ne!(dir_fallback.config.device_uuid, "test-device-uuid-123");
+    assert_ne!(dir_fallback.services.config.device_uuid, "test-device-uuid-123");
     let _ = std::fs::remove_dir(&config_file);
 
     // Test with empty dir where config doesn't exist
     let empty_dir = tempfile::tempdir().unwrap();
     let empty_fallback = AgentState::load_or_default_from(Some(empty_dir.path().to_path_buf()));
-    assert!(!empty_fallback.config.device_uuid.is_empty());
-    assert_ne!(empty_fallback.config.device_uuid, "test-device-uuid-123");
+    assert!(!empty_fallback.services.config.device_uuid.is_empty());
+    assert_ne!(empty_fallback.services.config.device_uuid, "test-device-uuid-123");
 
     // Test when config_dir is None (load_or_default)
     let no_home_fallback = AgentState::load_or_default();
-    assert!(!no_home_fallback.config.device_uuid.is_empty());
+    assert!(!no_home_fallback.services.config.device_uuid.is_empty());
 
     // Test save_config_file with relative path without parent
     let rel_path = Path::new("temp_test_local_cfg.json");
@@ -856,14 +858,14 @@ async fn test_agent_edge_cases_and_validations() {
     };
 
     // Status with logged_in
-    state.is_locked = false;
-    state.config.encrypted_token = "some_encrypted_token".into();
+    state.session.is_locked = false;
+    state.services.config.encrypted_token = "some_encrypted_token".into();
     let st = registry
         .execute("Status", &mut state, &ctx, &serde_json::json!({}))
         .await
         .unwrap();
     assert_eq!(st["logged_in"], true);
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     // Unlock without PIN configured
     assert!(registry
@@ -1092,10 +1094,8 @@ async fn test_agent_edge_cases_and_validations() {
 
     // AgentShutdown with shutdown_sender present
     let (shut_tx, mut shut_rx) = tokio::sync::mpsc::channel(1);
-    let mut with_shut_state = AgentState {
-        shutdown_sender: Some(shut_tx),
-        ..Default::default()
-    };
+    let mut with_shut_state = AgentState::default();
+    with_shut_state.services.shutdown_sender = Some(shut_tx);
     let shut_with_sender = registry
         .execute(
             "AgentShutdown",
@@ -1118,35 +1118,35 @@ async fn test_agent_edge_cases_and_validations() {
 
     // Constructors coverage
     let d = AgentDaemon::new();
-    assert!(d.state.read().await.is_locked);
+    assert!(d.state.read().await.session.is_locked);
     let d_state = AgentDaemon::with_state(AgentState::default());
-    assert!(d_state.state.read().await.is_locked);
+    assert!(d_state.state.read().await.session.is_locked);
     let reg = ActionsRegistry::new();
     assert!(reg.actions.is_empty());
     let reg_default = ActionsRegistry::default();
     assert!(reg_default.actions.is_empty());
     let default_daemon = AgentDaemon::default();
-    assert!(default_daemon.state.read().await.is_locked);
+    assert!(default_daemon.state.read().await.session.is_locked);
     let d_default = AgentDaemon::default();
-    assert!(d_default.state.read().await.is_locked);
+    assert!(d_default.state.read().await.session.is_locked);
     let d_with_state = AgentDaemon::with_state(AgentState::new(
         ConfigFile::default(),
         Arc::new(VaultAgentServer::default()),
     ));
-    assert!(d_with_state.state.read().await.is_locked);
+    assert!(d_with_state.state.read().await.session.is_locked);
     let d_with_both =
         AgentDaemon::with_state_and_registry(AgentState::default(), default_registry());
-    assert!(d_with_both.state.read().await.is_locked);
+    assert!(d_with_both.state.read().await.session.is_locked);
     let d_va = AgentDaemon::with_vault_agent(AgentState::default(), va.clone());
-    assert!(d_va.state.read().await.is_locked);
+    assert!(d_va.state.read().await.session.is_locked);
     let d_va_cloned = d_va.clone();
-    assert!(d_va_cloned.state.read().await.is_locked);
+    assert!(d_va_cloned.state.read().await.session.is_locked);
     assert!(set_permissions_unix(temp_dir.path(), 0o700).is_ok());
 
     // AgentState Debug, Clone, with_vault_agent with full fields
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let mut full_state = AgentState::new(ConfigFile::default(), va.clone());
-    full_state.shutdown_sender = Some(tx);
+    full_state.services.shutdown_sender = Some(tx);
     let cloned_st = full_state.clone();
     let dbg_st = format!("{cloned_st:?}");
     assert!(dbg_st.contains("AgentState"));
@@ -1301,13 +1301,11 @@ async fn test_agent_edge_cases_and_validations() {
     .is_ok());
 
     // Unlock with corrupted config_key_hash where verify_pin returns Err
-    let mut corrupted_pin_state = AgentState {
-        has_pin: true,
-        config: ConfigFile {
-            device_uuid: "".into(),
-            config_key_hash: "0".repeat(64),
-            ..Default::default()
-        },
+    let mut corrupted_pin_state = AgentState::default();
+    corrupted_pin_state.session.has_pin = true;
+    corrupted_pin_state.services.config = ConfigFile {
+        device_uuid: "".into(),
+        config_key_hash: "0".repeat(64),
         ..Default::default()
     };
     let err = default_reg
@@ -1744,7 +1742,7 @@ fn mock_api_client(base_url: &str) -> Arc<sw_bitwarden_api::AuthenticatedClient>
 #[tokio::test]
 async fn test_handle_sync_locked_returns_error() {
     let (mut state, _tmp) = temp_state();
-    state.is_locked = true;
+    state.session.is_locked = true;
     let res = handle_sync(&mut state, &serde_json::json!({})).await;
     assert!(res.is_err());
     assert!(res.unwrap_err().contains("Bóveda bloqueada"));
@@ -1753,9 +1751,9 @@ async fn test_handle_sync_locked_returns_error() {
 #[tokio::test]
 async fn test_handle_sync_without_session_returns_error() {
     let (mut state, _tmp) = temp_state();
-    state.is_locked = false;
-    state.config.encrypted_token = String::new();
-    state.api_client = None;
+    state.session.is_locked = false;
+    state.services.config.encrypted_token = String::new();
+    state.services.api_client = None;
     let res = handle_sync(&mut state, &serde_json::json!({})).await;
     assert!(res.is_err());
     assert_eq!(
@@ -1767,10 +1765,10 @@ async fn test_handle_sync_without_session_returns_error() {
 #[tokio::test]
 async fn test_handle_sync_payload_updates_config_and_summary() {
     let (mut state, _tmp) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let (_, key) = test_agent(42);
 
-    let vault = state.vault_agent.vault();
+    let vault = state.services.vault_agent.vault();
     // Insert 2 logins, 1 ssh key, 1 note
     vault
         .insert(encrypted_login("Login1", "u1", "p1", &key))
@@ -1818,11 +1816,11 @@ async fn test_handle_sync_payload_updates_config_and_summary() {
     let res = handle_sync(&mut state, &payload)
         .await
         .expect("sync should succeed");
-    assert_eq!(state.config.encrypted_token, "enc_tok_payload");
-    assert_eq!(state.config.encrypted_user_symmetric_key, "enc_sym_payload");
-    assert_eq!(state.config.identity_url, "https://identity.test");
-    assert_eq!(state.config.api_url, "https://api.test");
-    assert!(state.config.danger_accept_invalid_certs);
+    assert_eq!(state.services.config.encrypted_token, "enc_tok_payload");
+    assert_eq!(state.services.config.encrypted_user_symmetric_key, "enc_sym_payload");
+    assert_eq!(state.services.config.identity_url, "https://identity.test");
+    assert_eq!(state.services.config.api_url, "https://api.test");
+    assert!(state.services.config.danger_accept_invalid_certs);
 
     assert_eq!(res["status"], "synced");
     assert_eq!(res["total"], 4);
@@ -1833,9 +1831,9 @@ async fn test_handle_sync_payload_updates_config_and_summary() {
 #[tokio::test]
 async fn test_handle_sync_disk_config_fallback() {
     let (mut state, tmp) = temp_state();
-    state.is_locked = false;
-    state.config.encrypted_token = String::new();
-    state.api_client = None;
+    state.session.is_locked = false;
+    state.services.config.encrypted_token = String::new();
+    state.services.api_client = None;
 
     let disk_cfg = ConfigFile {
         encrypted_token: "disk_enc_token".to_string(),
@@ -1850,10 +1848,10 @@ async fn test_handle_sync_disk_config_fallback() {
     let res = handle_sync(&mut state, &serde_json::json!({}))
         .await
         .expect("sync fallback should succeed");
-    assert_eq!(state.config.encrypted_token, "disk_enc_token");
-    assert_eq!(state.config.encrypted_user_symmetric_key, "disk_enc_sym");
-    assert_eq!(state.config.identity_url, "https://disk-ident.test");
-    assert_eq!(state.config.api_url, "https://disk-api.test");
+    assert_eq!(state.services.config.encrypted_token, "disk_enc_token");
+    assert_eq!(state.services.config.encrypted_user_symmetric_key, "disk_enc_sym");
+    assert_eq!(state.services.config.identity_url, "https://disk-ident.test");
+    assert_eq!(state.services.config.api_url, "https://disk-api.test");
     assert_eq!(res["status"], "synced");
 }
 
@@ -1897,8 +1895,8 @@ async fn test_handle_sync_api_success_persists_vault() {
         .await;
 
     let (mut state, tmp) = temp_state();
-    state.is_locked = false;
-    state.api_client = Some(mock_api_client(&server.uri()));
+    state.session.is_locked = false;
+    state.services.api_client = Some(mock_api_client(&server.uri()));
 
     let res = handle_sync(&mut state, &serde_json::json!({}))
         .await
@@ -1929,8 +1927,8 @@ async fn test_handle_sync_api_rate_limit() {
         .await;
 
     let (mut state, _tmp) = temp_state();
-    state.is_locked = false;
-    state.api_client = Some(mock_api_client(&server.uri()));
+    state.session.is_locked = false;
+    state.services.api_client = Some(mock_api_client(&server.uri()));
 
     let err = handle_sync(&mut state, &serde_json::json!({}))
         .await
@@ -1951,8 +1949,8 @@ async fn test_handle_sync_api_server_error() {
         .await;
 
     let (mut state, _tmp) = temp_state();
-    state.is_locked = false;
-    state.api_client = Some(mock_api_client(&server.uri()));
+    state.session.is_locked = false;
+    state.services.api_client = Some(mock_api_client(&server.uri()));
 
     let err = handle_sync(&mut state, &serde_json::json!({}))
         .await
@@ -1984,8 +1982,8 @@ async fn test_handle_sync_token_payload_builds_api_client() {
         .await;
 
     let (mut state, _tmp) = temp_state();
-    state.is_locked = false;
-    assert!(state.api_client.is_none());
+    state.session.is_locked = false;
+    assert!(state.services.api_client.is_none());
 
     let payload = serde_json::json!({
         "identity_url": format!("{}/identity", server.uri()),
@@ -2004,7 +2002,7 @@ async fn test_handle_sync_token_payload_builds_api_client() {
         .await
         .expect("sync with token payload should succeed");
     assert_eq!(res["status"], "synced");
-    assert!(state.api_client.is_some());
+    assert!(state.services.api_client.is_some());
 }
 
 // ====================================================================
@@ -2015,16 +2013,16 @@ async fn test_handle_sync_token_payload_builds_api_client() {
 async fn test_handle_list_logins_filters_and_locked() {
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(50);
-    state.vault_agent = agent.clone();
+    state.services.vault_agent = agent.clone();
 
     // 1. Locked -> returns error
-    state.is_locked = true;
+    state.session.is_locked = true;
     let err = handle_list_logins(&state).await.unwrap_err();
     assert!(err.contains("Bóveda bloqueada"));
 
     // 2. Unlocked
     agent.unlock(key.try_clone().unwrap()).await;
-    state.is_locked = false;
+    state.session.is_locked = false;
 
     let vault = agent.vault();
     // 1 active login
@@ -2066,10 +2064,10 @@ async fn test_handle_list_logins_filters_and_locked() {
 async fn test_handle_get_login_found_not_found_locked() {
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(51);
-    state.vault_agent = agent.clone();
+    state.services.vault_agent = agent.clone();
 
     // Locked error
-    state.is_locked = true;
+    state.session.is_locked = true;
     assert!(
         handle_get_login(&state, &serde_json::json!({ "name": "GitHub" }))
             .await
@@ -2078,7 +2076,7 @@ async fn test_handle_get_login_found_not_found_locked() {
 
     // Unlock
     agent.unlock(key.try_clone().unwrap()).await;
-    state.is_locked = false;
+    state.session.is_locked = false;
 
     let login = encrypted_login("GitHub", "octocat", "super_secret", &key);
     agent.vault().insert(login).await;
@@ -2120,8 +2118,8 @@ async fn test_handle_get_login_found_not_found_locked() {
 async fn test_handle_delete_login_local_and_not_found() {
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(52);
-    state.vault_agent = agent.clone();
-    state.is_locked = false;
+    state.services.vault_agent = agent.clone();
+    state.session.is_locked = false;
     agent.unlock(key.try_clone().unwrap()).await;
 
     let login = encrypted_login("Twitter", "bird_user", "tweet123", &key);
@@ -2158,10 +2156,10 @@ async fn test_handle_delete_login_server_error_is_tolerated() {
 
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(53);
-    state.vault_agent = agent.clone();
-    state.is_locked = false;
+    state.services.vault_agent = agent.clone();
+    state.session.is_locked = false;
     agent.unlock(key.try_clone().unwrap()).await;
-    state.api_client = Some(mock_api_client(&server.uri()));
+    state.services.api_client = Some(mock_api_client(&server.uri()));
 
     let login = encrypted_login("Reddit", "redditor", "upvote_all", &key);
     agent.vault().insert(login).await;
@@ -2178,16 +2176,16 @@ async fn test_handle_delete_login_server_error_is_tolerated() {
 async fn test_handle_create_login_validations() {
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(54);
-    state.vault_agent = agent.clone();
+    state.services.vault_agent = agent.clone();
 
     // 1. Locked
-    state.is_locked = true;
+    state.session.is_locked = true;
     let err_locked = handle_create_login(&mut state, &serde_json::json!({}))
         .await
         .unwrap_err();
     assert!(err_locked.contains("Bóveda bloqueada"));
 
-    state.is_locked = false;
+    state.session.is_locked = false;
     agent.unlock(key).await;
 
     // 2. Non-object payload
@@ -2263,7 +2261,7 @@ async fn test_handle_create_login_validations() {
             ..Default::default()
         })
         .await;
-    state.api_client = None;
+    state.services.api_client = None;
     let err_no_session = handle_create_login(
         &mut state,
         &serde_json::json!({ "name": "n", "username": "u", "password": "p" }),
@@ -2302,8 +2300,8 @@ async fn test_handle_create_login_success() {
 
     let (mut state, _tmp) = temp_state();
     let (agent, key) = test_agent(55);
-    state.vault_agent = agent.clone();
-    state.is_locked = false;
+    state.services.vault_agent = agent.clone();
+    state.session.is_locked = false;
     agent.unlock(key).await;
 
     // Set profile in vault
@@ -2318,7 +2316,7 @@ async fn test_handle_create_login_success() {
         })
         .await;
 
-    state.api_client = Some(mock_api_client(&server.uri()));
+    state.services.api_client = Some(mock_api_client(&server.uri()));
 
     let payload = serde_json::json!({
         "name": "Google",
@@ -2374,18 +2372,18 @@ async fn test_handle_set_session_persists_and_unlocks() {
     assert_eq!(res["status"], "session_saved");
 
     // Config updated in memory
-    assert_eq!(state.config.identity_url, "https://ident.custom.test");
-    assert_eq!(state.config.api_url, "https://api.custom.test");
-    assert_eq!(state.config.notifications_url, "https://notif.custom.test");
-    assert!(state.config.danger_accept_invalid_certs);
-    assert_eq!(state.config.encrypted_token, "enc_tok_sample");
-    assert_eq!(state.config.encrypted_user_symmetric_key, "enc_sym_sample");
+    assert_eq!(state.services.config.identity_url, "https://ident.custom.test");
+    assert_eq!(state.services.config.api_url, "https://api.custom.test");
+    assert_eq!(state.services.config.notifications_url, "https://notif.custom.test");
+    assert!(state.services.config.danger_accept_invalid_certs);
+    assert_eq!(state.services.config.encrypted_token, "enc_tok_sample");
+    assert_eq!(state.services.config.encrypted_user_symmetric_key, "enc_sym_sample");
 
     // api_client created
-    assert!(state.api_client.is_some());
+    assert!(state.services.api_client.is_some());
 
     // vault unlocked
-    assert!(!state.vault_agent.is_locked());
+    assert!(!state.services.vault_agent.is_locked());
 
     // config file persisted
     let config_file = tmp.path().join("goldwarden.json");
@@ -2472,7 +2470,7 @@ async fn test_agent_state_helpers_and_config_path_variants() {
 
     let mock_client = mock_api_client("http://localhost:1234");
     let state_with_client = state.with_api_client(mock_client);
-    assert!(state_with_client.api_client.is_some());
+    assert!(state_with_client.services.api_client.is_some());
 }
 
 #[tokio::test]
@@ -2647,10 +2645,10 @@ async fn test_unlock_uses_pin_cache_when_valid() {
         .unwrap();
     assert_eq!(unlock1["status"], "unlocked");
     assert_eq!(unlock1["from_cache"], false);
-    assert!(state.pin_cache.is_valid());
+    assert!(state.security.pin_cache.is_valid());
 
     // Simulamos bloqueo del agente sin llamar a Lock (ej. bloqueo por inactividad o cambio de bandera)
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     // 3. Segundo Unlock sin PIN: cache hit (no ejecuta Argon2i)
     let unlock2 = registry
@@ -2659,7 +2657,7 @@ async fn test_unlock_uses_pin_cache_when_valid() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
 }
 
 #[tokio::test]
@@ -2687,8 +2685,8 @@ async fn test_unlock_falls_back_to_argon2_when_cache_miss() {
         .unwrap();
 
     // Limpiamos explícitamente el caché para forzar cache miss
-    state.pin_cache.clear();
-    assert!(!state.pin_cache.is_valid());
+    state.security.pin_cache.clear();
+    assert!(!state.security.pin_cache.is_valid());
 
     // Intento de Unlock sin PIN debe fallar al no haber caché
     let err_no_pin = registry
@@ -2712,7 +2710,7 @@ async fn test_unlock_falls_back_to_argon2_when_cache_miss() {
         .unwrap();
     assert_eq!(unlock_res["status"], "unlocked");
     assert_eq!(unlock_res["from_cache"], false);
-    assert!(state.pin_cache.is_valid());
+    assert!(state.security.pin_cache.is_valid());
 }
 
 #[tokio::test]
@@ -2749,7 +2747,7 @@ async fn test_lock_clears_pin_cache() {
         .await
         .unwrap();
     assert_eq!(unlock["status"], "unlocked");
-    assert!(state.pin_cache.is_valid());
+    assert!(state.security.pin_cache.is_valid());
 
     // Lock debe limpiar el pin_cache por seguridad
     let lock_res = registry
@@ -2757,8 +2755,8 @@ async fn test_lock_clears_pin_cache() {
         .await
         .unwrap();
     assert_eq!(lock_res["status"], "locked");
-    assert!(!state.pin_cache.is_valid());
-    assert!(state.pin_cache.get().is_none());
+    assert!(!state.security.pin_cache.is_valid());
+    assert!(state.security.pin_cache.get().is_none());
 
     // Posterior Unlock sin PIN falla porque el caché fue limpiado
     let unlock_fail = registry
@@ -2800,7 +2798,7 @@ async fn test_pin_update_clears_and_stores_new() {
         )
         .await
         .unwrap();
-    assert!(state.pin_cache.is_valid());
+    assert!(state.security.pin_cache.is_valid());
 
     // PinUpdate debe limpiar el caché previo y almacenar la nueva clave derivada
     let update_res = registry
@@ -2816,10 +2814,10 @@ async fn test_pin_update_clears_and_stores_new() {
         .await
         .unwrap();
     assert_eq!(update_res["status"], "pin_updated");
-    assert!(state.pin_cache.is_valid());
+    assert!(state.security.pin_cache.is_valid());
 
     // El nuevo PIN está en caché y permite Unlock inmediato sin enviar PIN
-    state.is_locked = true;
+    state.session.is_locked = true;
     let unlock_cache = registry
         .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
         .await
@@ -2958,10 +2956,10 @@ async fn test_unlock_cache_hit_decrypts_token_and_symmetric_key() {
     assert_eq!(unlock1["status"], "unlocked");
     assert_eq!(unlock1["from_cache"], false);
     assert!(!va.is_locked());
-    assert!(state.api_client.is_some());
+    assert!(state.services.api_client.is_some());
 
     // 2. Simular bloqueo del agente
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -2972,18 +2970,18 @@ async fn test_unlock_cache_hit_decrypts_token_and_symmetric_key() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
 
     // Verificar que el token descifrado coincide exactamente
-    let cached_cfg_key = state.pin_cache.get().unwrap();
-    let decrypted_token = state.config.decrypt_token(&cached_cfg_key).unwrap();
+    let cached_cfg_key = state.security.pin_cache.get().unwrap();
+    let decrypted_token = state.services.config.decrypt_token(&cached_cfg_key).unwrap();
     assert_eq!(decrypted_token.access_token, original_token.access_token);
     assert_eq!(decrypted_token.refresh_token, original_token.refresh_token);
 
     // Verificar que la user_symmetric_key descifrada coincide exactamente
     let dec_user_sym_b64 =
-        sw_config::decrypt_string(&state.config.encrypted_user_symmetric_key, &cached_cfg_key)
+        sw_config::decrypt_string(&state.services.config.encrypted_user_symmetric_key, &cached_cfg_key)
             .unwrap();
     let dec_user_sym_bytes = base64::engine::general_purpose::STANDARD
         .decode(dec_user_sym_b64.trim())
@@ -3032,10 +3030,10 @@ async fn test_unlock_cache_hit_empty_encrypted_token() {
     assert_eq!(unlock1["status"], "unlocked");
     assert_eq!(unlock1["from_cache"], false);
     assert!(!va.is_locked());
-    assert!(state.api_client.is_none());
+    assert!(state.services.api_client.is_none());
 
     // 2. Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -3046,9 +3044,9 @@ async fn test_unlock_cache_hit_empty_encrypted_token() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
-    assert!(state.api_client.is_none());
+    assert!(state.services.api_client.is_none());
 }
 
 #[tokio::test]
@@ -3089,7 +3087,7 @@ async fn test_unlock_cache_hit_empty_encrypted_user_symmetric_key() {
     assert!(!va.is_locked());
 
     // 2. Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -3100,7 +3098,7 @@ async fn test_unlock_cache_hit_empty_encrypted_user_symmetric_key() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
 }
 
@@ -3150,7 +3148,7 @@ async fn test_unlock_cache_hit_decrypt_string_fails() {
     assert!(!va.is_locked());
 
     // 2. Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -3161,7 +3159,7 @@ async fn test_unlock_cache_hit_decrypt_string_fails() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
 }
 
@@ -3207,7 +3205,7 @@ async fn test_unlock_cache_hit_base64_decode_fails() {
     assert!(!va.is_locked());
 
     // Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -3218,17 +3216,17 @@ async fn test_unlock_cache_hit_base64_decode_fails() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
 
     // 2. Probar rama adicional: base64 decode es válido pero longitud no es 64 bytes (falla from_bytes)
     use base64::Engine;
     let short_key_b64 = base64::engine::general_purpose::STANDARD.encode([42u8; 16]);
     let enc_short_key = sw_config::encrypt_string(&short_key_b64, &config_key).unwrap();
-    state.config.encrypted_user_symmetric_key = enc_short_key;
+    state.services.config.encrypted_user_symmetric_key = enc_short_key;
 
     // Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
     va.lock().await;
     assert!(va.is_locked());
 
@@ -3239,7 +3237,7 @@ async fn test_unlock_cache_hit_base64_decode_fails() {
         .unwrap();
     assert_eq!(unlock3["status"], "unlocked");
     assert_eq!(unlock3["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert!(!va.is_locked());
 }
 
@@ -3278,10 +3276,10 @@ async fn test_unlock_cache_hit_no_vault_agent() {
         .unwrap();
     assert_eq!(unlock1["status"], "unlocked");
     assert_eq!(unlock1["from_cache"], false);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
 
     // 2. Simular bloqueo
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     // 3. Unlock sin PIN: cache hit
     let unlock2 = registry
@@ -3290,7 +3288,7 @@ async fn test_unlock_cache_hit_no_vault_agent() {
         .unwrap();
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
 }
 
 #[tokio::test]
@@ -3306,7 +3304,7 @@ async fn test_lock_notifies_via_notifier() {
         .await
         .unwrap();
     assert_eq!(lock_res["status"], "locked");
-    assert!(state.is_locked);
+    assert!(state.session.is_locked);
 
     let notifs = mock_notifier.notifications();
     assert_eq!(notifs.len(), 1);
@@ -3329,19 +3327,19 @@ async fn test_lock_succeeds_even_if_notifier_fails() {
         .await
         .expect("Lock should succeed even if notifier fails (silent fallback)");
     assert_eq!(lock_res["status"], "locked");
-    assert!(state.is_locked);
+    assert!(state.session.is_locked);
     assert!(mock_notifier.notifications().is_empty());
 }
 
 #[tokio::test]
 async fn test_last_activity_updates_on_ipc() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let daemon = AgentDaemon::with_state(state);
     let ctx = test_ctx();
 
     let past = std::time::Instant::now() - Duration::from_secs(60);
-    *daemon.state.read().await.last_activity.write().await = past;
+    *daemon.state.read().await.security.last_activity.write().await = past;
 
     let idle_before = daemon.state.read().await.idle_duration().await;
     assert!(idle_before >= Duration::from_secs(59));
@@ -3356,14 +3354,14 @@ async fn test_last_activity_updates_on_ipc() {
 #[tokio::test]
 async fn test_idle_monitor_locks_after_ttl() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
-    state.notifier = mock_notifier.clone();
-    state.config.runtime_config.idle_ttl_secs = 10;
+    state.security.notifier = mock_notifier.clone();
+    state.services.config.runtime_config.idle_ttl_secs = 10;
     let state_arc = Arc::new(RwLock::new(state));
 
     let past = std::time::Instant::now() - Duration::from_secs(20);
-    *state_arc.read().await.last_activity.write().await = past;
+    *state_arc.read().await.security.last_activity.write().await = past;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -3378,7 +3376,7 @@ async fn test_idle_monitor_locks_after_ttl() {
     let _ = shutdown_tx.send(());
     let _ = monitor_handle.await;
 
-    assert!(state_arc.read().await.is_locked);
+    assert!(state_arc.read().await.session.is_locked);
     let notifs = mock_notifier.notifications();
     assert_eq!(notifs.len(), 1);
     assert_eq!(
@@ -3393,13 +3391,13 @@ async fn test_idle_monitor_locks_after_ttl() {
 #[tokio::test]
 async fn test_idle_monitor_resets_on_activity() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
-    state.notifier = mock_notifier.clone();
-    state.config.runtime_config.idle_ttl_secs = 100;
+    state.security.notifier = mock_notifier.clone();
+    state.services.config.runtime_config.idle_ttl_secs = 100;
     let state_arc = Arc::new(RwLock::new(state));
 
-    *state_arc.read().await.last_activity.write().await =
+    *state_arc.read().await.security.last_activity.write().await =
         std::time::Instant::now() - Duration::from_secs(50);
 
     state_arc.read().await.touch_activity().await;
@@ -3417,26 +3415,26 @@ async fn test_idle_monitor_resets_on_activity() {
     let _ = shutdown_tx.send(());
     let _ = monitor_handle.await;
 
-    assert!(!state_arc.read().await.is_locked);
+    assert!(!state_arc.read().await.session.is_locked);
     assert!(mock_notifier.notifications().is_empty());
 }
 
 #[tokio::test]
 async fn test_logind_prepare_for_sleep_locks() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
-    state.notifier = mock_notifier.clone();
+    state.security.notifier = mock_notifier.clone();
     let state_arc = Arc::new(RwLock::new(state));
 
     // PrepareForSleep(false) should not lock
     handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(false)).await;
-    assert!(!state_arc.read().await.is_locked);
+    assert!(!state_arc.read().await.session.is_locked);
     assert!(mock_notifier.notifications().is_empty());
 
     // PrepareForSleep(true) should lock
     handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(true)).await;
-    assert!(state_arc.read().await.is_locked);
+    assert!(state_arc.read().await.session.is_locked);
     let notifs = mock_notifier.notifications();
     assert_eq!(notifs.len(), 1);
     assert_eq!(
@@ -3451,13 +3449,13 @@ async fn test_logind_prepare_for_sleep_locks() {
 #[tokio::test]
 async fn test_logind_lock_signal_locks() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = false;
+    state.session.is_locked = false;
     let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
-    state.notifier = mock_notifier.clone();
+    state.security.notifier = mock_notifier.clone();
     let state_arc = Arc::new(RwLock::new(state));
 
     handle_logind_event(&state_arc, LogindEvent::Lock).await;
-    assert!(state_arc.read().await.is_locked);
+    assert!(state_arc.read().await.session.is_locked);
     let notifs = mock_notifier.notifications();
     assert_eq!(notifs.len(), 1);
     assert_eq!(
@@ -3472,13 +3470,13 @@ async fn test_logind_lock_signal_locks() {
 #[tokio::test]
 async fn test_idle_monitor_does_not_lock_when_already_locked() {
     let (mut state, _temp_dir) = temp_state();
-    state.is_locked = true;
+    state.session.is_locked = true;
     let mock_notifier = Arc::new(sw_notify::MockNotifier::new());
-    state.notifier = mock_notifier.clone();
-    state.config.runtime_config.idle_ttl_secs = 1;
+    state.security.notifier = mock_notifier.clone();
+    state.services.config.runtime_config.idle_ttl_secs = 1;
     let state_arc = Arc::new(RwLock::new(state));
 
-    *state_arc.read().await.last_activity.write().await =
+    *state_arc.read().await.security.last_activity.write().await =
         std::time::Instant::now() - Duration::from_secs(10);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
@@ -3496,7 +3494,7 @@ async fn test_idle_monitor_does_not_lock_when_already_locked() {
     handle_logind_event(&state_arc, LogindEvent::Lock).await;
     handle_logind_event(&state_arc, LogindEvent::PrepareForSleep(true)).await;
 
-    assert!(state_arc.read().await.is_locked);
+    assert!(state_arc.read().await.session.is_locked);
     assert!(mock_notifier.notifications().is_empty());
 }
 
@@ -3536,7 +3534,7 @@ async fn test_unlock_with_biometrics_success() {
     let (state, _temp_dir) = temp_state();
     let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(true));
     let mut state = state.with_biometrics(mock_bio.clone());
-    state.config.runtime_config.biometrics_enabled = true;
+    state.services.config.runtime_config.biometrics_enabled = true;
     let ctx = test_ctx();
     let pin = "bio_pin_123";
 
@@ -3562,7 +3560,7 @@ async fn test_unlock_with_biometrics_success() {
     assert_eq!(unlock1["status"], "unlocked");
     assert_eq!(mock_bio.call_count(), 0);
 
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     let unlock2 = registry
         .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
@@ -3571,7 +3569,7 @@ async fn test_unlock_with_biometrics_success() {
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
     assert_eq!(unlock2["biometrics"], true);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert_eq!(mock_bio.call_count(), 1);
 }
 
@@ -3581,7 +3579,7 @@ async fn test_unlock_with_biometrics_denied() {
     let (state, _temp_dir) = temp_state();
     let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(false));
     let mut state = state.with_biometrics(mock_bio.clone());
-    state.config.runtime_config.biometrics_enabled = true;
+    state.services.config.runtime_config.biometrics_enabled = true;
     let ctx = test_ctx();
     let pin = "bio_pin_denied";
 
@@ -3605,14 +3603,14 @@ async fn test_unlock_with_biometrics_denied() {
         .await
         .unwrap();
 
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     let err = registry
         .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
         .await
         .unwrap_err();
     assert_eq!(err, "Biometría cancelada o fallida");
-    assert!(state.is_locked);
+    assert!(state.session.is_locked);
     assert_eq!(mock_bio.call_count(), 1);
 }
 
@@ -3622,7 +3620,7 @@ async fn test_unlock_with_biometrics_disabled() {
     let (state, _temp_dir) = temp_state();
     let mock_bio = Arc::new(sw_systemauth::biometrics::MockBiometrics::new(true));
     let mut state = state.with_biometrics(mock_bio.clone());
-    state.config.runtime_config.biometrics_enabled = false;
+    state.services.config.runtime_config.biometrics_enabled = false;
     let ctx = test_ctx();
     let pin = "bio_pin_disabled";
 
@@ -3646,7 +3644,7 @@ async fn test_unlock_with_biometrics_disabled() {
         .await
         .unwrap();
 
-    state.is_locked = true;
+    state.session.is_locked = true;
 
     let unlock2 = registry
         .execute("Unlock", &mut state, &ctx, &serde_json::json!({}))
@@ -3655,7 +3653,7 @@ async fn test_unlock_with_biometrics_disabled() {
     assert_eq!(unlock2["status"], "unlocked");
     assert_eq!(unlock2["from_cache"], true);
     assert_eq!(unlock2["biometrics"], false);
-    assert!(!state.is_locked);
+    assert!(!state.session.is_locked);
     assert_eq!(mock_bio.call_count(), 0);
 }
 
@@ -3666,10 +3664,10 @@ async fn test_status_logged_in_false_when_locked() {
     let ctx = test_ctx();
 
     // Configurado como logueado
-    state.config.encrypted_token = "some_encrypted_token".into();
+    state.services.config.encrypted_token = "some_encrypted_token".into();
 
     // 1. Desbloqueado: Status reporta logged_in: true
-    state.is_locked = false;
+    state.session.is_locked = false;
     let st_unlocked = registry
         .execute("Status", &mut state, &ctx, &serde_json::json!({}))
         .await
@@ -3683,7 +3681,7 @@ async fn test_status_logged_in_false_when_locked() {
         .await
         .unwrap();
     assert_eq!(lock_res["status"], "locked");
-    assert!(state.is_locked);
+    assert!(state.session.is_locked);
 
     // 3. Bloqueado: Status reporta logged_in: false aunque config.encrypted_token exista
     let st_locked = registry
@@ -3699,14 +3697,14 @@ async fn test_list_logins_includes_all_logins_even_with_cipher_key_and_corrupt_n
     let registry = default_registry();
     let (mut state, _temp_dir) = temp_state();
     let ctx = test_ctx();
-    state.is_locked = false;
+    state.session.is_locked = false;
 
     let user_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
     let org_key = sw_crypto::SymmetricKey::from_bytes(&[0x88u8; 64]).unwrap();
 
     let agent = Arc::new(VaultAgentServer::default());
     agent.unlock(user_key.clone()).await;
-    state.vault_agent = agent.clone();
+    state.services.vault_agent = agent.clone();
 
     // Login 1: Standard user cipher
     let l1 = sw_vault::Cipher {
@@ -3793,14 +3791,14 @@ async fn test_list_logins_resolves_organization_key_via_keyring() {
     let registry = default_registry();
     let (mut state, _temp_dir) = temp_state();
     let ctx = test_ctx();
-    state.is_locked = false;
+    state.session.is_locked = false;
 
     let user_key = sw_crypto::SymmetricKey::from_bytes(&[0x11u8; 64]).unwrap();
     let org_key = sw_crypto::SymmetricKey::from_bytes(&[0x22u8; 64]).unwrap();
 
     let agent = Arc::new(VaultAgentServer::default());
     agent.unlock(user_key.clone()).await;
-    state.vault_agent = agent.clone();
+    state.services.vault_agent = agent.clone();
 
     let org_id = uuid::Uuid::new_v4();
     let enc_org_key_str = sw_crypto::encrypt_with_to_string(

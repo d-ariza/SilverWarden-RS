@@ -236,21 +236,21 @@ pub fn default_registry() -> ActionsRegistry {
         handle_agent_shutdown(state)
     });
     registry.register_async("ListSSHKeys", |state, _ctx, _payload| {
-        let agent = state.vault_agent.clone();
+        let agent = state.services.vault_agent.clone();
         Box::pin(async move { handle_list_ssh_keys(&agent).await })
     });
     registry.register_async("ImportSSHKey", |state, _ctx, payload| {
-        let agent = state.vault_agent.clone();
+        let agent = state.services.vault_agent.clone();
         let payload = payload.clone();
         Box::pin(async move { handle_import_ssh_key(&agent, &payload).await })
     });
     registry.register_async("NewSSHKey", |state, _ctx, payload| {
-        let agent = state.vault_agent.clone();
+        let agent = state.services.vault_agent.clone();
         let payload = payload.clone();
         Box::pin(async move { handle_new_ssh_key(&agent, &payload).await })
     });
     registry.register_async("DeleteSSHKey", |state, _ctx, payload| {
-        let agent = state.vault_agent.clone();
+        let agent = state.services.vault_agent.clone();
         let payload = payload.clone();
         Box::pin(async move { handle_delete_ssh_key(&agent, &payload).await })
     });
@@ -338,7 +338,7 @@ impl AgentDaemon {
             }
         }
 
-        state.vault_agent = vault_agent;
+        state.services.vault_agent = vault_agent;
         Self::with_state(state)
     }
 
@@ -387,16 +387,16 @@ impl AgentDaemon {
                 handle_delete_login(state, &serde_json::json!({ "name": name })).await
             }
             Request::ListSshKeys => {
-                let agent = state.vault_agent.clone();
+                let agent = state.services.vault_agent.clone();
                 handle_list_ssh_keys(&agent).await
             }
             Request::ImportSshKey { name, pem } => {
-                let agent = state.vault_agent.clone();
+                let agent = state.services.vault_agent.clone();
                 handle_import_ssh_key(&agent, &serde_json::json!({ "name": name, "pem": pem }))
                     .await
             }
             Request::NewSshKey { name, key_type } => {
-                let agent = state.vault_agent.clone();
+                let agent = state.services.vault_agent.clone();
                 handle_new_ssh_key(
                     &agent,
                     &serde_json::json!({ "name": name, "key_type": key_type }),
@@ -404,7 +404,7 @@ impl AgentDaemon {
                 .await
             }
             Request::DeleteSshKey { id } => {
-                let agent = state.vault_agent.clone();
+                let agent = state.services.vault_agent.clone();
                 handle_delete_ssh_key(&agent, &serde_json::json!({ "id": id })).await
             }
             Request::SetSession {
@@ -521,14 +521,14 @@ pub async fn handle_logind_event(state: &Arc<RwLock<AgentState>>, event: LogindE
         return;
     }
     let mut state_guard = state.write().await;
-    if state_guard.is_locked {
+    if state_guard.session.is_locked {
         return;
     }
-    state_guard.pin_cache.clear();
-    state_guard.is_locked = true;
-    state_guard.sessions.wipe();
-    let va = state_guard.vault_agent.clone();
-    let notifier = state_guard.notifier.clone();
+    state_guard.security.pin_cache.clear();
+    state_guard.session.is_locked = true;
+    state_guard.session.sessions.wipe();
+    let va = state_guard.services.vault_agent.clone();
+    let notifier = state_guard.security.notifier.clone();
     drop(state_guard);
 
     va.lock().await;
@@ -553,7 +553,7 @@ pub fn spawn_idle_monitor(
             tokio::select! {
                 _ = interval.tick() => {
                     let state_guard = state.read().await;
-                    if state_guard.is_locked {
+                    if state_guard.session.is_locked {
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(());
                         }
@@ -564,17 +564,17 @@ pub fn spawn_idle_monitor(
                     drop(state_guard);
                     if idle >= ttl {
                         let mut state_guard = state.write().await;
-                        if state_guard.is_locked {
+                        if state_guard.session.is_locked {
                             if let Some(tx) = ready_tx.take() {
                                 let _ = tx.send(());
                             }
                             continue;
                         }
-                        state_guard.pin_cache.clear();
-                        state_guard.is_locked = true;
-                        state_guard.sessions.wipe();
-                        let va = state_guard.vault_agent.clone();
-                        let notifier = state_guard.notifier.clone();
+                        state_guard.security.pin_cache.clear();
+                        state_guard.session.is_locked = true;
+                        state_guard.session.sessions.wipe();
+                        let va = state_guard.services.vault_agent.clone();
+                        let notifier = state_guard.security.notifier.clone();
                         drop(state_guard);
 
                         va.lock().await;
@@ -684,7 +684,7 @@ where
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     {
         let mut state = daemon.state.write().await;
-        state.shutdown_sender = Some(shutdown_tx);
+        state.services.shutdown_sender = Some(shutdown_tx);
     }
 
     // Cargar vault.json en VaultStore si existe en disco al arrancar el daemon
@@ -698,7 +698,7 @@ where
         if let Some(vault_path) = vp {
             if vault_path.exists() {
                 if let Ok(sync_data) = sw_vault::load_vault(&vault_path) {
-                    let agent = state.vault_agent.clone();
+                    let agent = state.services.vault_agent.clone();
                     agent.vault().load_sync_data(sync_data).await;
                     tracing::info!("Cargados ciphers de vault.json en memoria");
                 }

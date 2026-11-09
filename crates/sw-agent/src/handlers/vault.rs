@@ -3,21 +3,21 @@ use crate::state::AgentState;
 use crate::AgentError;
 
 pub async fn handle_list_logins(state: &AgentState) -> Result<serde_json::Value, AgentError> {
-    if state.is_locked {
+    if state.session.is_locked {
         return Err(AgentError::Locked);
     }
-    let agent = state.vault_agent.clone();
+    let agent = state.services.vault_agent.clone();
     let sym_key = agent.get_symmetric_key().await.ok_or(AgentError::Locked)?;
 
     {
-        let kr = state.keyring.read().await;
+        let kr = state.security.keyring.read().await;
         if kr.is_locked() || kr.account_key().is_none() {
             drop(kr);
-            populate_keyring(&state.keyring, agent.vault(), &sym_key).await;
+            populate_keyring(&state.security.keyring, agent.vault(), &sym_key).await;
         }
     }
 
-    let kr = state.keyring.read().await;
+    let kr = state.security.keyring.read().await;
     let all = agent.vault().all().await;
     let mut list = Vec::new();
     for c in all {
@@ -79,7 +79,7 @@ pub async fn handle_get_login(
     state: &AgentState,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, AgentError> {
-    if state.is_locked {
+    if state.session.is_locked {
         return Err(AgentError::Locked);
     }
     let target_name = payload
@@ -88,18 +88,18 @@ pub async fn handle_get_login(
         .or_else(|| payload.as_str())
         .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
 
-    let agent = state.vault_agent.clone();
+    let agent = state.services.vault_agent.clone();
     let sym_key = agent.get_symmetric_key().await.ok_or(AgentError::Locked)?;
 
     {
-        let kr = state.keyring.read().await;
+        let kr = state.security.keyring.read().await;
         if kr.is_locked() || kr.account_key().is_none() {
             drop(kr);
-            populate_keyring(&state.keyring, agent.vault(), &sym_key).await;
+            populate_keyring(&state.security.keyring, agent.vault(), &sym_key).await;
         }
     }
 
-    let kr = state.keyring.read().await;
+    let kr = state.security.keyring.read().await;
     let all = agent.vault().all().await;
     for c in all {
         if c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none() {
@@ -135,7 +135,7 @@ pub async fn handle_create_login(
     state: &mut AgentState,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, AgentError> {
-    if state.is_locked {
+    if state.session.is_locked {
         return Err(AgentError::Locked);
     }
     let obj = payload
@@ -171,7 +171,7 @@ pub async fn handle_create_login(
         ));
     }
 
-    let agent = state.vault_agent.clone();
+    let agent = state.services.vault_agent.clone();
 
     let profile = agent.vault().profile().await;
     let mut profile_id = profile.and_then(|p| p.id);
@@ -234,7 +234,7 @@ pub async fn handle_create_login(
         ..Default::default()
     };
 
-    let client = state.api_client.as_ref().or_else(|| agent.api_client());
+    let client = state.services.api_client.as_ref().or_else(|| agent.api_client());
     let client = client.ok_or_else(|| {
         AgentError::Unauthorized("No hay sesión iniciada en el servidor. Inicia sesión con 'silverwarden login' primero.".to_string())
     })?;
@@ -261,7 +261,7 @@ pub async fn handle_delete_login(
     state: &mut AgentState,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, AgentError> {
-    if state.is_locked {
+    if state.session.is_locked {
         return Err(AgentError::Locked);
     }
     let target_name = payload
@@ -270,12 +270,12 @@ pub async fn handle_delete_login(
         .or_else(|| payload.as_str())
         .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
 
-    let agent = state.vault_agent.clone();
+    let agent = state.services.vault_agent.clone();
     let sym_key = agent.get_symmetric_key().await.ok_or(AgentError::Locked)?;
 
     let all = agent.vault().all().await;
     let mut to_delete = None;
-    let kr = state.keyring.read().await;
+    let kr = state.security.keyring.read().await;
     for c in all {
         if c.r#type == sw_vault::CipherType::Login && c.deleted_date.is_none() {
             let base_key = if let Some(ref org_id) = c.organization_id {
@@ -304,7 +304,7 @@ pub async fn handle_delete_login(
     })?;
 
     if let Some(id) = id_opt {
-        let client = state.api_client.as_ref().or_else(|| agent.api_client());
+        let client = state.services.api_client.as_ref().or_else(|| agent.api_client());
         if let Some(c) = client {
             if let Err(e) = c.delete_cipher(&id).await {
                 tracing::warn!("Failed to delete cipher from server: {e}");

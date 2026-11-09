@@ -949,7 +949,7 @@ async fn test_cli_sync_e2e_agent_receives_sync_data_and_ssh_add_lists_keys() {
 
     // 2. Start agent daemon with this vault_agent
     let mut agent_state = sw_agent::AgentState::default().with_vault_agent(vault_agent.clone());
-    agent_state.config_directory = Some(temp_dir.path().to_path_buf());
+    agent_state.services.config_directory = Some(temp_dir.path().to_path_buf());
     let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, vault_agent.clone());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -2244,8 +2244,8 @@ async fn test_cli_logins_create_server_failure_propagates_error() {
 
     let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default(), va.clone())
         .with_config_directory(temp_dir.path().to_path_buf());
-    agent_state.is_locked = false;
-    agent_state.api_client = Some(client);
+    agent_state.session.is_locked = false;
+    agent_state.services.api_client = Some(client);
 
     let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
 
@@ -2358,8 +2358,8 @@ async fn test_cli_logins_create_server_success_inserts_item() {
 
     let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default(), va.clone())
         .with_config_directory(temp_dir.path().to_path_buf());
-    agent_state.is_locked = false;
-    agent_state.api_client = Some(client);
+    agent_state.session.is_locked = false;
+    agent_state.services.api_client = Some(client);
 
     let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
 
@@ -2432,7 +2432,7 @@ async fn test_cli_logins_create_fails_when_profile_not_synced() {
 
     let mut agent_state = sw_agent::AgentState::new(sw_config::ConfigFile::default(), va.clone())
         .with_config_directory(temp_dir.path().to_path_buf());
-    agent_state.is_locked = false;
+    agent_state.session.is_locked = false;
 
     let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va.clone());
 

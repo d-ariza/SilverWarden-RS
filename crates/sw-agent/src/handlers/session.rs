@@ -20,24 +20,24 @@ pub async fn handle_set_session(
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(ident) = payload.get("identity_url").and_then(|v| v.as_str()) {
-        state.config.identity_url = ident.to_string();
+        state.services.config.identity_url = ident.to_string();
     }
     if let Some(api) = payload.get("api_url").and_then(|v| v.as_str()) {
-        state.config.api_url = api.to_string();
+        state.services.config.api_url = api.to_string();
     }
     if let Some(notif) = payload.get("notifications_url").and_then(|v| v.as_str()) {
-        state.config.notifications_url = notif.to_string();
+        state.services.config.notifications_url = notif.to_string();
     }
     if let Some(insecure) = payload
         .get("danger_accept_invalid_certs")
         .and_then(|v| v.as_bool())
     {
-        state.config.danger_accept_invalid_certs = insecure;
+        state.services.config.danger_accept_invalid_certs = insecure;
     }
 
     if let Some(enc_tok) = payload.get("encrypted_token").and_then(|v| v.as_str()) {
         if !enc_tok.is_empty() {
-            state.config.encrypted_token = enc_tok.to_string();
+            state.services.config.encrypted_token = enc_tok.to_string();
         }
     }
     if let Some(enc_sym) = payload
@@ -45,23 +45,23 @@ pub async fn handle_set_session(
         .and_then(|v| v.as_str())
     {
         if !enc_sym.is_empty() {
-            state.config.encrypted_user_symmetric_key = enc_sym.to_string();
+            state.services.config.encrypted_user_symmetric_key = enc_sym.to_string();
         }
     }
 
     if let Some(token_val) = payload.get("token") {
         if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
-            let identity_url = state.config.identity_url.clone();
-            let api_url = state.config.api_url.clone();
+            let identity_url = state.services.config.identity_url.clone();
+            let api_url = state.services.config.api_url.clone();
             let client = Arc::new(
                 sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
                     identity_url,
                     api_url,
                     token.clone(),
-                    state.config.danger_accept_invalid_certs,
+                    state.services.config.danger_accept_invalid_certs,
                 ),
             );
-            state.api_client = Some(client);
+            state.services.api_client = Some(client);
         }
     }
 
@@ -69,13 +69,13 @@ pub async fn handle_set_session(
         use base64::Engine;
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(sym_key_b64.trim()) {
             if let Ok(sym_key) = sw_crypto::SymmetricKey::from_bytes(&bytes) {
-                state.vault_agent.unlock(sym_key).await;
+                state.services.vault_agent.unlock(sym_key).await;
             }
         }
     }
 
     if let Some(path) = state.config_path() {
-        let _ = save_config_file(&state.config, &path);
+        let _ = save_config_file(&state.services.config, &path);
     }
 
     Ok(serde_json::json!({ "status": "session_saved" }))
@@ -109,14 +109,14 @@ pub async fn handle_status(
     state: &mut AgentState,
     _ctx: &CallingContext,
 ) -> Result<serde_json::Value, AgentError> {
-    let logged_in = !state.is_locked && (state.config.is_logged_in() || state.api_client.is_some());
+    let logged_in = !state.session.is_locked && (state.services.config.is_logged_in() || state.services.api_client.is_some());
     Ok(serde_json::json!({
-        "locked": state.is_locked,
-        "has_pin": state.has_pin,
+        "locked": state.session.is_locked,
+        "has_pin": state.session.has_pin,
         "logged_in": logged_in,
         "version": env!("CARGO_PKG_VERSION"),
-        "pin_cached": state.pin_cache.is_valid(),
-        "pin_cached_remaining_secs": state.pin_cache.remaining().map(|d| d.as_secs()).unwrap_or(0),
+        "pin_cached": state.security.pin_cache.is_valid(),
+        "pin_cached_remaining_secs": state.security.pin_cache.remaining().map(|d| d.as_secs()).unwrap_or(0),
     }))
 }
 
@@ -138,7 +138,7 @@ pub async fn handle_unlock(
     if let Some(map) = payload.as_object() {
         if let Some(enc_tok) = map.get("encrypted_token").and_then(|v| v.as_str()) {
             if !enc_tok.is_empty() {
-                state.config.encrypted_token = enc_tok.to_string();
+                state.services.config.encrypted_token = enc_tok.to_string();
             }
         }
         if let Some(enc_sym) = map
@@ -146,7 +146,7 @@ pub async fn handle_unlock(
             .and_then(|v| v.as_str())
         {
             if !enc_sym.is_empty() {
-                state.config.encrypted_user_symmetric_key = enc_sym.to_string();
+                state.services.config.encrypted_user_symmetric_key = enc_sym.to_string();
             }
         }
     }
@@ -157,26 +157,26 @@ pub async fn handle_unlock(
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(disk_cfg) = serde_json::from_str::<ConfigFile>(&content) {
                     if !disk_cfg.config_key_hash.is_empty() {
-                        state.config.config_key_hash = disk_cfg.config_key_hash;
-                        state.has_pin = true;
+                        state.services.config.config_key_hash = disk_cfg.config_key_hash;
+                        state.session.has_pin = true;
                     }
                     if !disk_cfg.encrypted_token.is_empty() {
-                        state.config.encrypted_token = disk_cfg.encrypted_token;
+                        state.services.config.encrypted_token = disk_cfg.encrypted_token;
                     }
                     if !disk_cfg.encrypted_user_symmetric_key.is_empty() {
-                        state.config.encrypted_user_symmetric_key =
+                        state.services.config.encrypted_user_symmetric_key =
                             disk_cfg.encrypted_user_symmetric_key;
                     }
-                    state.config.identity_url = disk_cfg.identity_url;
-                    state.config.api_url = disk_cfg.api_url;
-                    state.config.notifications_url = disk_cfg.notifications_url;
-                    state.config.danger_accept_invalid_certs = disk_cfg.danger_accept_invalid_certs;
+                    state.services.config.identity_url = disk_cfg.identity_url;
+                    state.services.config.api_url = disk_cfg.api_url;
+                    state.services.config.notifications_url = disk_cfg.notifications_url;
+                    state.services.config.danger_accept_invalid_certs = disk_cfg.danger_accept_invalid_certs;
                 }
             }
         }
     }
 
-    if !state.has_pin {
+    if !state.session.has_pin {
         return Err(AgentError::Unauthorized(
             "No hay PIN configurado en el agente".to_string(),
         ));
@@ -184,10 +184,11 @@ pub async fn handle_unlock(
 
     // 1. Si no hay PIN en el payload: intentar cache hit (evita Argon2i)
     if pin_opt.is_none() {
-        if let Some(config_key) = state.pin_cache.get() {
-            let biometrics_enabled = state.config.runtime_config.biometrics_enabled;
+        if let Some(config_key) = state.security.pin_cache.get() {
+            let biometrics_enabled = state.services.config.runtime_config.biometrics_enabled;
             if biometrics_enabled {
                 match state
+                    .security
                     .biometrics
                     .authenticate("Desbloquear SilverWarden", ctx)
                     .await
@@ -201,31 +202,33 @@ pub async fn handle_unlock(
                 }
             }
 
-            state.is_locked = false;
+            state.session.is_locked = false;
             state
+                .session
                 .sessions
                 .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
             state
+                .session
                 .sessions
                 .create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
 
-            if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
-                if let Ok(token) = state.config.decrypt_token(&config_key) {
-                    state.api_client = Some(Arc::new(
+            if state.services.api_client.is_none() && !state.services.config.encrypted_token.is_empty() {
+                if let Ok(token) = state.services.config.decrypt_token(&config_key) {
+                    state.services.api_client = Some(Arc::new(
                         sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
-                            state.config.identity_url.clone(),
-                            state.config.api_url.clone(),
+                            state.services.config.identity_url.clone(),
+                            state.services.config.api_url.clone(),
                             token,
-                            state.config.danger_accept_invalid_certs,
+                            state.services.config.danger_accept_invalid_certs,
                         ),
                     ));
                 }
             }
 
-            let agent = &state.vault_agent;
-            let sym_key = if !state.config.encrypted_user_symmetric_key.is_empty() {
+            let agent = &state.services.vault_agent;
+            let sym_key = if !state.services.config.encrypted_user_symmetric_key.is_empty() {
                 if let Ok(dec) = sw_config::decrypt_string(
-                    &state.config.encrypted_user_symmetric_key,
+                    &state.services.config.encrypted_user_symmetric_key,
                     &config_key,
                 ) {
                     use base64::Engine;
@@ -257,7 +260,7 @@ pub async fn handle_unlock(
                 }
             }
             if let Some(sk) = agent.get_symmetric_key().await {
-                populate_keyring(&state.keyring, agent.vault(), &sk).await;
+                populate_keyring(&state.security.keyring, agent.vault(), &sk).await;
             }
 
             return Ok(serde_json::json!({
@@ -276,12 +279,14 @@ pub async fn handle_unlock(
     let pin = pin_opt.unwrap();
 
     let (verified, memory_kib) = match state
+        .services
         .config
         .verify_pin_with_params(&pin, AGENT_KDF_MEMORY_KIB)
     {
         Ok(true) => (true, AGENT_KDF_MEMORY_KIB),
         Ok(false) => {
             match state
+                .services
                 .config
                 .verify_pin_with_params(&pin, sw_config::KDF_MEMORY_KIB_TEST)
             {
@@ -305,39 +310,41 @@ pub async fn handle_unlock(
         return Err(AgentError::InvalidPin);
     }
 
-    state.is_locked = false;
+    state.session.is_locked = false;
     state
+        .session
         .sessions
         .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
     state
+        .session
         .sessions
         .create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
 
     let key_res =
-        sw_config::derive_config_key_with_params(&pin, &state.config.device_uuid, memory_kib);
+        sw_config::derive_config_key_with_params(&pin, &state.services.config.device_uuid, memory_kib);
 
     if let Ok(key) = &key_res {
-        state.pin_cache.store(key);
+        state.security.pin_cache.store(key);
 
-        if state.api_client.is_none() && !state.config.encrypted_token.is_empty() {
-            if let Ok(token) = state.config.decrypt_token(key) {
-                state.api_client = Some(Arc::new(
+        if state.services.api_client.is_none() && !state.services.config.encrypted_token.is_empty() {
+            if let Ok(token) = state.services.config.decrypt_token(key) {
+                state.services.api_client = Some(Arc::new(
                     sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
-                        state.config.identity_url.clone(),
-                        state.config.api_url.clone(),
+                        state.services.config.identity_url.clone(),
+                        state.services.config.api_url.clone(),
                         token,
-                        state.config.danger_accept_invalid_certs,
+                        state.services.config.danger_accept_invalid_certs,
                     ),
                 ));
             }
         }
     }
 
-    let agent = &state.vault_agent;
+    let agent = &state.services.vault_agent;
     if let Ok(key) = key_res {
-        let sym_key = if !state.config.encrypted_user_symmetric_key.is_empty() {
+        let sym_key = if !state.services.config.encrypted_user_symmetric_key.is_empty() {
             if let Ok(dec) =
-                sw_config::decrypt_string(&state.config.encrypted_user_symmetric_key, &key)
+                sw_config::decrypt_string(&state.services.config.encrypted_user_symmetric_key, &key)
             {
                 use base64::Engine;
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(dec.trim()) {
@@ -367,7 +374,7 @@ pub async fn handle_unlock(
         }
     }
     if let Some(sk) = agent.get_symmetric_key().await {
-        populate_keyring(&state.keyring, agent.vault(), &sk).await;
+        populate_keyring(&state.security.keyring, agent.vault(), &sk).await;
     }
 
     Ok(serde_json::json!({ "status": "unlocked", "from_cache": false }))
@@ -377,12 +384,12 @@ pub async fn handle_lock(
     state: &mut AgentState,
     _ctx: &CallingContext,
 ) -> Result<serde_json::Value, AgentError> {
-    state.pin_cache.clear();
-    state.is_locked = true;
-    state.sessions.wipe();
-    let va = state.vault_agent.clone();
-    let notifier = state.notifier.clone();
-    let state_kr = state.keyring.clone();
+    state.security.pin_cache.clear();
+    state.session.is_locked = true;
+    state.session.sessions.wipe();
+    let va = state.services.vault_agent.clone();
+    let notifier = state.security.notifier.clone();
+    let state_kr = state.security.keyring.clone();
     va.lock().await;
     state_kr.write().await.lock();
     let _ = notifier.notify("SilverWarden", "Bóveda bloqueada").await;
@@ -407,7 +414,7 @@ pub fn handle_pin_set(
         }
     };
 
-    if state.has_pin {
+    if state.session.has_pin {
         return Err(AgentError::Validation(
             "El PIN ya está configurado. Usa PinUpdate para cambiarlo.".to_string(),
         ));
@@ -415,16 +422,16 @@ pub fn handle_pin_set(
 
     let key = sw_config::derive_config_key_with_params(
         pin,
-        &state.config.device_uuid,
+        &state.services.config.device_uuid,
         AGENT_KDF_MEMORY_KIB,
     )
     .map_err(|e| AgentError::ServerError(format!("Error al derivar clave de PIN: {e}")))?;
-    state.config.config_key_hash = sw_config::hash_config_key(&key);
-    state.has_pin = true;
-    state.pin_cache.store(&key);
+    state.services.config.config_key_hash = sw_config::hash_config_key(&key);
+    state.session.has_pin = true;
+    state.security.pin_cache.store(&key);
 
     if let Some(path) = state.config_path() {
-        let _ = save_config_file(&state.config, &path);
+        let _ = save_config_file(&state.services.config, &path);
     }
 
     Ok(serde_json::json!({ "status": "pin_set" }))
@@ -453,15 +460,16 @@ pub fn handle_pin_update(
             }
         };
 
-    if !state.has_pin {
+    if !state.session.has_pin {
         return Err(AgentError::Validation(
             "El PIN no está configurado. Usa PinSet.".to_string(),
         ));
     }
 
-    state.pin_cache.clear();
+    state.security.pin_cache.clear();
 
     state
+        .services
         .config
         .update_pin_with_params(old_pin, new_pin, AGENT_KDF_MEMORY_KIB)
         .map_err(|e| {
@@ -474,21 +482,21 @@ pub fn handle_pin_update(
 
     if let Ok(new_key) = sw_config::derive_config_key_with_params(
         new_pin,
-        &state.config.device_uuid,
+        &state.services.config.device_uuid,
         AGENT_KDF_MEMORY_KIB,
     ) {
-        state.pin_cache.store(&new_key);
+        state.security.pin_cache.store(&new_key);
     }
 
     if let Some(path) = state.config_path() {
-        let _ = save_config_file(&state.config, &path);
+        let _ = save_config_file(&state.services.config, &path);
     }
 
     Ok(serde_json::json!({ "status": "pin_updated" }))
 }
 
 pub fn handle_agent_shutdown(state: &mut AgentState) -> Result<serde_json::Value, AgentError> {
-    if let Some(tx) = &state.shutdown_sender {
+    if let Some(tx) = &state.services.shutdown_sender {
         let _ = tx.try_send(());
     }
     Ok(serde_json::json!({ "status": "shutting_down" }))

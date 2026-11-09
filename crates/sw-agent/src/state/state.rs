@@ -133,23 +133,41 @@ impl Default for PinCache {
     }
 }
 
-/// Central state maintained by the agent daemon.
+/// Security-related state: biometrics, pin cache, keyring, notifier, clock, last activity.
 #[derive(Clone, Debug)]
-pub struct AgentState {
-    pub config: ConfigFile,
+pub struct SecurityContext {
+    pub biometrics: Arc<dyn sw_systemauth::Biometrics>,
+    pub pin_cache: PinCache,
+    pub keyring: Arc<tokio::sync::RwLock<sw_crypto::Keyring>>,
+    pub notifier: Arc<dyn sw_notify::Notifier>,
+    pub clock: Arc<dyn Clock>,
+    pub last_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+}
+
+/// Session-related state: sessions, locked flag, pin configured flag.
+#[derive(Clone, Debug)]
+pub struct SessionContext {
     pub sessions: SessionStore,
     pub is_locked: bool,
     pub has_pin: bool,
-    pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+/// Daemon services: vault agent, api client, shutdown channel, config, config directory.
+#[derive(Clone, Debug)]
+pub struct DaemonServices {
     pub vault_agent: Arc<VaultAgentServer>,
-    pub config_directory: Option<PathBuf>,
     pub api_client: Option<Arc<sw_bitwarden_api::AuthenticatedClient>>,
-    pub pin_cache: PinCache,
-    pub notifier: Arc<dyn sw_notify::Notifier>,
-    pub last_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
-    pub clock: Arc<dyn Clock>,
-    pub biometrics: Arc<dyn sw_systemauth::Biometrics>,
-    pub keyring: Arc<tokio::sync::RwLock<sw_crypto::Keyring>>,
+    pub shutdown_sender: Option<tokio::sync::mpsc::Sender<()>>,
+    pub config: ConfigFile,
+    pub config_directory: Option<PathBuf>,
+}
+
+/// Central state maintained by the agent daemon.
+#[derive(Clone, Debug)]
+pub struct AgentState {
+    pub security: SecurityContext,
+    pub session: SessionContext,
+    pub services: DaemonServices,
 }
 
 impl AgentState {
@@ -157,75 +175,81 @@ impl AgentState {
         let has_pin = !config.config_key_hash.is_empty();
         let pin_cache_ttl = Duration::from_secs(config.runtime_config.pin_cache_ttl_secs);
         Self {
-            config,
-            sessions: SessionStore::new(),
-            is_locked: true,
-            has_pin,
-            shutdown_sender: None,
-            vault_agent,
-            config_directory: None,
-            api_client: None,
-            pin_cache: PinCache::new(pin_cache_ttl),
-            notifier: Arc::new(sw_notify::DbusNotifier::new()),
-            last_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
-            clock: Arc::new(SystemClock),
-            biometrics: Arc::new(sw_systemauth::PolkitBiometrics::new()),
-            keyring: Arc::new(tokio::sync::RwLock::new(sw_crypto::Keyring::new())),
+            security: SecurityContext {
+                biometrics: Arc::new(sw_systemauth::PolkitBiometrics::new()),
+                pin_cache: PinCache::new(pin_cache_ttl),
+                keyring: Arc::new(tokio::sync::RwLock::new(sw_crypto::Keyring::new())),
+                notifier: Arc::new(sw_notify::DbusNotifier::new()),
+                clock: Arc::new(SystemClock),
+                last_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+            },
+            session: SessionContext {
+                sessions: SessionStore::new(),
+                is_locked: true,
+                has_pin,
+            },
+            services: DaemonServices {
+                vault_agent,
+                api_client: None,
+                shutdown_sender: None,
+                config,
+                config_directory: None,
+            },
         }
     }
 
     /// Touches the last activity timestamp, resetting the inactivity counter.
     pub async fn touch_activity(&self) {
-        let mut guard = self.last_activity.write().await;
-        *guard = self.clock.now();
+        let mut guard = self.security.last_activity.write().await;
+        *guard = self.security.clock.now();
     }
 
     /// Returns the duration elapsed since the last IPC or user activity.
     pub async fn idle_duration(&self) -> Duration {
-        let guard = self.last_activity.read().await;
-        self.clock.now().saturating_duration_since(*guard)
+        let guard = self.security.last_activity.read().await;
+        self.security.clock.now().saturating_duration_since(*guard)
     }
 
     /// Returns the configured idle time-to-live before automatic lock.
     pub async fn idle_ttl(&self) -> Duration {
-        Duration::from_secs(self.config.runtime_config.idle_ttl_secs)
+        Duration::from_secs(self.services.config.runtime_config.idle_ttl_secs)
     }
 
     /// Sets an injectable desktop notifier.
     pub fn with_notifier(mut self, notifier: Arc<dyn sw_notify::Notifier>) -> Self {
-        self.notifier = notifier;
+        self.security.notifier = notifier;
         self
     }
 
     /// Sets an injectable clock for deterministic time in pin cache and timeout operations.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.pin_cache = PinCache::with_clock(self.pin_cache.ttl(), clock.clone());
-        self.clock = clock;
+        self.security.pin_cache = PinCache::with_clock(self.security.pin_cache.ttl(), clock.clone());
+        self.security.clock = clock;
         self
     }
 
     /// Sets an injectable biometrics backend.
     pub fn with_biometrics(mut self, biometrics: Arc<dyn sw_systemauth::Biometrics>) -> Self {
-        self.biometrics = biometrics;
+        self.security.biometrics = biometrics;
         self
     }
 
     /// Sets an authenticated API client in state.
     pub fn with_api_client(mut self, client: Arc<sw_bitwarden_api::AuthenticatedClient>) -> Self {
-        self.api_client = Some(client);
+        self.services.api_client = Some(client);
         self
     }
 
     /// Sets an injectable configuration directory for saving and loading config.
     pub fn with_config_directory(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.config_directory = Some(dir.into());
+        self.services.config_directory = Some(dir.into());
         self
     }
 
     /// Returns the target path for saving/loading configuration.
     /// In test mode (`#[cfg(test)]`), this NEVER touches `$HOME` unless `config_directory` was explicitly set.
     pub fn config_path(&self) -> Option<PathBuf> {
-        if let Some(dir) = &self.config_directory {
+        if let Some(dir) = &self.services.config_directory {
             if dir.ends_with("goldwarden.json") {
                 Some(dir.clone())
             } else {
@@ -250,13 +274,13 @@ impl AgentState {
     pub fn vault_path(&self) -> Option<PathBuf> {
         #[cfg(test)]
         {
-            self.config_directory
+            self.services.config_directory
                 .as_ref()
                 .map(|dir| dir.join("vault.json"))
         }
         #[cfg(not(test))]
         {
-            if let Some(dir) = &self.config_directory {
+            if let Some(dir) = &self.services.config_directory {
                 Some(dir.join("vault.json"))
             } else {
                 sw_vault::VaultPaths::default_paths()
@@ -268,7 +292,7 @@ impl AgentState {
 
     /// Sets the `VaultAgentServer` instance in state.
     pub fn with_vault_agent(mut self, agent: Arc<VaultAgentServer>) -> Self {
-        self.vault_agent = agent;
+        self.services.vault_agent = agent;
         self
     }
 
@@ -294,14 +318,14 @@ impl AgentState {
     ) -> Self {
         let mut state = Self::new(ConfigFile::default(), vault_agent);
         if let Some(dir) = config_dir {
-            state.config_directory = Some(dir);
+            state.services.config_directory = Some(dir);
         }
         if let Some(path) = state.config_path() {
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(cfg) = serde_json::from_str::<ConfigFile>(&content) {
-                        state.config = cfg;
-                        state.has_pin = !state.config.config_key_hash.is_empty();
+                        state.services.config = cfg;
+                        state.session.has_pin = !state.services.config.config_key_hash.is_empty();
                         return state;
                     }
                 }
