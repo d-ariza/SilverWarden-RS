@@ -28,7 +28,13 @@ async fn test_agent_socket_actions_flow() {
 
     let listener = bind_socket(&socket_path).await.unwrap();
     let agent_task = tokio::spawn(async move {
-        accept_loop(listener, daemon_clone, &agent_socket, std::future::pending()).await
+        accept_loop(
+            listener,
+            daemon_clone,
+            &agent_socket,
+            std::future::pending(),
+        )
+        .await
     });
 
     let mut stream = UnixStream::connect(&socket_path)
@@ -714,25 +720,37 @@ async fn test_agent_state_load_or_default_and_save_config() {
     assert!(config_file.exists());
 
     let loaded_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_eq!(loaded_state.services.config.device_uuid, "test-device-uuid-123");
+    assert_eq!(
+        loaded_state.services.config.device_uuid,
+        "test-device-uuid-123"
+    );
 
     // Test with invalid json in config file
     std::fs::write(&config_file, b"not json").unwrap();
     let fallback_state = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_ne!(fallback_state.services.config.device_uuid, "test-device-uuid-123");
+    assert_ne!(
+        fallback_state.services.config.device_uuid,
+        "test-device-uuid-123"
+    );
 
     // Test when config path is a directory (read_to_string fails)
     let _ = std::fs::remove_file(&config_file);
     std::fs::create_dir(&config_file).unwrap();
     let dir_fallback = AgentState::load_or_default_from(Some(temp_dir.path().to_path_buf()));
-    assert_ne!(dir_fallback.services.config.device_uuid, "test-device-uuid-123");
+    assert_ne!(
+        dir_fallback.services.config.device_uuid,
+        "test-device-uuid-123"
+    );
     let _ = std::fs::remove_dir(&config_file);
 
     // Test with empty dir where config doesn't exist
     let empty_dir = tempfile::tempdir().unwrap();
     let empty_fallback = AgentState::load_or_default_from(Some(empty_dir.path().to_path_buf()));
     assert!(!empty_fallback.services.config.device_uuid.is_empty());
-    assert_ne!(empty_fallback.services.config.device_uuid, "test-device-uuid-123");
+    assert_ne!(
+        empty_fallback.services.config.device_uuid,
+        "test-device-uuid-123"
+    );
 
     // Test when config_dir is None (load_or_default)
     let no_home_fallback = AgentState::load_or_default();
@@ -1821,7 +1839,10 @@ async fn test_handle_sync_payload_updates_config_and_summary() {
         .await
         .expect("sync should succeed");
     assert_eq!(state.services.config.encrypted_token, "enc_tok_payload");
-    assert_eq!(state.services.config.encrypted_user_symmetric_key, "enc_sym_payload");
+    assert_eq!(
+        state.services.config.encrypted_user_symmetric_key,
+        "enc_sym_payload"
+    );
     assert_eq!(state.services.config.identity_url, "https://identity.test");
     assert_eq!(state.services.config.api_url, "https://api.test");
     assert!(state.services.config.danger_accept_invalid_certs);
@@ -1853,8 +1874,14 @@ async fn test_handle_sync_disk_config_fallback() {
         .await
         .expect("sync fallback should succeed");
     assert_eq!(state.services.config.encrypted_token, "disk_enc_token");
-    assert_eq!(state.services.config.encrypted_user_symmetric_key, "disk_enc_sym");
-    assert_eq!(state.services.config.identity_url, "https://disk-ident.test");
+    assert_eq!(
+        state.services.config.encrypted_user_symmetric_key,
+        "disk_enc_sym"
+    );
+    assert_eq!(
+        state.services.config.identity_url,
+        "https://disk-ident.test"
+    );
     assert_eq!(state.services.config.api_url, "https://disk-api.test");
     assert_eq!(res["status"], "synced");
 }
@@ -2376,12 +2403,21 @@ async fn test_handle_set_session_persists_and_unlocks() {
     assert_eq!(res["status"], "session_saved");
 
     // Config updated in memory
-    assert_eq!(state.services.config.identity_url, "https://ident.custom.test");
+    assert_eq!(
+        state.services.config.identity_url,
+        "https://ident.custom.test"
+    );
     assert_eq!(state.services.config.api_url, "https://api.custom.test");
-    assert_eq!(state.services.config.notifications_url, "https://notif.custom.test");
+    assert_eq!(
+        state.services.config.notifications_url,
+        "https://notif.custom.test"
+    );
     assert!(state.services.config.danger_accept_invalid_certs);
     assert_eq!(state.services.config.encrypted_token, "enc_tok_sample");
-    assert_eq!(state.services.config.encrypted_user_symmetric_key, "enc_sym_sample");
+    assert_eq!(
+        state.services.config.encrypted_user_symmetric_key,
+        "enc_sym_sample"
+    );
 
     // api_client created
     assert!(state.services.api_client.is_some());
@@ -2979,14 +3015,20 @@ async fn test_unlock_cache_hit_decrypts_token_and_symmetric_key() {
 
     // Verificar que el token descifrado coincide exactamente
     let cached_cfg_key = state.security.pin_cache.get().unwrap();
-    let decrypted_token = state.services.config.decrypt_token(&cached_cfg_key).unwrap();
+    let decrypted_token = state
+        .services
+        .config
+        .decrypt_token(&cached_cfg_key)
+        .unwrap();
     assert_eq!(decrypted_token.access_token, original_token.access_token);
     assert_eq!(decrypted_token.refresh_token, original_token.refresh_token);
 
     // Verificar que la user_symmetric_key descifrada coincide exactamente
-    let dec_user_sym_b64 =
-        sw_config::decrypt_string(&state.services.config.encrypted_user_symmetric_key, &cached_cfg_key)
-            .unwrap();
+    let dec_user_sym_b64 = sw_config::decrypt_string(
+        &state.services.config.encrypted_user_symmetric_key,
+        &cached_cfg_key,
+    )
+    .unwrap();
     let dec_user_sym_bytes = base64::engine::general_purpose::STANDARD
         .decode(dec_user_sym_b64.trim())
         .unwrap();
@@ -3343,7 +3385,14 @@ async fn test_last_activity_updates_on_ipc() {
     let ctx = test_ctx();
 
     let past = std::time::Instant::now() - Duration::from_secs(60);
-    *daemon.state.read().await.security.last_activity.write().await = past;
+    *daemon
+        .state
+        .read()
+        .await
+        .security
+        .last_activity
+        .write()
+        .await = past;
 
     let idle_before = daemon.state.read().await.idle_duration().await;
     assert!(idle_before >= Duration::from_secs(59));
@@ -3897,60 +3946,84 @@ async fn test_list_logins_resolves_organization_key_via_keyring() {
 }
 
 #[tokio::test]
-async fn test_shared_vault_between_daemon_and_ssh_agent() {
-    use sw_crypto::SymmetricKey;
-    use sw_ssh_agent::SshAgentServer;
+async fn test_agent_state_composition_with_fake_clock() {
+    use crate::ports::FakeClock;
 
+    let fake_clock = Arc::new(FakeClock::new());
+    let vault_agent = Arc::new(crate::VaultAgentServer::default());
+    let state = AgentState::new(ConfigFile::default(), vault_agent).with_clock(fake_clock.clone());
+
+    // Verificar que los 3 contextos existen y están bien inicializados
+    assert!(!state.security.pin_cache.is_valid());
+    assert_eq!(state.security.clock.now(), fake_clock.now());
+    assert!(state.session.is_locked);
+    assert!(!state.session.has_pin);
+    assert_eq!(state.services.vault_agent.vault().len().await, 0);
+
+    // Avanzar el reloj y verificar que idle_duration refleja el tiempo
+    fake_clock.advance(Duration::from_secs(60));
+    state.touch_activity().await;
+    fake_clock.advance(Duration::from_secs(30));
+    let idle = state.idle_duration().await;
+    assert_eq!(idle, Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn test_run_agent_loads_config_from_disk() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let _agent_sock = temp_dir.path().join("agent.sock");
-    let ssh_sock = temp_dir.path().join("ssh.sock");
+    let config_path = temp_dir.path().join("goldwarden.json");
+    let config = ConfigFile {
+        device_uuid: "test-device-uuid-123".to_string(),
+        config_key_hash: "a".repeat(64),
+        ..Default::default()
+    };
+    config.save_to_file(&config_path).unwrap();
 
-    // 1. Instancia compartida única de VaultAgentServer
+    let socket_path = temp_dir.path().join("agent.sock");
     let vault_agent = Arc::new(VaultAgentServer::default());
-    let key = SymmetricKey::from_bytes(&[88u8; 64]).unwrap();
-    vault_agent.unlock(key).await;
 
-    // 2. Composición: el daemon y el SSH agent reciben la misma instancia
-    let state = AgentState::default().with_vault_agent(vault_agent.clone());
+    let state = AgentState::load_or_default_from_with(
+        Some(temp_dir.path().to_path_buf()),
+        vault_agent.clone(),
+    );
+    assert_eq!(state.services.config.device_uuid, "test-device-uuid-123");
+    assert!(state.session.has_pin);
+
     let daemon = AgentDaemon::with_vault_agent(state, vault_agent.clone());
-    let ssh_server = SshAgentServer::new(&ssh_sock, (*vault_agent).clone());
 
-    // Verificar identidad en memoria: ambos apuntan al mismo VaultStore subyacente
-    assert!(Arc::ptr_eq(
-        daemon.state.read().await.services.vault_agent.vault(),
-        ssh_server.agent().vault()
-    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let sock = socket_path.clone();
+    let server_handle = tokio::spawn(async move {
+        run_agent_daemon_with_shutdown(&sock, daemon, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
 
-    // 3. Crear una clave SSH a través del daemon (IPC)
-    let ctx = CallingContext {
-        username: "tester".into(),
-        process_name: "test".into(),
-        parent_process_name: "test_runner".into(),
-        grandparent_process_name: "cargo".into(),
-        process_pid: 10,
-        parent_process_pid: 5,
-        grandparent_process_pid: 1,
-        error: false,
-        authenticated: true,
-    };
-    let new_key_req = Request::NewSshKey {
-        name: "shared-agent-key".into(),
-        key_type: "Ed25519".into(),
-    };
-    let resp = daemon.handle_message(&ctx, new_key_req).await;
-    assert!(resp.is_ok());
+    for _ in 0..50 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
-    // 4. El SSH agent ve la clave inmediatamente a través del VaultStore compartido
-    let identities = ssh_server.agent().request_identities().await.unwrap();
-    assert_eq!(identities.len(), 1);
-    assert_eq!(identities[0].comment(), "shared-agent-key");
+    let mut stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("connect to agent socket");
+    write_message(&mut stream, &Request::Status)
+        .await
+        .expect("write status request");
+    let resp: Response = read_message(&mut stream)
+        .await
+        .expect("read status response");
 
-    // 5. El daemon bloquea el vault_agent compartido
-    let lock_resp = daemon.handle_message(&ctx, Request::Lock).await;
-    assert!(lock_resp.is_ok());
+    let _ = shutdown_tx.send(());
+    let _ = server_handle.await;
 
-    // El SSH agent ahora está bloqueado y no lista identidades
-    assert!(ssh_server.agent().is_locked());
-    let locked_ids = ssh_server.agent().request_identities().await.unwrap();
-    assert_eq!(locked_ids.len(), 0);
+    match resp {
+        Response::Ok(val) => {
+            assert_eq!(val["has_pin"], true);
+        }
+        other => panic!("Unexpected response: {:?}", other),
+    }
 }

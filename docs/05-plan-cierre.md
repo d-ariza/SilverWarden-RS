@@ -150,27 +150,27 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 1.2. Subdivisión de `AgentState`
 
-- [ ] **1.2.1 — Definir `SecurityContext`**
+- [x] **1.2.1 — Definir `SecurityContext`**
   - Campos: `biometrics`, `pin_cache`, `keyring`, `notifier`, `clock`, `last_activity`.
   - Límite: 6 campos.
   - Verificación: `cargo check -p sw-agent`.
 
-- [ ] **1.2.2 — Definir `SessionContext`**
+- [x] **1.2.2 — Definir `SessionContext`**
   - Campos: `sessions`, `is_locked`, `has_pin`.
   - Límite: 3 campos.
   - Verificación: `cargo check -p sw-agent`.
 
-- [ ] **1.2.3 — Definir `DaemonServices`**
+- [x] **1.2.3 — Definir `DaemonServices`**
   - Campos: `vault_agent`, `api_client`, `shutdown_sender`, `config`, `config_directory`.
   - Límite: 5 campos.
   - Verificación: `cargo check -p sw-agent`.
 
-- [ ] **1.2.4 — Componer `AgentState`**
+- [x] **1.2.4 — Componer `AgentState`**
   - `AgentState { security: SecurityContext, session: SessionContext, services: DaemonServices }`.
   - Total: 3 campos.
   - Verificación: `grep -A 6 "pub struct AgentState" crates/sw-agent/src/state/state.rs`.
 
-- [ ] **1.2.5 — Actualizar handlers**
+- [x] **1.2.5 — Actualizar handlers**
   - Objetivo: que los handlers sigan recibiendo `&mut AgentState` compuesto.
   - Pasos:
     - No intentar “un sub-contexto por handler”: `handle_unlock`, `handle_sync` y `handle_list_logins` necesitan 2-3 contextos.
@@ -179,11 +179,11 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Verificación: `cargo test -p sw-agent` y `cargo clippy -p sw-agent -- -D warnings`.
   - DoD: cada sub-struct tiene ≤6 campos; `AgentState` tiene 3.
 
-- [ ] **1.2.6 — Actualizar constructores y métodos**
+- [x] **1.2.6 — Actualizar constructores y métodos**
   - `AgentState::new`, `load_or_default_with`, `with_vault_agent`, `with_config_directory`, `vault_path`, `touch_activity`.
   - Verificación: `cargo test -p sw-agent` en verde.
 
-- [ ] **1.2.7 — Test de composición**
+- [x] **1.2.7 — Test de composición**
   - Un test que construya `AgentState` con `FakeClock` y verifique que los tres contextos se actualizan correctamente.
   - Verificación: `cargo test -p sw-agent agent_state`.
 
