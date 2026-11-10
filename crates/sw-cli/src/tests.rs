@@ -1295,7 +1295,10 @@ async fn test_agent_start_launches_both_sockets() {
 
     // Verify ssh-add -L against the SSH agent socket responds with "no identities" (exit code 1)
     let ssh_add_available = std::env::var("PATH")
-        .map(|p| p.split(':').any(|dir| std::path::Path::new(dir).join("ssh-add").exists()))
+        .map(|p| {
+            p.split(':')
+                .any(|dir| std::path::Path::new(dir).join("ssh-add").exists())
+        })
         .unwrap_or(false);
     if !ssh_add_available {
         eprintln!("ssh-add not found in PATH, skipping the rest of the test");
@@ -1313,6 +1316,145 @@ async fn test_agent_start_launches_both_sockets() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("The agent has no identities.")
+            || stdout.contains("The agent has no identities.")
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_shared_vault_between_daemon_and_ssh_agent() {
+    let _env_lock = ASYNC_ENV_MUTEX.lock().await;
+    let _path_lock = PATH_MUTEX.lock().await;
+    let _guard_home = EnvGuard::new("HOME");
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    unsafe {
+        std::env::set_var("HOME", temp_dir.path());
+    }
+    let main_sock = temp_dir.path().join(".silverwarden.sock");
+    let ssh_sock = temp_dir.path().join(".silverwarden-ssh-agent.sock");
+
+    let cli = test_cli(
+        Some(main_sock.clone()),
+        Commands::Agent {
+            action: AgentCommands::Start { no_ssh: false },
+        },
+    );
+
+    let handle = tokio::spawn(async move {
+        let _ = handle_command(&cli, |_| Ok(String::new())).await;
+    });
+
+    let mut both_exist = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if main_sock.exists() && ssh_sock.exists() {
+            both_exist = true;
+            break;
+        }
+    }
+    assert!(both_exist, "Both sockets should exist after agent start");
+
+    let ssh_add_available = std::env::var("PATH")
+        .map(|p| {
+            p.split(':')
+                .any(|dir| std::path::Path::new(dir).join("ssh-add").exists())
+        })
+        .unwrap_or(false);
+    if !ssh_add_available {
+        eprintln!("ssh-add not found in PATH, skipping the rest of the test");
+        handle.abort();
+        return;
+    }
+
+    // 1. Initially the agent has no identities
+    let output = tokio::process::Command::new("ssh-add")
+        .arg("-L")
+        .env("SSH_AUTH_SOCK", &ssh_sock)
+        .output()
+        .await
+        .expect("Failed to execute ssh-add");
+    assert_eq!(output.status.code(), Some(1));
+
+    // 2. Connect to the daemon via IPC on main_sock
+    let mut stream = tokio::net::UnixStream::connect(&main_sock)
+        .await
+        .expect("Client should connect to daemon socket");
+
+    // Configure PIN and unlock
+    sw_ipc::write_message(
+        &mut stream,
+        &sw_ipc::Request::PinSet {
+            pin: "testpin123".into(),
+        },
+    )
+    .await
+    .expect("Failed to write PinSet request");
+    let pin_resp: sw_ipc::Response = sw_ipc::read_message(&mut stream)
+        .await
+        .expect("Failed to read PinSet response");
+    assert!(pin_resp.is_ok());
+
+    sw_ipc::write_message(
+        &mut stream,
+        &sw_ipc::Request::Unlock {
+            pin: Some("testpin123".into()),
+        },
+    )
+    .await
+    .expect("Failed to write Unlock request");
+    let unlock_resp: sw_ipc::Response = sw_ipc::read_message(&mut stream)
+        .await
+        .expect("Failed to read Unlock response");
+    assert!(unlock_resp.is_ok());
+
+    // 3. Create a new SSH key via the daemon's IPC
+    sw_ipc::write_message(
+        &mut stream,
+        &sw_ipc::Request::NewSshKey {
+            name: "shared-daemon-ssh-key".into(),
+            key_type: "Ed25519".into(),
+        },
+    )
+    .await
+    .expect("Failed to write NewSshKey request");
+    let key_resp: sw_ipc::Response = sw_ipc::read_message(&mut stream)
+        .await
+        .expect("Failed to read NewSshKey response");
+    assert!(key_resp.is_ok());
+
+    // 4. Query ssh-add -L: the SSH agent immediately serves the key from the shared vault
+    let output_key = tokio::process::Command::new("ssh-add")
+        .arg("-L")
+        .env("SSH_AUTH_SOCK", &ssh_sock)
+        .output()
+        .await
+        .expect("Failed to execute ssh-add with key");
+    assert_eq!(output_key.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output_key.stdout);
+    assert!(stdout.contains("shared-daemon-ssh-key"));
+
+    // 5. Lock the vault via the daemon IPC
+    sw_ipc::write_message(&mut stream, &sw_ipc::Request::Lock)
+        .await
+        .expect("Failed to write Lock request");
+    let lock_resp: sw_ipc::Response = sw_ipc::read_message(&mut stream)
+        .await
+        .expect("Failed to read Lock response");
+    assert!(lock_resp.is_ok());
+
+    // 6. Query ssh-add -L again: now locked, no identities returned
+    let output_locked = tokio::process::Command::new("ssh-add")
+        .arg("-L")
+        .env("SSH_AUTH_SOCK", &ssh_sock)
+        .output()
+        .await
+        .expect("Failed to execute ssh-add after lock");
+    assert_eq!(output_locked.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output_locked.stderr);
+    let stdout = String::from_utf8_lossy(&output_locked.stdout);
     assert!(
         stderr.contains("The agent has no identities.")
             || stdout.contains("The agent has no identities.")

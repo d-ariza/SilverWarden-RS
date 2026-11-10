@@ -441,6 +441,7 @@ impl AgentDaemon {
     }
 }
 
+#[cfg(test)]
 impl Default for AgentDaemon {
     fn default() -> Self {
         let va = Arc::new(VaultAgentServer::default());
@@ -501,7 +502,7 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let daemon = AgentDaemon::with_vault_agent(
-        AgentState::new(ConfigFile::default(), vault_agent.clone()),
+        AgentState::load_or_default_with(vault_agent.clone()),
         vault_agent,
     );
     run_agent_daemon_with_shutdown(socket_path, daemon, shutdown_signal).await

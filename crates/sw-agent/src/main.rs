@@ -1,13 +1,14 @@
-use sw_agent::AgentDaemon;
-use tracing::info;
+use std::sync::Arc;
+use sw_ssh_agent::VaultAgentServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    info!("Starting silverWarden agent daemon...");
+    tracing::info!("Starting silverWarden agent daemon...");
 
-    let _daemon = AgentDaemon::default();
-    info!("silverWarden daemon initialized successfully");
+    let socket_path = sw_agent::default_socket_path()?;
+    let vault_agent = Arc::new(VaultAgentServer::default());
+    sw_agent::run_agent(&socket_path, vault_agent).await?;
 
     Ok(())
 }
