@@ -125,7 +125,11 @@ pub async fn handle_sync(
 
     let agent = state.services.vault_agent.clone();
 
-    let client = state.services.api_client.as_ref().or_else(|| agent.api_client());
+    let client = state
+        .services
+        .api_client
+        .as_ref()
+        .or_else(|| agent.api_client());
     if let Some(c) = client {
         match c.sync().await {
             Ok(sync_data) => {

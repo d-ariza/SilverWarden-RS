@@ -3705,9 +3705,9 @@ dependencies = [
  "sw-crypto",
  "sw-ipc",
  "sw-notify",
- "sw-ssh-agent",
  "sw-systemauth",
  "sw-vault",
+ "sw-vault-agent",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3784,6 +3784,7 @@ dependencies = [
  "sw-ipc",
  "sw-ssh-agent",
  "sw-vault",
+ "sw-vault-agent",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3879,11 +3880,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ssh-key 0.6.7",
- "sw-bitwarden-api",
- "sw-crypto",
- "sw-notify",
- "sw-systemauth",
- "sw-vault",
+ "sw-vault-agent",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3919,6 +3916,27 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "sw-vault-agent"
+version = "0.1.0"
+dependencies = [
+ "rand 0.10.3",
+ "russh",
+ "serde",
+ "serde_json",
+ "sw-bitwarden-api",
+ "sw-crypto",
+ "sw-notify",
+ "sw-systemauth",
+ "sw-vault",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

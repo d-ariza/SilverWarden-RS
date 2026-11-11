@@ -189,15 +189,15 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 1.3. Composición única de `VaultAgentServer`
 
-- [ ] **1.3.1 — Eliminar el singleton**
+- [x] **1.3.1 — Eliminar el singleton**
   - Borrar `static SHARED_VAULT_AGENT` y `pub fn shared_vault_agent()` de `crates/sw-ssh-agent/src/lib.rs`.
   - Verificación: `grep -rn "shared_vault_agent" crates/` vacío.
 
-- [ ] **1.3.2 — Eliminar `for_shared_agent`**
+- [x] **1.3.2 — Eliminar `for_shared_agent`**
   - Borrar `SshAgentServer::for_shared_agent`.
   - Verificación: `grep -rn "for_shared_agent" crates/` vacío.
 
-- [ ] **1.3.3 — Crear la composición en `sw-cli`**
+- [x] **1.3.3 — Crear la composición en `sw-cli`**
   - En `crates/sw-cli/src/commands/agent.rs`:
     - Crear un solo `let vault_agent = Arc::new(VaultAgentServer::default());`.
     - Construir `let daemon = AgentDaemon::with_vault_agent(AgentState::load_or_default_with(vault_agent.clone()), vault_agent.clone());`.
@@ -205,12 +205,12 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
     - Construir `SshAgentServer::new(ssh_sock, (*vault_agent).clone())`.
   - Verificación: el código compila y ambos servidores comparten la misma instancia.
 
-- [ ] **1.3.4 — `AgentDaemon::new()` deja de crear su propio agente**
+- [x] **1.3.4 — `AgentDaemon::new()` deja de crear su propio agente**
   - Opción A: eliminar `AgentDaemon::new()` y usar siempre `with_vault_agent`.
   - Opción B: mantener `new()` solo para tests y documentarlo.
   - Verificación: `grep -rn "VaultAgentServer::default()" crates/sw-agent/src/lib.rs` no aparece en producción.
 
-- [ ] **1.3.5 — Test de integración del vault compartido**
+- [x] **1.3.5 — Test de integración del vault compartido**
   - Arrancar daemon y SSH agent con la misma instancia.
   - Desbloquear por el daemon.
   - Pedir `ListSshKeys` por el socket SSH y comprobar que devuelve las claves.
@@ -219,19 +219,19 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 1.4. Dirección de dependencias
 
-- [ ] **1.4.1 — Mover `VaultAgentServer` a un crate neutral**
+- [x] **1.4.1 — Mover `VaultAgentServer` a un crate neutral**
   - Opción recomendada: crear `crates/sw-vault-agent` con `VaultAgentServer`, `ApprovalProvider` y la lógica de sesión. Ese crate depende de `sw-vault`, `sw-crypto`, `sw-systemauth`, `sw-bitwarden-api`, `sw-notify` y `russh`.
   - `sw-agent` y `sw-ssh-agent` dependen de `sw-vault-agent`.
   - Alternativa: mantenerlo en `sw-ssh-agent` y documentar la excepción con ADR-0007.
   - Verificación: `cargo tree -p sw-agent | grep sw-ssh-agent` vacío.
   - DoD: el núcleo no depende del adaptador SSH.
 
-- [ ] **1.4.2 — Ajustar dependencias**
+- [x] **1.4.2 — Ajustar dependencias**
   - `sw-agent` puede mantener `sw-ssh-agent` solo como `dev-dependency` si los tests usan `generate_test_ed25519`.
   - `sw-ssh-agent` depende de `sw-vault-agent`.
   - Verificación: `cargo tree -p sw-agent --edges normal | grep sw-ssh-agent` vacío.
 
-- [ ] **1.4.3 — Verificación de fase**
+- [x] **1.4.3 — Verificación de fase**
   - `cargo tree -p sw-agent`
   - `cargo tree -p sw-ssh-agent`
   - `cargo test --workspace`

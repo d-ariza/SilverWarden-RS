@@ -18,6 +18,7 @@ sw-vault = { workspace = true }
 sw-bitwarden-api = { workspace = true }
 sw-agent = { workspace = true }
 sw-ssh-agent = { workspace = true }
+sw-vault-agent = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

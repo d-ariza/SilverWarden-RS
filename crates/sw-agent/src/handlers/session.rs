@@ -109,7 +109,8 @@ pub async fn handle_status(
     state: &mut AgentState,
     _ctx: &CallingContext,
 ) -> Result<serde_json::Value, AgentError> {
-    let logged_in = !state.session.is_locked && (state.services.config.is_logged_in() || state.services.api_client.is_some());
+    let logged_in = !state.session.is_locked
+        && (state.services.config.is_logged_in() || state.services.api_client.is_some());
     Ok(serde_json::json!({
         "locked": state.session.is_locked,
         "has_pin": state.session.has_pin,
@@ -170,7 +171,8 @@ pub async fn handle_unlock(
                     state.services.config.identity_url = disk_cfg.identity_url;
                     state.services.config.api_url = disk_cfg.api_url;
                     state.services.config.notifications_url = disk_cfg.notifications_url;
-                    state.services.config.danger_accept_invalid_certs = disk_cfg.danger_accept_invalid_certs;
+                    state.services.config.danger_accept_invalid_certs =
+                        disk_cfg.danger_accept_invalid_certs;
                 }
             }
         }
@@ -207,12 +209,15 @@ pub async fn handle_unlock(
                 .session
                 .sessions
                 .create_session(ctx, SessionType::Pin, Duration::from_secs(3600));
-            state
-                .session
-                .sessions
-                .create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
+            state.session.sessions.create_session(
+                ctx,
+                SessionType::AccessVault,
+                Duration::from_secs(3600),
+            );
 
-            if state.services.api_client.is_none() && !state.services.config.encrypted_token.is_empty() {
+            if state.services.api_client.is_none()
+                && !state.services.config.encrypted_token.is_empty()
+            {
                 if let Ok(token) = state.services.config.decrypt_token(&config_key) {
                     state.services.api_client = Some(Arc::new(
                         sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
@@ -226,7 +231,12 @@ pub async fn handle_unlock(
             }
 
             let agent = &state.services.vault_agent;
-            let sym_key = if !state.services.config.encrypted_user_symmetric_key.is_empty() {
+            let sym_key = if !state
+                .services
+                .config
+                .encrypted_user_symmetric_key
+                .is_empty()
+            {
                 if let Ok(dec) = sw_config::decrypt_string(
                     &state.services.config.encrypted_user_symmetric_key,
                     &config_key,
@@ -320,13 +330,17 @@ pub async fn handle_unlock(
         .sessions
         .create_session(ctx, SessionType::AccessVault, Duration::from_secs(3600));
 
-    let key_res =
-        sw_config::derive_config_key_with_params(&pin, &state.services.config.device_uuid, memory_kib);
+    let key_res = sw_config::derive_config_key_with_params(
+        &pin,
+        &state.services.config.device_uuid,
+        memory_kib,
+    );
 
     if let Ok(key) = &key_res {
         state.security.pin_cache.store(key);
 
-        if state.services.api_client.is_none() && !state.services.config.encrypted_token.is_empty() {
+        if state.services.api_client.is_none() && !state.services.config.encrypted_token.is_empty()
+        {
             if let Ok(token) = state.services.config.decrypt_token(key) {
                 state.services.api_client = Some(Arc::new(
                     sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
@@ -342,7 +356,12 @@ pub async fn handle_unlock(
 
     let agent = &state.services.vault_agent;
     if let Ok(key) = key_res {
-        let sym_key = if !state.services.config.encrypted_user_symmetric_key.is_empty() {
+        let sym_key = if !state
+            .services
+            .config
+            .encrypted_user_symmetric_key
+            .is_empty()
+        {
             if let Ok(dec) =
                 sw_config::decrypt_string(&state.services.config.encrypted_user_symmetric_key, &key)
             {

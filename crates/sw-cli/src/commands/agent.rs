@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::*;
+use std::sync::Arc;
 
 pub async fn handle(cli: &Cli, action: &AgentCommands) -> Result<String, CliError> {
     let socket_path = resolve_socket_path(cli.socket.clone())?;
@@ -11,10 +11,11 @@ pub async fn handle(cli: &Cli, action: &AgentCommands) -> Result<String, CliErro
             );
             let ssh_socket_path = resolve_ssh_socket_path(&socket_path);
 
-            let vault_agent = Arc::new(sw_ssh_agent::VaultAgentServer::default());
+            let vault_agent = Arc::new(sw_vault_agent::VaultAgentServer::default());
             let agent_sock = socket_path.clone();
             let va_clone = vault_agent.clone();
-            let agent_handle = tokio::spawn(async move { sw_agent::run_agent(&agent_sock, va_clone).await });
+            let agent_handle =
+                tokio::spawn(async move { sw_agent::run_agent(&agent_sock, va_clone).await });
 
             let ssh_handle = if !*no_ssh {
                 println!(
@@ -22,7 +23,8 @@ pub async fn handle(cli: &Cli, action: &AgentCommands) -> Result<String, CliErro
                     ssh_socket_path.display()
                 );
                 let ssh_sock = ssh_socket_path.clone();
-                let ssh_server = sw_ssh_agent::SshAgentServer::new(&ssh_sock, (*vault_agent).clone());
+                let ssh_server =
+                    sw_ssh_agent::SshAgentServer::new(&ssh_sock, (*vault_agent).clone());
                 Some(tokio::spawn(async move { ssh_server.serve().await }))
             } else {
                 None

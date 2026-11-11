@@ -938,7 +938,7 @@ async fn test_cli_sync_e2e_agent_receives_sync_data_and_ssh_add_lists_keys() {
 
     // 1. Setup VaultAgentServer unlocked with sym_key, but starting with empty VaultStore
     let vault_store = Arc::new(sw_vault::VaultStore::new());
-    let vault_agent = Arc::new(sw_ssh_agent::VaultAgentServer::with_key(
+    let vault_agent = Arc::new(sw_vault_agent::VaultAgentServer::with_key(
         vault_store.clone(),
         sym_key.try_clone().unwrap(),
     ));
@@ -1005,10 +1005,10 @@ async fn test_cli_sync_e2e_agent_receives_sync_data_and_ssh_add_lists_keys() {
     let identities_after = vault_agent.request_identities().await.unwrap();
     assert_eq!(identities_after.len(), 1);
     match &identities_after[0] {
-        sw_ssh_agent::AgentIdentity::PublicKey { comment, .. } => {
+        sw_vault_agent::AgentIdentity::PublicKey { comment, .. } => {
             assert_eq!(comment, "work-laptop");
         }
-        sw_ssh_agent::AgentIdentity::Certificate { comment, .. } => {
+        sw_vault_agent::AgentIdentity::Certificate { comment, .. } => {
             assert_eq!(comment, "work-laptop");
         }
     }
@@ -2250,7 +2250,7 @@ async fn test_cli_login_unlock_sync_integration_sequence() {
     initial_config.config_key_hash = sw_config::hash_config_key(&config_key);
     initial_config.save_to_file(&config_file_path).unwrap();
 
-    let va = std::sync::Arc::new(sw_ssh_agent::VaultAgentServer::default());
+    let va = std::sync::Arc::new(sw_vault_agent::VaultAgentServer::default());
     let agent_state = sw_agent::AgentState::new(initial_config.clone(), va.clone())
         .with_config_directory(temp_dir.path().to_path_buf());
     let daemon = sw_agent::AgentDaemon::with_vault_agent(agent_state, va);
@@ -2363,7 +2363,7 @@ async fn test_cli_logins_create_server_failure_propagates_error() {
     let socket_path = temp_dir.path().join("failing_create.sock");
 
     let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
-    let va = std::sync::Arc::new(sw_ssh_agent::VaultAgentServer::default());
+    let va = std::sync::Arc::new(sw_vault_agent::VaultAgentServer::default());
     va.unlock(sym_key).await;
     va.vault()
         .load_sync_data(sw_vault::SyncData {
@@ -2477,7 +2477,7 @@ async fn test_cli_logins_create_server_success_inserts_item() {
     let socket_path = temp_dir.path().join("success_create.sock");
 
     let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
-    let va = std::sync::Arc::new(sw_ssh_agent::VaultAgentServer::default());
+    let va = std::sync::Arc::new(sw_vault_agent::VaultAgentServer::default());
     va.unlock(sym_key).await;
     va.vault()
         .load_sync_data(sw_vault::SyncData {
@@ -2568,7 +2568,7 @@ async fn test_cli_logins_create_fails_when_profile_not_synced() {
     let socket_path = temp_dir.path().join("no_profile_create.sock");
 
     let sym_key = sw_crypto::SymmetricKey::from_bytes(&[0x42u8; 64]).unwrap();
-    let va = std::sync::Arc::new(sw_ssh_agent::VaultAgentServer::default());
+    let va = std::sync::Arc::new(sw_vault_agent::VaultAgentServer::default());
     va.unlock(sym_key).await;
     // Profile is not loaded into va.vault()
 

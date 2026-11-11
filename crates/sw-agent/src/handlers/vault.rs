@@ -234,7 +234,11 @@ pub async fn handle_create_login(
         ..Default::default()
     };
 
-    let client = state.services.api_client.as_ref().or_else(|| agent.api_client());
+    let client = state
+        .services
+        .api_client
+        .as_ref()
+        .or_else(|| agent.api_client());
     let client = client.ok_or_else(|| {
         AgentError::Unauthorized("No hay sesión iniciada en el servidor. Inicia sesión con 'silverwarden login' primero.".to_string())
     })?;
@@ -304,7 +308,11 @@ pub async fn handle_delete_login(
     })?;
 
     if let Some(id) = id_opt {
-        let client = state.services.api_client.as_ref().or_else(|| agent.api_client());
+        let client = state
+            .services
+            .api_client
+            .as_ref()
+            .or_else(|| agent.api_client());
         if let Some(c) = client {
             if let Err(e) = c.delete_cipher(&id).await {
                 tracing::warn!("Failed to delete cipher from server: {e}");

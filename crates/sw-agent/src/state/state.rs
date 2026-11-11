@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sw_config::ConfigFile;
 use sw_crypto::mem::{LockedBuffer, MemLockedBuffer};
-use sw_ssh_agent::VaultAgentServer;
 use sw_systemauth::SessionStore;
+use sw_vault_agent::VaultAgentServer;
 
 use crate::ports::{Clock, SystemClock};
 
@@ -223,7 +223,8 @@ impl AgentState {
 
     /// Sets an injectable clock for deterministic time in pin cache and timeout operations.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.security.pin_cache = PinCache::with_clock(self.security.pin_cache.ttl(), clock.clone());
+        self.security.pin_cache =
+            PinCache::with_clock(self.security.pin_cache.ttl(), clock.clone());
         self.security.clock = clock;
         self
     }
@@ -274,7 +275,8 @@ impl AgentState {
     pub fn vault_path(&self) -> Option<PathBuf> {
         #[cfg(test)]
         {
-            self.services.config_directory
+            self.services
+                .config_directory
                 .as_ref()
                 .map(|dir| dir.join("vault.json"))
         }
@@ -301,12 +303,14 @@ impl AgentState {
         Self::load_or_default_from_with(None, vault_agent)
     }
 
-    /// Loads the configuration file from ~/.config/goldwarden/goldwarden.json or defaults.
+    /// Test helper: Loads the configuration file from default paths or fallback defaults.
+    /// In production, use `load_or_default_with` with an explicit `VaultAgentServer`.
     pub fn load_or_default() -> Self {
         Self::load_or_default_with(Arc::new(VaultAgentServer::default()))
     }
 
-    /// Loads the configuration from an optional directory, or defaults.
+    /// Test helper: Loads the configuration from an optional directory, or fallback defaults.
+    /// In production, use `load_or_default_from_with` with an explicit `VaultAgentServer`.
     pub fn load_or_default_from(config_dir: Option<PathBuf>) -> Self {
         Self::load_or_default_from_with(config_dir, Arc::new(VaultAgentServer::default()))
     }
@@ -335,6 +339,9 @@ impl AgentState {
     }
 }
 
+/// Default implementation for `AgentState`.
+/// Intended primarily for testing; production code should construct `AgentState`
+/// with explicit dependencies via `AgentState::new` or `load_or_default_with`.
 impl Default for AgentState {
     fn default() -> Self {
         Self::new(ConfigFile::default(), Arc::new(VaultAgentServer::default()))

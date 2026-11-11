@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use sw_ipc::{read_message, write_message, Request, Response};
-use sw_ssh_agent::VaultAgentServer;
 use sw_systemauth::CallingContext;
+use sw_vault_agent::VaultAgentServer;
 use thiserror::Error;
 use tokio::sync::RwLock;
 

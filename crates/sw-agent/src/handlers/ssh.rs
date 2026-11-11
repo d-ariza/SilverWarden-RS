@@ -1,5 +1,5 @@
 use crate::AgentError;
-use sw_ssh_agent::VaultAgentServer;
+use sw_vault_agent::VaultAgentServer;
 
 pub async fn handle_list_ssh_keys(
     agent: &VaultAgentServer,

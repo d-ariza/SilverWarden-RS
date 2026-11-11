@@ -6,11 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-sw-vault = { workspace = true }
-sw-crypto = { workspace = true }
-sw-systemauth = { workspace = true }
-sw-bitwarden-api = { workspace = true }
-sw-notify = { workspace = true }
+sw-vault-agent = { workspace = true }
 ssh-key = { workspace = true }
 russh = { workspace = true }
 tokio = { workspace = true }

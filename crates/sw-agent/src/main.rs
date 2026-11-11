@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use sw_ssh_agent::VaultAgentServer;
+use sw_vault_agent::VaultAgentServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

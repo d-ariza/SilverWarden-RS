@@ -9,6 +9,7 @@ members = [
     "crates/sw-agent",
     "crates/sw-vault",
     "crates/sw-bitwarden-api",
+    "crates/sw-vault-agent",
     "crates/sw-ssh-agent",
     "crates/sw-cli",
     "crates/sw-notify",
@@ -34,6 +35,7 @@ sw-systemauth = { path = "crates/sw-systemauth" }
 sw-agent = { path = "crates/sw-agent" }
 sw-vault = { path = "crates/sw-vault" }
 sw-bitwarden-api = { path = "crates/sw-bitwarden-api" }
+sw-vault-agent = { path = "crates/sw-vault-agent" }
 sw-ssh-agent = { path = "crates/sw-ssh-agent" }
 sw-notify = { path = "crates/sw-notify" }
 sw-autotype = { path = "crates/sw-autotype" }

@@ -16,7 +16,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sw-ssh-agent = { workspace = true }
+sw-vault-agent = { workspace = true }
 sw-vault = { workspace = true }
 sw-bitwarden-api = { workspace = true }
 sw-notify = { workspace = true }
