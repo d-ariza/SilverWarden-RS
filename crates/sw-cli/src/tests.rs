@@ -963,13 +963,12 @@ async fn test_cli_sync_e2e_agent_receives_sync_data_and_ssh_add_lists_keys() {
     });
 
     // Wait until agent socket is ready
-    for _ in 0..50 {
-        if agent_socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
-    assert!(agent_socket_path.exists());
+    wait_until(
+        "agent_socket_path",
+        std::time::Duration::from_secs(5),
+        || agent_socket_path.exists(),
+    )
+    .await;
 
     // 3. Write CLI config
     let mut logged_in_cfg = sw_config::ConfigFile {
@@ -1176,6 +1175,21 @@ static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static ASYNC_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PATH_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Waits until `cond()` returns `true` or panics after `timeout`.
+#[allow(clippy::expect_fun_call)]
+async fn wait_until<F>(desc: &str, timeout: std::time::Duration, mut cond: F)
+where
+    F: FnMut() -> bool,
+{
+    tokio::time::timeout(timeout, async {
+        while !cond() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await; // Sondeo interno
+        }
+    })
+    .await
+    .expect(&format!("timeout esperando {desc}"));
+}
+
 struct EnvGuard {
     key: String,
     old_val: Option<String>,
@@ -1283,15 +1297,12 @@ async fn test_agent_start_launches_both_sockets() {
     });
 
     // Wait up to 5 seconds for both sockets to appear
-    let mut both_exist = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if main_sock.exists() && ssh_sock.exists() {
-            both_exist = true;
-            break;
-        }
-    }
-    assert!(both_exist, "Both sockets should exist after agent start");
+    wait_until(
+        "both main_sock and ssh_sock",
+        std::time::Duration::from_secs(5),
+        || main_sock.exists() && ssh_sock.exists(),
+    )
+    .await;
 
     // Verify ssh-add -L against the SSH agent socket responds with "no identities" (exit code 1)
     let ssh_add_available = std::env::var("PATH")
@@ -1347,15 +1358,12 @@ async fn test_shared_vault_between_daemon_and_ssh_agent() {
         let _ = handle_command(&cli, |_| Ok(String::new())).await;
     });
 
-    let mut both_exist = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if main_sock.exists() && ssh_sock.exists() {
-            both_exist = true;
-            break;
-        }
-    }
-    assert!(both_exist, "Both sockets should exist after agent start");
+    wait_until(
+        "both main_sock and ssh_sock",
+        std::time::Duration::from_secs(5),
+        || main_sock.exists() && ssh_sock.exists(),
+    )
+    .await;
 
     let ssh_add_available = std::env::var("PATH")
         .map(|p| {
@@ -1481,17 +1489,11 @@ async fn test_agent_start_no_ssh() {
     });
 
     // Wait up to 2 seconds for main socket to appear
-    let mut main_exists = false;
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if main_sock.exists() {
-            main_exists = true;
-            break;
-        }
-    }
-    assert!(main_exists, "Main socket should exist");
-    // SSH socket should NOT exist
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_until("main_sock", std::time::Duration::from_secs(2), || {
+        main_sock.exists()
+    })
+    .await;
+    // Once main_sock is bound and listening, SSH socket must NOT exist with --no-ssh
     assert!(
         !ssh_sock.exists(),
         "SSH socket should NOT exist with --no-ssh"
@@ -2265,12 +2267,10 @@ async fn test_cli_login_unlock_sync_integration_sequence() {
     });
 
     // Wait until agent socket is ready
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-    }
+    wait_until("socket_path", std::time::Duration::from_secs(5), || {
+        socket_path.exists()
+    })
+    .await;
 
     // --- Sequence Step 1: Login ---
     let cli_login = Cli {
@@ -2400,12 +2400,10 @@ async fn test_cli_logins_create_server_failure_propagates_error() {
         .await;
     });
 
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-    }
+    wait_until("socket_path", std::time::Duration::from_secs(5), || {
+        socket_path.exists()
+    })
+    .await;
 
     let cli = Cli {
         socket: Some(socket_path),
@@ -2514,12 +2512,10 @@ async fn test_cli_logins_create_server_success_inserts_item() {
         .await;
     });
 
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-    }
+    wait_until("socket_path", std::time::Duration::from_secs(5), || {
+        socket_path.exists()
+    })
+    .await;
 
     let cli = Cli {
         socket: Some(socket_path),
@@ -2587,12 +2583,10 @@ async fn test_cli_logins_create_fails_when_profile_not_synced() {
         .await;
     });
 
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-    }
+    wait_until("socket_path", std::time::Duration::from_secs(5), || {
+        socket_path.exists()
+    })
+    .await;
 
     let cli = Cli {
         socket: Some(socket_path),

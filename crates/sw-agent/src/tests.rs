@@ -3,6 +3,21 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+/// Waits until `cond()` returns `true` or panics after `timeout`.
+#[allow(clippy::expect_fun_call)]
+async fn wait_until<F>(desc: &str, timeout: Duration, mut cond: F)
+where
+    F: FnMut() -> bool,
+{
+    tokio::time::timeout(timeout, async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(10)).await; // Sondeo interno de wait_until
+        }
+    })
+    .await
+    .expect(&format!("timeout esperando {desc}"));
+}
+
 #[tokio::test]
 async fn test_agent_socket_actions_flow() {
     let temp_dir = tempfile::tempdir().expect("Create temp dir");
@@ -4000,12 +4015,10 @@ async fn test_run_agent_loads_config_from_disk() {
         .await
     });
 
-    for _ in 0..50 {
-        if socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until("socket_path", Duration::from_secs(5), || {
+        socket_path.exists()
+    })
+    .await;
 
     let mut stream = tokio::net::UnixStream::connect(&socket_path)
         .await
