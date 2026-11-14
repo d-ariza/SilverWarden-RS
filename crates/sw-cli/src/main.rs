@@ -256,22 +256,8 @@ impl From<ClientError> for CliError {
 pub fn resolve_socket_path(custom: Option<PathBuf>) -> Result<PathBuf, CliError> {
     match custom {
         Some(p) => Ok(p),
-        None => sw_agent::default_socket_path().map_err(|e| CliError::Other(e.to_string())),
+        None => sw_config::default_socket_path().map_err(|e| CliError::Other(e.to_string())),
     }
-}
-
-/// Resolves the SSH agent socket path, respecting custom paths or default `~/.silverwarden-ssh-agent.sock`.
-pub fn resolve_ssh_socket_path(main_socket: &Path) -> PathBuf {
-    if let Some(parent) = main_socket.parent() {
-        let is_home = std::env::var("HOME")
-            .map(|h| PathBuf::from(h) == parent)
-            .unwrap_or(false);
-        if !is_home {
-            return parent.join(".silverwarden-ssh-agent.sock");
-        }
-    }
-    sw_ssh_agent::default_ssh_agent_socket_path()
-        .unwrap_or_else(|_| PathBuf::from(".silverwarden-ssh-agent.sock"))
 }
 
 /// Emits a warning if a running Goldwarden Go instance socket is detected.

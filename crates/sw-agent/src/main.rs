@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!("Starting silverWarden agent daemon...");
 
-    let socket_path = sw_agent::default_socket_path()?;
+    let socket_path = sw_config::default_socket_path()?;
     let vault_agent = Arc::new(VaultAgentServer::default());
     sw_agent::run_agent(&socket_path, vault_agent).await?;
 

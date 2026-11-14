@@ -9,7 +9,11 @@ pub async fn handle(cli: &Cli, action: &AgentCommands) -> Result<String, CliErro
                 "Iniciando el agente SilverWarden en {}...",
                 socket_path.display()
             );
-            let ssh_socket_path = resolve_ssh_socket_path(&socket_path);
+            let ssh_socket_path = match &cli.socket {
+                Some(_) => sw_config::ssh_agent_socket_path_next_to(&socket_path),
+                None => sw_config::default_ssh_agent_socket_path()
+                    .unwrap_or_else(|_| sw_config::ssh_agent_socket_path_next_to(&socket_path)),
+            };
 
             let vault_agent = Arc::new(sw_vault_agent::VaultAgentServer::default());
             let agent_sock = socket_path.clone();

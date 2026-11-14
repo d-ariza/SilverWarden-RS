@@ -1,3 +1,9 @@
+pub mod paths;
+pub use paths::{
+    default_socket_path, default_ssh_agent_socket_path, socket_path_from_home,
+    ssh_agent_socket_path_from_home, ssh_agent_socket_path_next_to,
+};
+
 use base64::Engine;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},

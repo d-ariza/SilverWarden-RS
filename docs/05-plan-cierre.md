@@ -239,13 +239,13 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 1.5. Centralización de rutas
 
-- [ ] **1.5.1 — Crear el módulo de rutas**
+- [x] **1.5.1 — Crear el módulo de rutas**
   - Opción recomendada: `crates/sw-config/src/paths.rs` con `default_socket_path()` y `default_ssh_agent_socket_path()`.
   - Opción alternativa: `crates/sw-paths`.
   - No ponerlo en `sw-client`: `sw-agent` (servidor) no debe depender de `sw-client` (cliente).
   - Verificación: `cargo check -p sw-config`.
 
-- [ ] **1.5.2 — Usar la función en todos los consumidores**
+- [x] **1.5.2 — Usar la función en todos los consumidores**
   - `sw-agent/src/lib.rs` deja de definir `default_socket_path`.
   - `sw-cli/src/main.rs` importa desde `sw-config`.
   - `sw-gui/src-tauri/src/lib.rs` deja de hardcodear `~/.silverwarden.sock`.

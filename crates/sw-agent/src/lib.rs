@@ -450,19 +450,7 @@ impl Default for AgentDaemon {
     }
 }
 
-/// Returns the socket path `~/.silverwarden.sock` for a specific home or falling back to the current user's `$HOME`.
-pub fn socket_path_from_home(home: Option<&str>) -> Result<PathBuf, AgentError> {
-    let home = home
-        .map(String::from)
-        .or_else(|| std::env::var("HOME").ok())
-        .ok_or_else(|| AgentError::Other("HOME no definido".into()))?;
-    Ok(PathBuf::from(home).join(".silverwarden.sock"))
-}
-
-/// Returns the default socket path `~/.silverwarden.sock` for the current user.
-pub fn default_socket_path() -> Result<PathBuf, AgentError> {
-    socket_path_from_home(None)
-}
+pub use sw_config::{default_socket_path, socket_path_from_home};
 
 /// Checks if a socket file exists. If another process is actively listening, returns `SocketAlreadyInUse`.
 /// If the socket is orphaned, removes it cleanly.

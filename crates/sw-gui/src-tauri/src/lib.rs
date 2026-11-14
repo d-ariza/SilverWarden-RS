@@ -1,7 +1,7 @@
 use sw_client::{AgentClient, ClientError};
-use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::Emitter;
 use tauri::Manager;
+use tauri::menu::{Menu, MenuItem, Submenu};
 
 fn get_settings_path() -> Result<std::path::PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "No HOME directory".to_string())?;
@@ -81,14 +81,15 @@ async fn set_menu_state(window: tauri::Window, is_logged_in: bool) -> Result<(),
 }
 
 fn get_agent_client() -> Result<AgentClient, String> {
-    let home = std::env::var("HOME").map_err(|_| "No se pudo determinar el directorio HOME.".to_string())?;
-    let socket_path = std::path::PathBuf::from(home).join(".silverwarden.sock");
+    let socket_path = sw_config::default_socket_path().map_err(|e| e.to_string())?;
     Ok(AgentClient::new(socket_path))
 }
 
 fn map_client_error(e: ClientError) -> String {
     match e {
-        ClientError::SocketNotFound(_) => "El agente no está corriendo (socket no existe).".to_string(),
+        ClientError::SocketNotFound(_) => {
+            "El agente no está corriendo (socket no existe).".to_string()
+        }
         ClientError::InvalidPin => "El PIN es incorrecto, inténtalo de nuevo.".to_string(),
         ClientError::Locked => "Bóveda bloqueada. Desbloquea primero.".to_string(),
         ClientError::NotFound(msg)
@@ -174,8 +175,8 @@ async fn lock_vault() -> Result<String, String> {
 
 #[tauri::command]
 fn copy_to_clipboard(text: String) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|e| format!("Error al acceder al portapapeles: {e}"))?;
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Error al acceder al portapapeles: {e}"))?;
     clipboard
         .set_text(&text)
         .map_err(|e| format!("Error al copiar al portapapeles: {e}"))?;
@@ -200,19 +201,28 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 #[tauri::command]
 async fn list_logins() -> Result<serde_json::Value, String> {
     let client = get_agent_client()?;
-    client.call_ok(sw_client::Request::ListLogins).await.map_err(map_client_error)
+    client
+        .call_ok(sw_client::Request::ListLogins)
+        .await
+        .map_err(map_client_error)
 }
 
 #[tauri::command]
 async fn sync_vault() -> Result<serde_json::Value, String> {
     let client = get_agent_client()?;
-    client.call_ok(sw_client::Request::Sync).await.map_err(map_client_error)
+    client
+        .call_ok(sw_client::Request::Sync)
+        .await
+        .map_err(map_client_error)
 }
 
 #[tauri::command]
 async fn get_login(name: String) -> Result<serde_json::Value, String> {
     let client = get_agent_client()?;
-    client.call_ok(sw_client::Request::GetLogin { name }).await.map_err(map_client_error)
+    client
+        .call_ok(sw_client::Request::GetLogin { name })
+        .await
+        .map_err(map_client_error)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

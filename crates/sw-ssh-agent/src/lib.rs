@@ -103,21 +103,7 @@ impl SshAgentServer {
     }
 }
 
-/// Returns the default SSH agent socket path `~/.silverwarden-ssh-agent.sock` for a specific home or falling back to `$HOME`.
-pub fn default_ssh_agent_socket_path_from_home(
-    home: Option<&str>,
-) -> Result<PathBuf, SshAgentError> {
-    let home = home
-        .map(String::from)
-        .or_else(|| std::env::var("HOME").ok())
-        .ok_or_else(|| SshAgentError::Other("HOME no definido".into()))?;
-    Ok(PathBuf::from(home).join(".silverwarden-ssh-agent.sock"))
-}
-
-/// Returns the default SSH agent socket path `~/.silverwarden-ssh-agent.sock` for the current user.
-pub fn default_ssh_agent_socket_path() -> Result<PathBuf, SshAgentError> {
-    default_ssh_agent_socket_path_from_home(None)
-}
+pub use sw_config::{default_ssh_agent_socket_path, ssh_agent_socket_path_from_home};
 
 /// Cleans orphan socket if exists, binds `UnixListener` with permissions 0600,
 /// and serves SSH agent connections.

@@ -23,6 +23,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 sw-ipc = { path = "../../sw-ipc" }
 sw-client = { path = "../../sw-client" }
+sw-config = { path = "../../sw-config" }
 tokio = { version = "1.40", features = ["full"] }
 serde_json = "1.0"
 arboard = "3.4"
