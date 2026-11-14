@@ -464,20 +464,42 @@ async fn test_handle_command_status_and_status_locked() {
 
 #[tokio::test]
 async fn test_handle_command_unlock_with_pin_and_interactive() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     let temp_dir = tempfile::tempdir().unwrap();
     let socket_path = temp_dir.path().join("unlock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
+    let pin_cached = Arc::new(AtomicBool::new(false));
+    let pin_cached_srv = pin_cached.clone();
 
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
-            assert!(matches!(req, Request::Unlock { .. }));
-            let resp = Response::Ok(serde_json::json!({ "status": "unlocked" }));
+            let resp = match req {
+                Request::Status => Response::Ok(serde_json::json!({
+                    "locked": true,
+                    "has_pin": true,
+                    "logged_in": true,
+                    "pin_cached": pin_cached_srv.load(Ordering::SeqCst),
+                })),
+                Request::Unlock { pin } => {
+                    if pin_cached_srv.load(Ordering::SeqCst) {
+                        assert_eq!(pin, None);
+                    } else {
+                        assert!(pin.is_some());
+                    }
+                    Response::Ok(serde_json::json!({ "status": "unlocked" }))
+                }
+                other => panic!("Unexpected request: {:?}", other),
+            };
             sw_ipc::write_message(&mut stream, &resp).await.unwrap();
         }
     });
 
-    // 1. With --pin flag
+    // 1. With --pin flag (does not require Status)
     let cli_flag = test_cli(
         Some(socket_path.clone()),
         Commands::Unlock {
@@ -487,8 +509,8 @@ async fn test_handle_command_unlock_with_pin_and_interactive() {
     let out_flag = handle_command(&cli_flag, |_| unreachable!()).await.unwrap();
     assert!(out_flag.contains("Bóveda desbloqueada con éxito."));
 
-    // 2. Interactive prompt
-    let cli_prompt = test_cli(Some(socket_path), Commands::Unlock { pin: None });
+    // 2. Interactive prompt when pin_cached == false
+    let cli_prompt = test_cli(Some(socket_path.clone()), Commands::Unlock { pin: None });
     let out_prompt = handle_command(&cli_prompt, |msg| {
         assert!(msg.contains("PIN"));
         Ok("prompted_secret".into())
@@ -496,6 +518,14 @@ async fn test_handle_command_unlock_with_pin_and_interactive() {
     .await
     .unwrap();
     assert!(out_prompt.contains("Bóveda desbloqueada con éxito."));
+
+    // 3. Cached PIN when pin_cached == true skips prompt completely
+    pin_cached.store(true, Ordering::SeqCst);
+    let cli_cached = test_cli(Some(socket_path), Commands::Unlock { pin: None });
+    let out_cached = handle_command(&cli_cached, |_| unreachable!())
+        .await
+        .unwrap();
+    assert!(out_cached.contains("Bóveda desbloqueada con éxito."));
 }
 
 #[tokio::test]
@@ -601,33 +631,63 @@ async fn test_handle_command_pin_set_and_update() {
 
 #[tokio::test]
 async fn test_handle_command_local_subcommands() {
-    let dummy_socket = PathBuf::from("/tmp/dummy.sock");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let socket_path = temp_dir.path().join("ssh_local.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
+            let resp = match req {
+                Request::ListSshKeys => Response::Ok(serde_json::json!([{
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "name": "work-key",
+                    "fingerprint": "SHA256:abc",
+                    "public_key": "ssh-ed25519 AAAA"
+                }])),
+                Request::NewSshKey { name, key_type } => {
+                    assert_eq!(name, "id_ed25519");
+                    assert_eq!(key_type, "Ed25519");
+                    Response::Ok(serde_json::json!({
+                        "name": name,
+                        "fingerprint": "SHA256:new",
+                        "public_key": "ssh-ed25519 BBBB"
+                    }))
+                }
+                other => panic!("Unexpected request: {:?}", other),
+            };
+            sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+        }
+    });
 
     // SSH List
     let cli_ssh_list = test_cli(
-        Some(dummy_socket.clone()),
+        Some(socket_path.clone()),
         Commands::Ssh {
             ssh_command: SshCommands::List,
         },
     );
-    assert!(handle_command(&cli_ssh_list, |_| unreachable!())
+    let out_list = handle_command(&cli_ssh_list, |_| unreachable!())
         .await
-        .unwrap()
-        .contains("Listando claves SSH"));
+        .unwrap();
+    assert!(out_list.contains("Listando claves SSH"));
+    assert!(out_list.contains("work-key"));
+    assert!(out_list.contains("SHA256:abc"));
 
     // SSH Add
     let cli_ssh_add = test_cli(
-        Some(dummy_socket),
+        Some(socket_path),
         Commands::Ssh {
             ssh_command: SshCommands::Add {
                 key_id: "id_ed25519".into(),
             },
         },
     );
-    assert!(handle_command(&cli_ssh_add, |_| unreachable!())
+    let out_add = handle_command(&cli_ssh_add, |_| unreachable!())
         .await
-        .unwrap()
-        .contains("Registrando clave SSH id_ed25519"));
+        .unwrap();
+    assert!(out_add.contains("Registrando clave SSH id_ed25519"));
+    assert!(out_add.contains("SHA256:new"));
 }
 
 #[tokio::test]
@@ -3198,29 +3258,59 @@ async fn test_config_set_empty_urls_validation() {
 
 #[tokio::test]
 async fn test_ssh_subcommands() {
-    let cli_list = Cli {
-        socket: None,
-        config: None,
-        insecure: false,
-        command: Commands::Ssh {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let socket_path = temp_dir.path().join("ssh_cmd.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let pem_path = temp_dir.path().join("imported_key.pem");
+    std::fs::write(&pem_path, "-----BEGIN OPENSSH PRIVATE KEY-----\ndummy\n").unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
+            let resp = match req {
+                Request::ListSshKeys => Response::Ok(serde_json::json!([])),
+                Request::ImportSshKey { name, pem } => {
+                    assert_eq!(name, "imported_key");
+                    assert!(pem.contains("OPENSSH PRIVATE KEY"));
+                    Response::Ok(serde_json::json!({
+                        "name": name,
+                        "fingerprint": "SHA256:imp",
+                    }))
+                }
+                Request::NewSshKey { name, key_type } => {
+                    assert_eq!(name, "id_ed25519");
+                    assert_eq!(key_type, "Ed25519");
+                    Response::Ok(serde_json::json!({
+                        "name": name,
+                        "fingerprint": "SHA256:gen",
+                    }))
+                }
+                other => panic!("Unexpected request: {:?}", other),
+            };
+            sw_ipc::write_message(&mut stream, &resp).await.unwrap();
+        }
+    });
+
+    let cli_list = test_cli(
+        Some(socket_path.clone()),
+        Commands::Ssh {
             ssh_command: SshCommands::List,
         },
-    };
+    );
     let res_list = handle_command(&cli_list, |_| Ok(String::new()))
         .await
         .unwrap();
-    assert!(res_list.contains("Listando claves SSH"));
+    assert!(res_list.contains("No hay claves SSH registradas."));
 
-    let cli_add_empty = Cli {
-        socket: None,
-        config: None,
-        insecure: false,
-        command: Commands::Ssh {
+    let cli_add_empty = test_cli(
+        Some(socket_path.clone()),
+        Commands::Ssh {
             ssh_command: SshCommands::Add {
                 key_id: "  ".to_string(),
             },
         },
-    };
+    );
     let err_add = handle_command(&cli_add_empty, |_| Ok(String::new()))
         .await
         .unwrap_err();
@@ -3231,16 +3321,27 @@ async fn test_ssh_subcommands() {
         other => panic!("Unexpected error: {:?}", other),
     }
 
-    let cli_add_ok = Cli {
-        socket: None,
-        config: None,
-        insecure: false,
-        command: Commands::Ssh {
+    let cli_add_file = test_cli(
+        Some(socket_path.clone()),
+        Commands::Ssh {
+            ssh_command: SshCommands::Add {
+                key_id: pem_path.display().to_string(),
+            },
+        },
+    );
+    let res_import = handle_command(&cli_add_file, |_| Ok(String::new()))
+        .await
+        .unwrap();
+    assert!(res_import.contains("Registrando clave SSH imported_key"));
+
+    let cli_add_ok = test_cli(
+        Some(socket_path),
+        Commands::Ssh {
             ssh_command: SshCommands::Add {
                 key_id: "id_ed25519".to_string(),
             },
         },
-    };
+    );
     let res_add = handle_command(&cli_add_ok, |_| Ok(String::new()))
         .await
         .unwrap();

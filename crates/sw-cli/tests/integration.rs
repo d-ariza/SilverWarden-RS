@@ -238,21 +238,58 @@ fn test_cli_local_commands() {
             "No hay sesión iniciada. Ejecuta 'silverwarden login' primero.",
         ));
 
-    // SSH List
+    // SSH Add validation fails locally without connecting to an agent
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
-    cmd.args(["ssh", "list"])
+    cmd.args(["ssh", "add", "   "])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Listando claves SSH registradas...",
+        .failure()
+        .stderr(predicate::str::contains(
+            "El nombre de la clave SSH no puede estar vacío.",
         ));
 
-    // SSH Add
+    // SSH List via IPC
+    let (_dir_list, sock_list, handle_list) = spawn_mock_server(|req| {
+        assert_eq!(req, Request::ListSshKeys);
+        Response::Ok(serde_json::json!([{
+            "id": "11111111-1111-1111-1111-111111111111",
+            "name": "cli-ssh",
+            "fingerprint": "SHA256:test",
+            "public_key": "ssh-ed25519 AAAA"
+        }]))
+    });
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
-    cmd.args(["ssh", "add", "id_ed25519"])
+    cmd.args(["--socket", sock_list.to_str().unwrap(), "ssh", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Registrando clave SSH id_ed25519"));
+        .stdout(predicate::str::contains("Listando claves SSH registradas:"));
+    handle_list.join().unwrap();
+
+    // SSH Add via IPC
+    let (_dir_add, sock_add, handle_add) = spawn_mock_server(|req| {
+        assert_eq!(
+            req,
+            Request::NewSshKey {
+                name: "id_ed25519".to_string(),
+                key_type: "Ed25519".to_string(),
+            }
+        );
+        Response::Ok(serde_json::json!({
+            "name": "id_ed25519",
+            "fingerprint": "SHA256:added"
+        }))
+    });
+    let mut cmd = Command::cargo_bin("silverwarden").unwrap();
+    cmd.args([
+        "--socket",
+        sock_add.to_str().unwrap(),
+        "ssh",
+        "add",
+        "id_ed25519",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Registrando clave SSH id_ed25519"));
+    handle_add.join().unwrap();
 }
 
 #[test]

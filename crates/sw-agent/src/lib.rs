@@ -322,12 +322,7 @@ impl AgentDaemon {
         if let Some(vault_path) = state.vault_path() {
             if vault_path.exists() {
                 if let Ok(sync_data) = sw_vault::load_vault(&vault_path) {
-                    let agent = vault_agent.clone();
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        handle.spawn(async move {
-                            agent.vault().load_sync_data(sync_data).await;
-                        });
-                    }
+                    let _ = vault_agent.vault().try_load_sync_data(sync_data);
                 }
             }
         }
