@@ -16,13 +16,13 @@ tiene la evidencia que la respalda.
 |---|---|---|---|
 | DT-2 | Abierta | `sw-bitwarden-api/src/twofactor.rs:164` devuelve `NotImplemented` | Fuera de alcance (post-MVP) |
 | DT-5 | **Parcial** | GUI con 4 rutas (`login`, `setup`, `vault`, inicio) | Fase 3 (cerrar cobertura) |
-| DT-7 | Abierta | `tokio 1.53.2`; RUSTSEC-2026-0386 **no** está en `.cargo/audit.toml` | Fase 4 + upgrade a ≥1.53.3 |
-| DT-12 | Abierta | `sw-cli/src/commands/ssh.rs` es un stub: imprime y no llama IPC | Fase 3.6 o post-MVP |
-| DT-13 | Mitigada | Soporte dual `SSHKey`/`SecureNote` presente | Se mantiene |
+| DT-7 | **Cerrada** | `tokio 1.54.1`; `cargo audit` sin RUSTSEC-2026-0386 | Cerrada el 2026-11-14 (`cargo update`) |
+| DT-12 | **Cerrada** | `sw-cli/src/commands/ssh.rs` despacha `ListSshKeys`, `ImportSshKey` y `NewSshKey` por IPC | Cerrada el 2026-11-14 |
+| DT-13 | **Cerrada** | Soporte dual `SSHKey`/`SecureNote` + `BITWARDEN_CLIENT_VERSION = "2024.12.0"` (D-M5-3, D49) | Resuelta para Tipo 5 y legacy |
 | DT-14 | Abierta | `Commands` no tiene notas/tarjetas/identidades | Fuera de alcance |
 | DT-15 | Abierta | `rg "pwned\|HIBP"` → 0 resultados | Fuera de alcance |
 | DT-16 | Mitigada | `SSHKeyCipher` y `SecureNoteCipher` conviven en `sw-vault` | Se mantiene |
-| DT-19 | Abierta | `commands/unlock.rs` pide PIN antes de consultar `Status` | Diferido; documentar en README |
+| DT-19 | **Cerrada** | `sw-cli/src/commands/unlock.rs` consulta `Status` (`pin_cached`) antes de pedir PIN | Cerrada el 2026-11-14 |
 | DT-20 | **Cerrada** | Tests de TTL usan `FakeClock` + `advance` (`sw-agent/src/tests.rs:2594`) | Cerrada por 1.1.4 |
 | DT-21 | Abierta | `rg "portal.Notification\|ashpd"` → 0 resultados | Fuera de alcance |
 | DT-22 | Abierta (diseño) | `sw-agent/tests/manual_logind.rs` con `#[ignore]` | Fuera de alcance (CI) |
@@ -31,22 +31,22 @@ tiene la evidencia que la respalda.
 | DT-26 | Abierta | No hay `list --type` ni paginación | Fuera de alcance |
 | DT-33 | Abierta | `sw-agent/src/lib.rs:70` usa `.contains()` | Fase 3.1.4 |
 | DT-34 | Abierta | 11 `serde_json::json!` en `sw-agent/src/lib.rs` | Fase 3.1.4 |
-| DT-35 | **Parcial** | `AgentDaemon::new()` eliminado; `with_vault_agent` sigue con `try_current` en `lib.rs:326` | Cerrar en 1.3.x o nueva tarea |
+| DT-35 | **Cerrada** | `AgentDaemon::with_vault_agent` usa `VaultStore::try_load_sync_data`; `rg "try_current"` → 0 | Cerrada el 2026-11-14 |
 | DT-36 | Abierta | `sw-crypto/src/asymmetric.rs:69` usa `expect` | Post-M7 |
 | DT-37 | Abierta | `sw-crypto/src/keyhierarchy.rs:95` usa `expect` | Post-M7 |
-| DT-38 | Abierta | **5** duplicados de lógica de `cipher.key` en producción (+1 mención en test) | Fase 2.2.2 |
+| DT-38 | **Cerrada** | `VaultStore::resolve_cipher_key` en `crates/sw-vault/src/decrypt.rs` (**1** ocurrencia en producción) | Cerrada en Fase 2 (post-2.2.2) |
 | DT-39 | Abierta | 13 usos de `HOME` + `ENV_MUTEX`/`ASYNC_ENV_MUTEX` en `sw-cli/src/tests.rs` | Post-M7 |
-| DT-40 | **Nueva** | `rustix 1.1.5`, RUSTSEC-2026-0486 (unsound) | Fase 4: upgrade a ≥1.1.6 |
-| DT-41 | **Nueva** | `async-executor 1.14.0` yanked | Fase 4: `cargo update` |
+| DT-40 | **Cerrada** | `rustix 1.1.6`; `cargo audit` sin RUSTSEC-2026-0486 | Cerrada el 2026-11-14 (`cargo update`) |
+| DT-41 | **Cerrada** | `async-executor 1.14.1` (sin versión *yanked*) | Cerrada el 2026-11-14 (`cargo update`) |
 | DT-42 | **Cerrada** | 11 dependencias declaradas sin uso (2 de workspace + 9 de crate) | Eliminadas el 2026-11-14 |
 
 **Lectura de conjunto:**
 
-- **23 fichas** en "Items Abiertos": 2 mitigadas (DT-13, DT-16), 1 parcial (DT-5) y 20 abiertas.
+- **15 fichas** en "Items Abiertos": 1 mitigada (DT-16), 1 parcial (DT-5) y 13 abiertas (`DT-38`, `DT-42`, `DT-7`, `DT-12`, `DT-13`, `DT-19`, `DT-35`, `DT-40` y `DT-41` cerradas el 2026-11-14 en el árbol de trabajo; 21 cerradas en total).
 - **DT-20 ya se cerró** con el puerto `Clock` de 1.1.4; su ficha vive ahora en el histórico.
-- **DT-35 y DT-38 estaban mal medidos**: el primero sigue vivo en otro constructor; el segundo se duplicó de 3 a 6.
-- **DT-7 no está exento** en `.cargo/audit.toml`, así que el job de auditoría de 4.2.3 nacería con 3 warnings (DT-7, DT-40 y DT-41).
-- **DT-12 es peor que "no expuesto"**: el subcomando existe y no hace nada.
+- **DT-35 y DT-38 cerradas**: `VaultStore::try_load_sync_data` eliminó el último `try_current()` en `AgentDaemon::with_vault_agent`, y `VaultStore::resolve_cipher_key` consolidó las 5 copias de `cipher.key`.
+- **DT-7, DT-40 y DT-41 cerradas**: `tokio 1.54.1`, `rustix 1.1.6` y `async-executor 1.14.1` actualizados; `cargo audit` reporta 0 vulnerabilidades y 0 avisos sobre 468 dependencias.
+- **DT-12 cerrada**: `sw-cli/src/commands/ssh.rs` despacha `Request::ListSshKeys`, `Request::ImportSshKey` y `Request::NewSshKey` por IPC al agente.
 
 ---
 
@@ -65,27 +65,6 @@ tiene la evidencia que la respalda.
 - **Motivo:** M7 se ejecutó a medias; el resto está planificado en la fase 3 del plan de cierre.
 - **Retoma:** Fase 3 del plan de cierre (`docs/05-plan-cierre.md` §3.4–§3.6).
 - **Estado:** Parcial (GUI con 4 rutas).
-
-### DT-7 — `tokio 1.53.2` con warning de `AsyncFd::new`
-- **Descripción:** `cargo audit` reporta `RUSTSEC-2026-0386` (unsound) en `tokio 1.53.2`.
-- **Impacto:** Bajo. No usamos `AsyncFd::new` en el MVP.
-- **Motivo:** Ya existe parche (`>=1.53.3`) y el aviso **no** está exento en `.cargo/audit.toml`.
-- **Retoma:** Fase 4 del plan de cierre (`4.2.3`) + `cargo update -p tokio --precise 1.53.3`.
-- **Estado:** Abierta y no exenta en `.cargo/audit.toml`; fix tokio ≥1.53.3.
-
-### DT-12 — Comando `silverwarden ssh import/add` en el CLI
-- **Descripción:** El agente tiene la lógica IPC implementada (`ImportSSHKey`, `NewSSHKey`), pero `sw-cli` expone `ssh list` y `ssh add` como **stub**: `crates/sw-cli/src/commands/ssh.rs` imprime texto y no llama a ningún `Request` del agente.
-- **Impacto:** Medio (el usuario cree que el comando funciona y no hace nada).
-- **Motivo:** Prioridad enfocada en paridad del daemon SSH y soporte para GUI en M5.
-- **Retoma:** Fase 3.6 del plan de cierre (vista SSH) o tarea específica de CLI.
-- **Estado:** Abierta; `commands/ssh.rs` es un stub.
-
-### DT-13 — Normalizar las claves SSH en Vaultwarden
-- **Descripción:** En Vaultwarden local funcionó con claves de tipo `SSHKey` (tipo 5), pero en instancias como Disroot se guardaron históricamente como `SecureNote`. Además, Vaultwarden filtra los ciphers tipo 5 si el cliente no reporta `Bitwarden-Client-Version >= 2024.12.0`.
-- **Impacto:** Bajo. Mitigado y resuelto con D-M5-3 (soporte dual de tipo 5 y SecureNote) y D49 (`BITWARDEN_CLIENT_VERSION = "2024.12.0"`).
-- **Motivo:** Asegurar interoperabilidad tanto con vaults legados como con implementaciones modernas de Vaultwarden.
-- **Retoma:** M6/M7.
-- **Estado:** Mitigada / Resuelta para Tipo 5 en Vaultwarden moderno (D49).
 
 ### DT-14 — Comandos CLI para Notas, Tarjetas e Identidades
 - **Descripción:** El agente tiene el modelo (`sw-vault`) y la API (`sw-bitwarden-api`), pero el CLI no tiene subcomandos para crear/leer/borrar estos tipos.
@@ -106,13 +85,6 @@ tiene la evidencia que la respalda.
 - **Impacto:** Medio (interoperabilidad entre distintos backends y clientes).
 - **Motivo:** Bitwarden oficial y Vaultwarden evolucionaron en el soporte nativo de tipo 5.
 - **Retoma:** M6/M7.
-- **Estado:** Abierta.
-
-### DT-19 — El CLI no consulta `Status` antes de `Unlock` para omitir el prompt de PIN
-- **Descripción:** En SW-050 se implementó el PinCache en `sw-agent` y el atajo de cache hit cuando no se envía PIN en el payload de `Unlock`. Sin embargo, `sw-cli` (`silverwarden unlock`) aún solicita interactivamente el PIN por terminal antes de enviar la petición IPC, en lugar de consultar primero la acción `Status` del agente para verificar si `pin_cached: true` y omitir el prompt.
-- **Impacto:** Bajo (usabilidad en terminal). El atajo está disponible para clientes IPC (como la futura GUI M7 o llamadas de automatización), pero el CLI aún pide el PIN antes de despachar.
-- **Motivo:** Fuera del alcance estricto de SW-050 (enfocado en el subsistema de agente `sw-agent`).
-- **Retoma:** M6 (refactorización de comandos de sesión en CLI) o M7.
 - **Estado:** Abierta.
 
 ### DT-21 — Backend XDG Desktop Portal para notificaciones (pospuesto a post-MVP)
@@ -164,13 +136,6 @@ tiene la evidencia que la respalda.
 - **Retoma:** Fase 3.1.4 del plan de cierre arquitectónico.
 - **Estado:** Abierta.
 
-### DT-35 — `tokio::runtime::Handle::try_current()` en constructor síncrono de `AgentDaemon`
-- **Descripción:** `AgentDaemon::new()` ya se eliminó, pero `with_vault_agent` sigue usando `tokio::runtime::Handle::try_current()` en `crates/sw-agent/src/lib.rs:326` para tareas en background, en lugar de recibir explícitamente el handle.
-- **Impacto:** Bajo (puede fallar si se instancia fuera de un runtime activo de Tokio).
-- **Motivo:** Conveniencia para entrypoints existentes en el CLI y daemon.
-- **Retoma:** Fase 1.3 del plan de cierre arquitectónico (o tarea nueva de inyección del handle).
-- **Estado:** Parcial; `with_vault_agent` usa `try_current` en `lib.rs:326`.
-
 ### DT-36 — `impl Clone for AsymmetricKey` con `expect` en ruta de producción
 - **Descripción:** La implementación manual de `Clone` para `AsymmetricKey` usa `expect("AsymmetricKey clone must succeed")` como fallback cuando `try_clone()` falla. Esto puede panickar en producción si `mlock` no está disponible (contenedores, entornos restringidos) y el re-parseo también falla.
 - **Impacto:** Bajo (el camino feliz funciona y hay fallback), pero viola P9 ("Cero `unwrap()` en rutas de producción").
@@ -185,13 +150,6 @@ tiene la evidencia que la respalda.
 - **Retoma:** Tarea de refactor de `SymmetricKey` (post-M7), sustituyendo `impl Clone` por `try_clone() -> Result` y propagando el error a los consumidores.
 - **Estado:** Abierta.
 
-### DT-38 — Lógica duplicada de resolución de `cipher.key` en `sw-vault`
-- **Descripción:** La lógica para descifrar `cipher.key` (clave de organización) y usarla para descifrar los campos del cipher está duplicada **5 veces** en producción (`sw-vault/src/lib.rs` líneas 872, 971, 1014, 1204 y 1276) más 1 mención en un mensaje de test. Viola DRY y P6 (una sola razón de cambio).
-- **Impacto:** Bajo (funciona, pero es frágil ante cambios futuros).
-- **Motivo:** Implementación incremental para resolver el bug de las Organizaciones (los 274 logins de Disroot) sin refactorizar los sitios a la vez.
-- **Retoma:** Fase 2.2.2 del plan de cierre (split de `sw-vault`). Extraer `fn resolve_cipher_key(cipher: &Cipher, user_key: &SymmetricKey) -> Option<SymmetricKey>`.
-- **Estado:** Abierta; **5** duplicados de lógica (6 menciones contando el test).
-
 ### DT-39 — Tests de `sw-cli` dependen de `$HOME` y usan `ENV_MUTEX` global
 - **Descripción:** Varios tests de `sw-cli` (`test_resolve_socket_path`, `test_check_goldwarden_go_conflict`, `test_setup_systemd_missing_home`, etc.) leen o modifican `$HOME` y se serializan con un `ENV_MUTEX` global. Esto viola P8 ("Nunca escribe en `$HOME`... Nunca depende del entorno") y es frágil: si un test futuro toca `$HOME` sin el lock, la condición de carrera vuelve (ver el fallo de `test_resolve_socket_path` en la sesión de commits del plan de cierre).
 - **Impacto:** Medio (tests frágiles, no deterministas).
@@ -199,23 +157,56 @@ tiene la evidencia que la respalda.
 - **Retoma:** Tarea de refactor de tests de `sw-cli` (post-M7). Extraer `$HOME` a un parámetro inyectable (`HomeDir` trait o similar) y eliminar el `ENV_MUTEX`.
 - **Estado:** Abierta.
 
-### DT-40 — `rustix 1.1.5` con RUSTSEC-2026-0486 (unsound)
-- **Descripción:** `cargo audit` reporta `RUSTSEC-2026-0486` (unsound) en `rustix 1.1.5`: las funciones `xattr` marcan bytes no escritos como inicializados cuando reciben un buffer de longitud cero.
-- **Impacto:** Bajo. No usamos `xattr` con buffer vacío en el MVP.
-- **Motivo:** Dependencia transitiva; el parche (`>=1.1.6`) ya está publicado.
-- **Retoma:** Fase 4 del plan de cierre (`4.2.3`). `cargo update -p rustix --precise 1.1.6`.
-- **Estado:** Abierta (nueva en la auditoría 2026-11-13).
-
-### DT-41 — `async-executor 1.14.0` yanked
-- **Descripción:** `cargo audit` marca `async-executor 1.14.0` como *yanked*: la versión fue retirada del índice de crates.io.
-- **Impacto:** Bajo. Compila y pasa tests, pero un `cargo update` limpio puede fallar en CI.
-- **Motivo:** Dependencia transitiva (probablemente vía `smol`/`async-io`).
-- **Retoma:** Fase 4 del plan de cierre (`4.2.3`). `cargo update -p async-executor`.
-- **Estado:** Abierta (nueva en la auditoría 2026-11-13).
-
 ---
 
 ## Items Cerrados (Histórico)
+
+### DT-7 — `tokio 1.53.2` con warning de `AsyncFd::new` (`RUSTSEC-2026-0386`)
+- **Descripción:** `cargo audit` reportaba `RUSTSEC-2026-0386` (unsound) en `tokio 1.53.2`.
+- **Resolución:** Actualizado a `tokio 1.54.1` en `Cargo.lock` el 2026-11-14 (`cargo update -p tokio -p rustix@1.1.5 -p async-executor`).
+- **Evidencia:** `cargo audit` (1509 advisories, 468 dependencias) → `0` vulnerabilidades, `0` avisos.
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-12 — Comando `silverwarden ssh list/add` en el CLI
+- **Descripción:** `crates/sw-cli/src/commands/ssh.rs` era un stub que imprimía texto sin conectar al agente por IPC.
+- **Resolución:** Conectado a `AgentClient` el 2026-11-14: `ssh list` envía `Request::ListSshKeys`, `ssh add <ruta-pem>` lee el archivo y envía `Request::ImportSshKey`, y `ssh add <nombre>` envía `Request::NewSshKey` (`Ed25519`), validando cadenas vacías localmente antes de resolver el socket.
+- **Evidencia:** `crates/sw-cli/src/commands/ssh.rs`; `test_handle_command_local_subcommands` y `test_ssh_subcommands` en `crates/sw-cli/src/tests.rs` + `test_cli_local_commands` en `crates/sw-cli/tests/integration.rs` usando sockets mock en `tempdir`.
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-13 — Normalizar las claves SSH en Vaultwarden
+- **Descripción:** En Vaultwarden local funcionó con claves de tipo `SSHKey` (tipo 5), pero en Disroot se guardaron históricamente como `SecureNote`. Además, Vaultwarden filtra los ciphers tipo 5 si el cliente no reporta `Bitwarden-Client-Version >= 2024.12.0`.
+- **Resolución:** Resuelta mediante el soporte dual de `SSHKey` (tipo 5) y `SecureNote` (`D-M5-3`) junto con `BITWARDEN_CLIENT_VERSION = "2024.12.0"` (`D49`).
+- **Estado:** Cerrada (validada por D-M5-3 y D49).
+
+### DT-19 — El CLI consulta `Status` antes de `Unlock` para omitir el prompt de PIN
+- **Descripción:** `crates/sw-cli/src/commands/unlock.rs` pedía el PIN interactivamente cuando no se pasaba `--pin`, sin consultar primero el estado del caché del agente.
+- **Resolución:** Cuando `pin` es `None`, `commands/unlock.rs` consulta `Request::Status` y verifica `pin_cached`: si es `true`, envía `Request::Unlock { pin: None }` sin invocar el prompt; si es `false`, solicita el PIN interactivo y usa `call_ok` para propagar errores del agente.
+- **Evidencia:** `crates/sw-cli/src/commands/unlock.rs`; `test_handle_command_unlock_with_pin_and_interactive` (`sw-cli/src/tests.rs`) + `test_cli_unlock_with_mock_agent` y `test_cli_unlock_agent_error` (`sw-cli/tests/integration.rs`).
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-35 — `tokio::runtime::Handle::try_current()` en constructor síncrono de `AgentDaemon`
+- **Descripción:** `AgentDaemon::with_vault_agent` en `crates/sw-agent/src/lib.rs` usaba `tokio::runtime::Handle::try_current()` para lanzar `load_sync_data` en segundo plano si encontraba `vault.json`.
+- **Resolución:** Extraído el helper compartido `VaultStore::apply_sync_data` y añadido `VaultStore::try_load_sync_data(&self, SyncData) -> bool` en `crates/sw-vault/src/store.rs` usando `try_write()` no bloqueante; `AgentDaemon::with_vault_agent` carga `vault.json` de forma síncrona y determinista sin consultar el runtime de Tokio.
+- **Evidencia:** `rg -n "try_current" crates --glob '!target'` → `0` coincidencias; tests de `sw-vault` (`41 passed`, incluyendo `try_load_sync_data` fuera de runtime y bajo contención) y `sw-agent` (`77 passed`, `+2` manuales ignorados); `./scripts/check-file-size.sh` (`crates/sw-agent/src/lib.rs` en `761` líneas, `0` violaciones).
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-40 — `rustix 1.1.5` con `RUSTSEC-2026-0486`
+- **Descripción:** `cargo audit` reportaba `RUSTSEC-2026-0486` (unsound en `xattr` con buffer vacío) en `rustix 1.1.5`.
+- **Resolución:** Actualizado a `rustix 1.1.6` en `Cargo.lock` el 2026-11-14 (`cargo update -p tokio -p rustix@1.1.5 -p async-executor`).
+- **Evidencia:** `cargo audit` → `0` vulnerabilidades, `0` avisos.
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-41 — `async-executor 1.14.0` yanked
+- **Descripción:** `cargo audit` marcaba `async-executor 1.14.0` como *yanked* en crates.io.
+- **Resolución:** Actualizado a `async-executor 1.14.1` en `Cargo.lock` el 2026-11-14 (`cargo update -p tokio -p rustix@1.1.5 -p async-executor`).
+- **Evidencia:** `cargo audit` → `0` vulnerabilidades, `0` avisos (`cargo test --workspace --exclude sw-gui` → `508 passed, 0 failed, 5 ignored`; `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` → exit `0`; `cargo check --manifest-path crates/sw-gui/src-tauri/Cargo.toml` → exit `0`; `cargo fmt --all -- --check` → exit `0`).
+- **Estado:** Cerrada en el árbol de trabajo (2026-11-14).
+
+### DT-38 — Lógica duplicada de resolución de `cipher.key` en `sw-vault`
+- **Descripción:** La lógica para descifrar `cipher.key` (clave de organización) y usarla para descifrar campos del cipher estuvo duplicada **5 veces** en producción (originalmente en `sw-vault/src/lib.rs`, trasladada sin cambios de comportamiento a `crates/sw-vault/src/decrypt.rs` durante el split `2.2.2`).
+- **Resolución:** Consolidada el 2026-11-14 en `VaultStore::resolve_cipher_key(cipher: &Cipher, user_key: &SymmetricKey) -> Option<SymmetricKey>` dentro de `crates/sw-vault/src/decrypt.rs`, sustituyendo los 5 sitios duplicados (`filter_logins`, `filter_notes`, `decrypt_cipher`, `extract_ssh_key_ciphers`, `extract_legacy_ssh_notes`).
+- **Evidencia:** `rg -n "cipher\.key" crates/sw-vault/src --glob '!tests.rs'` → **1 sola ocurrencia** (`decrypt.rs:13`); `crates/sw-vault/src/decrypt.rs` baja a `402` líneas; `./scripts/check-file-size.sh` → OK (`violaciones: 0`); `cargo test -p sw-vault -p sw-agent -p sw-vault-agent` → `41 passed` (`sw-vault`, incluidos 11 `caracterizacion_*`), `77 passed` (`sw-agent`, +2 manuales ignorados) y `23 passed` (`sw-vault-agent`); `cargo clippy -p sw-vault --all-targets -- -D warnings` y `cargo fmt --all -- --check` → exit `0`.
+- **Estado:** Cerrada en el árbol de trabajo (Fase 2, 2026-11-14).
 
 ### DT-42 — Dependencias declaradas sin uso (11)
 - **Descripción:** `cargo check --workspace --all-targets` reportaba 11 dependencias declaradas y no usadas:

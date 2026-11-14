@@ -349,20 +349,35 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - **Estado real (2026-11-13):** 638 líneas de producción; `VaultAgentServer` vive en `sw-vault-agent`. No requiere split adicional.
   - Verificación: `awk '/^(pub )?mod tests/{print NR-1; exit}' crates/sw-ssh-agent/src/lib.rs` → 638; `cargo test -p sw-ssh-agent`.
 
-- [ ] **2.2.2 — `sw-vault/src/lib.rs` (1.375 líneas de producción)**
+- [x] **2.2.2 — `sw-vault/src/lib.rs` (1.375 líneas de producción)**
   - Extraer `store.rs` (store y concurrencia).
   - Extraer `models.rs` (modelos y tipos de ciphers).
   - Extraer `decrypt.rs` (descifrado y resolución de claves).
   - Extraer `storage.rs` (persistencia y permisos `0600`).
   - Dejar `lib.rs` < 300 líneas.
   - Verificación: `cargo test -p sw-vault`, `cargo clippy -p sw-vault -- -D warnings`, `wc -l` producción ≤800.
+  - **Estado real (2026-11-14):** dividido en `models.rs` (484), `decrypt.rs` (402 tras cerrar DT-38 con `VaultStore::resolve_cipher_key`; originalmente 438 en el split),
+    `store.rs` (332) y `storage.rs` (136); `lib.rs` queda en 18 líneas antes de
+    `mod tests;` (19 totales). 0 violaciones y 0 avisos en `sw-vault` en
+    `./scripts/check-file-size.sh`. `cargo test -p sw-vault` (41 passed, incluidos
+    11 `caracterizacion_*`), `cargo test -p sw-agent -p sw-vault-agent`,
+    `cargo clippy -p sw-vault --all-targets -- -D warnings` y
+    `cargo fmt --all -- --check` en verde.
 
-- [ ] **2.2.3 — `sw-bitwarden-api/src/lib.rs` (1.004 líneas de producción)**
+- [x] **2.2.3 — `sw-bitwarden-api/src/lib.rs` (1.004 líneas de producción)**
   - Extraer `client.rs` (cliente HTTP autenticado).
   - Extraer `sync.rs` (sincronización de vault).
   - Extraer `auth.rs` (autenticación y 2FA).
   - Dejar `lib.rs` < 300 líneas.
   - Verificación: `cargo test -p sw-bitwarden-api`, `cargo clippy -p sw-bitwarden-api -- -D warnings`, `wc -l` producción ≤800.
+  - **Estado real (2026-11-14):** dividido en `auth.rs` (489), `client.rs` (401)
+    y `sync.rs` (110); `lib.rs` queda en 35 líneas antes de `mod tests;` (36
+    totales). `./scripts/check-file-size.sh` pasa completo (`Archivos medidos: 64 ·
+    violaciones: 0 · avisos: 7`). `cargo test -p sw-bitwarden-api` (72 passed,
+    incluidos 8 `caracterizacion_*`), `cargo test -p sw-agent` (77 passed + 2
+    manuales ignorados), `cargo clippy -p sw-bitwarden-api --all-targets -- -D
+    warnings`, `cargo fmt --all -- --check` y `cargo check --workspace --exclude
+    sw-gui` en verde.
 
 - [x] **2.2.4 — Tests de caracterización antes de cada split**
   - Antes de mover código, capturar el comportamiento actual: tests existentes, snapshots de respuestas o fixtures.
@@ -383,35 +398,83 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
     - `cargo test --workspace` → 508 passed, 0 failed.
     - `cargo fmt --all -- --check` y `cargo clippy -p sw-vault -p sw-bitwarden-api --all-targets -- -D warnings` → limpios.
 
-### 2.3. Limpieza opcional de zona de alarma
+### 2.3. Limpieza de zona de alarma y cohesión (originalmente opcional; ejecutada al 100 % en Fase 2)
 
-- [ ] **2.3.1 — `sw-config/src/lib.rs` (695 líneas de producción)**
-  - Opcional: extraer `model.rs`, `paths.rs`, `migration.rs`, `defaults.rs`.
-  - No es un incumplimiento de P6; es zona de alarma.
-  - Verificación: `cargo test -p sw-config`.
+> **Nota de ejecución (2026-11-14):** Aunque el plan original clasificaba `2.3.1`–`2.3.3` como mejoras opcionales (ninguna superaba el límite P6 de 800 líneas de producción) que podían diferirse tras la v1.0, durante la Fase 2 se decidió explícitamente ejecutarlas y verificarlas todas antes del cierre. **Ninguna de las tres quedó diferida.**
 
-- [ ] **2.3.2 — `sw-bitwarden-api/src/websocket.rs` (530 líneas de producción)**
-  - Opcional: extraer `protocol.rs`, `connection.rs`, `dispatcher.rs`.
-  - No es un incumplimiento de P6.
-  - Verificación: `cargo test -p sw-bitwarden-api`.
+- [x] **2.3.1 — `sw-config/src/lib.rs` (695 líneas de producción → dividido por decisión explícita en fase 2)**
+  - Extraídos los módulos reales de producción manteniendo intactos los re-exports públicos de `sw_config`:
+    - `crates/sw-config/src/defaults.rs`: 104 líneas (`TINK_HEADER`, `NONCE_LEN`, `KDF_*`, `DEFAULT_PIN_CACHE_TTL_SECS`, `DEFAULT_IDLE_TTL_SECS`, `derive_server_urls`, `RuntimeConfig`).
+    - `crates/sw-config/src/migration.rs`: 147 líneas (`MIGRATION_SUCCESS_MSG`, `get_old_config_path`, `get_new_config_path`, `migrate_old_path*`, `backup_config`, `run_migration*`).
+    - `crates/sw-config/src/model.rs`: 453 líneas (`ConfigError`, helpers de clave/PIN/cifrado, `ConfigFile`, `LoginToken`).
+    - `crates/sw-config/src/paths.rs`: 83 líneas (creado en 1.5.1, sin cambios en 2.3.1).
+    - `crates/sw-config/src/tests.rs`: 1003 líneas (tests unitarios extraídos de `lib.rs`).
+    - `crates/sw-config/src/lib.rs`: 28 líneas totales (27 líneas antes de `#[cfg(test)] mod tests;`).
+  - Verificación real:
+    - `./scripts/check-file-size.sh` → OK (`Archivos medidos: 67 · violaciones: 0 · avisos: 6`; `sw-config` queda sin avisos ni violaciones).
+    - `cargo test -p sw-config -p sw-agent` → `sw-config` unittests `36 passed; 0 failed; 0 ignored` + `tests/test_parity.rs` `0 passed; 0 failed; 1 ignored` (`uses 2 GiB of RAM, run manually`); `sw-agent` unittests `77 passed; 0 failed; 0 ignored` + `manual_logind` `1 ignored` + `manual_polkit` `1 ignored` (doc-tests `0`).
+    - `cargo clippy -p sw-config --all-targets -- -D warnings`, `cargo fmt --all -- --check` y `cargo check --workspace --exclude sw-gui` → OK (exit 0).
 
-- [ ] **2.3.3 — `sw-systemauth/src/lib.rs` (405 líneas de producción)**
-  - Opcional por cohesión: extraer `process.rs` y `pam.rs`.
-  - No es un incumplimiento de P6.
-  - Verificación: `cargo test -p sw-systemauth`.
+- [x] **2.3.2 — `sw-bitwarden-api/src/websocket.rs` (532 líneas de producción → dividido por decisión explícita en fase 2)**
+  - Extraídos los submódulos reales manteniendo intactos los re-exports públicos y `#[path = "websocket_tests.rs"]`:
+    - `crates/sw-bitwarden-api/src/websocket/protocol.rs`: 193 líneas (`NOTIFICATION_*`, `NotificationMessage`, `MsgPackValue`, `parse_message_pack`, `parse_raw_msgpack`, `encode_notification_message`, `build_hub_url`).
+    - `crates/sw-bitwarden-api/src/websocket/connection.rs`: 134 líneas (`WsStream`, `WebsocketClient` y su `impl`).
+    - `crates/sw-bitwarden-api/src/websocket/dispatcher.rs`: 212 líneas (`run_websocket_daemon`, `run_websocket_daemon_with_options`, `get_or_create_api_client`).
+    - `crates/sw-bitwarden-api/src/websocket.rs`: 20 líneas totales (`17` líneas antes de `#[cfg(test)]`).
+    - `crates/sw-bitwarden-api/src/websocket_tests.rs`: 686 líneas (añadidos los imports explícitos que antes heredaba por `use super::*;`).
+  - Verificación real:
+    - `./scripts/check-file-size.sh` → OK (`Archivos medidos: 70 · violaciones: 0 · avisos: 5`; desaparece el `WARN` de `websocket.rs`, `sw-bitwarden-api` queda sin avisos ni violaciones).
+    - `cargo test -p sw-bitwarden-api -p sw-agent` → `sw-bitwarden-api` unittests `72 passed; 0 failed; 0 ignored`; `sw-agent` unittests `77 passed; 0 failed; 0 ignored` + `manual_logind` `1 ignored` + `manual_polkit` `1 ignored` (doc-tests `0`).
+    - `cargo clippy -p sw-bitwarden-api --all-targets -- -D warnings` y `cargo fmt --all -- --check` → OK (exit 0).
 
-- [ ] **2.3.4 — No bloquear el cierre por 2.3.x**
-  - Estas tareas pueden quedar fuera de la v1.0 del plan.
-  - DoD: el plan distingue “obligatorio” de “mejora”.
+- [x] **2.3.3 — `sw-systemauth/src/lib.rs` (405 líneas de producción / 869 totales → dividido por decisión explícita en fase 2)**
+  - Nota de arquitectura: `sw-systemauth` no implementa PAM; la autenticación del sistema vía Polkit D-Bus ya reside en `crates/sw-systemauth/src/biometrics.rs` (181 líneas). Se extrajo por cohesión `session.rs`, `process.rs` y `tests.rs`, manteniendo intactos los re-exports públicos de `sw_systemauth`:
+    - `crates/sw-systemauth/src/session.rs`: 178 líneas (`CallingContext`, `AuthSession`, `SessionType`, `Session`, `SessionStore`).
+    - `crates/sw-systemauth/src/process.rs`: 224 líneas (`ProcessInfo`, `resolve_username`, `parse_proc_stat`, `get_process_info`, `get_process_start_time`, `resolve_calling_context_with_lookup`, `get_calling_context_for_pid`, `get_calling_context`).
+    - `crates/sw-systemauth/src/biometrics.rs`: 181 líneas (sin cambios).
+    - `crates/sw-systemauth/src/tests.rs`: 449 líneas (tests unitarios extraídos de `lib.rs`).
+    - `crates/sw-systemauth/src/lib.rs`: 13 líneas totales (`11` líneas antes de `#[cfg(test)]`).
+  - Verificación real:
+    - `./scripts/check-file-size.sh` → OK (`Archivos medidos: 72 · violaciones: 0 · avisos: 5`; todos los archivos de `sw-systemauth` quedan por debajo de 225 líneas).
+    - `cargo test -p sw-systemauth -p sw-agent -p sw-ssh-agent` → `sw-systemauth` unittests `24 passed; 0 failed; 0 ignored`; `sw-ssh-agent` unittests `20 passed; 0 failed; 0 ignored`; `sw-agent` unittests `77 passed; 0 failed; 0 ignored` + `manual_logind` `1 ignored` + `manual_polkit` `1 ignored` (doc-tests `0`).
+    - `cargo clippy -p sw-systemauth --all-targets -- -D warnings` y `cargo fmt --all -- --check` → OK (exit 0).
+
+- [x] **2.3.4 — Criterio obligatorio vs. mejora en `2.3.x` (sin diferimientos en la ejecución real)**
+  - Plan original: clasificaba `2.3.1`–`2.3.3` como mejoras de alarma/cohesión que no bloqueaban el cierre ni tenían obligación de entrar en v1.0.
+  - DoD: el plan distingue “obligatorio” (`§2.2`, >800 líneas de producción) de “mejora” (`§2.3`, ≤800 líneas).
+  - **Estado real (2026-11-14):** La distinción `obligatorio` (`§2.2`) vs. `mejora` (`§2.3`) queda mantenida en el plan, pero **no se difirió ninguna tarea de `2.3.x`**: por decisión explícita en Fase 2 se ejecutaron, probaron y cerraron las tres (`2.3.1`, `2.3.2` y `2.3.3`). No quedan ítems pendientes ni fuera de v1.0 en `§2.3`.
 
 ### 2.4. Verificación de fase
 
-- [ ] **2.4.1 — Ejecutar los gates**
+- [x] **2.4.1 — Ejecutar los gates**
   - `./scripts/check-file-size.sh`
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo fmt --all -- --check`
   - DoD: 3 splits obligatorios cerrados; 0 archivos de producción >800.
+  - **Evidencia real (2026-11-14):**
+    - `./scripts/check-file-size.sh` → exit `0`: `Archivos medidos: 72 · violaciones: 0 · avisos: 5` — `OK: ningún archivo de producción supera 800 líneas.`
+      - Avisos restantes (todos ≤766 líneas de producción): `crates/sw-agent/src/handlers/session.rs` (522), `crates/sw-cli/src/main.rs` (554), `crates/sw-ssh-agent/src/lib.rs` (637), `crates/sw-vault-agent/src/agent.rs` (662), `crates/sw-agent/src/lib.rs` (766).
+    - `cargo test --workspace --exclude sw-gui` → exit `0` (**508 passed, 0 failed, 5 ignored**; doc-tests `0`):
+      - `sw-agent`: `77 passed` (`src/lib.rs`), `0` (`src/main.rs`), `1 ignored` (`tests/manual_logind.rs`), `1 ignored` (`tests/manual_polkit.rs`).
+      - `sw-bitwarden-api`: `72 passed`.
+      - `sw-cli`: `122 passed` (`src/main.rs`) + `10 passed` (`tests/integration.rs`).
+      - `sw-client`: `4 passed`.
+      - `sw-config`: `36 passed` (`src/lib.rs`), `1 ignored` (`tests/test_parity.rs`).
+      - `sw-crypto`: `66 passed`.
+      - `sw-ipc`: `8 passed`.
+      - `sw-notify`: `5 passed` (`src/lib.rs`), `2 ignored` (`tests/manual_dbus.rs`).
+      - `sw-ssh-agent`: `20 passed`.
+      - `sw-systemauth`: `24 passed`.
+      - `sw-vault`: `41 passed`.
+      - `sw-vault-agent`: `23 passed`.
+      - `sw-autotype`, `sw-browserbiometrics`: `0 passed`.
+    - `cargo clippy --workspace --exclude sw-gui --all-targets -- -D warnings` → exit `0` (con aviso esperado `excluded package(s) sw-gui not found in workspace`).
+    - `cargo check --manifest-path crates/sw-gui/src-tauri/Cargo.toml` → exit `0` (`sw-gui` verificado aparte).
+    - `cargo fmt --all -- --check` → exit `0`.
+  - **Cierre de Fase 2 (2026-11-14):** Las 12 tareas de Fase 2 (`2.1.1`–`2.4.1`) completadas:
+    - Obligatorios cerrados: `sw-ssh-agent/src/lib.rs` (`2.2.1`), `sw-vault/src/lib.rs` (`2.2.2`, 1.375 → 18 pre-tests + 4 módulos), `sw-bitwarden-api/src/lib.rs` (`2.2.3`, 1.004 → 35 pre-tests + 3 módulos), tests de caracterización (`2.2.4`).
+    - Zona de alarma/cohesión cerrados: `sw-config/src/lib.rs` (`2.3.1`, 701 → 27 pre-tests + 4 módulos + `tests.rs`), `sw-bitwarden-api/src/websocket.rs` (`2.3.2`, 532 → 17 pre-`#[cfg(test)]` + 3 submódulos), `sw-systemauth/src/lib.rs` (`2.3.3`, 406 → 11 pre-`#[cfg(test)]` + `session.rs`/`process.rs`/`biometrics.rs` + `tests.rs`).
 
 ---
 
@@ -607,9 +670,10 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 - [ ] **4.1.2 — `scripts/coverage-production.py`**
   - `cargo llvm-cov`.
-  - Excluye tests y `#[cfg(test)]`.
-  - Falla <90%.
-  - Verificación: ejecución local con el repo actual.
+  - Excluye tests (`tests.rs`, `*_tests.rs`, `tests/`, `fuzz/`) filtrando únicamente rutas relativas con prefijo `crates/` respecto a la raíz del repo (sin depender de `os.path.exists` sobre rutas absolutas), e imprime `Entradas ignoradas por ruta no válida: N`.
+  - Ejecuta `cargo llvm-cov clean --workspace` por defecto (`--clean`, desactivable con `--reuse` o `--no-clean`) y valida reproducibilidad con tolerancia de `0.01 %` (exit `3` si la medición no es determinista).
+  - Falla <90% (exit `1`; exit `2` si falta `cargo-llvm-cov`).
+  - Verificación: ejecución local limpia y repetida con el repo actual.
 
 - [ ] **4.1.3 — `scripts/check-generated-types.sh`**
   - Ejecuta `cargo test -p sw-ipc --features ts`.
@@ -627,7 +691,8 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 - [ ] **4.2.2 — Job `coverage`**
   - Instalar `cargo-llvm-cov` y `llvm-tools-preview`.
   - `python3 ./scripts/coverage-production.py`.
-  - Verificación: el job publica el porcentaje y falla por debajo de 90.
+  - El script ya no depende del estado previo de `target/` ni de rutas absolutas locales: limpia `target/` por defecto (`cargo llvm-cov clean --workspace`), filtra por prefijo relativo `crates/` y comprueba reproducibilidad (`±0.01 %`). En CI se ejecutará siempre con `target/` limpio.
+  - Verificación: el job publica el porcentaje, exige `Entradas ignoradas por ruta no válida: 0` y falla por debajo de 90 %.
 
 - [ ] **4.2.3 — Job `audit`**
   - Instalar `cargo-audit`.
@@ -772,19 +837,19 @@ Toda tarea, antes de marcarse, cumple:
 
 ## 9. Deuda técnica: cierre o diferimiento
 
-El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 23 fichas abiertas (2 mitigadas, 1 parcial) y 13 cerradas tras la auditoría 2026-11-13. Este plan cierra o difiere explícitamente cada una:
+El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 15 fichas abiertas (1 mitigada, 1 parcial y 13 abiertas) y 21 cerradas tras la auditoría 2026-11-13, el cierre de Fase 2 y el cierre de deuda rápida del 2026-11-14. Este plan cierra o difiere explícitamente cada una:
 
-| DT    | Tema                                       | Disposición                                                 |
-| ----- | ------------------------------------------ | ----------------------------------------------------------- |
-| DT-2  | FIDO2 stub                                 | Fuera de alcance (post-MVP)                                 |
-| DT-5  | GUI Tauri                                  | Parcial; se cubre en Fase 3                                 |
-| DT-7  | `tokio` RUSTSEC-2026-0386                  | Fase 4: upgrade ≥1.53.3 + `cargo audit`                     |
-| DT-12 | CLI SSH import/add (stub)                  | Fase 3.6 o tarea de CLI                                     |
-| DT-13 | Claves SSH legacy                          | Mitigada; se mantiene el soporte dual (tipo 5 + SecureNote) |
+| DT    | Tema                                       | Disposición                                                        |
+| ----- | ------------------------------------------ | ------------------------------------------------------------------ |
+| DT-2  | FIDO2 stub                                 | Fuera de alcance (post-MVP)                                        |
+| DT-5  | GUI Tauri                                  | Parcial; se cubre en Fase 3                                        |
+| DT-7  | `tokio` RUSTSEC-2026-0386                  | **Cerrada** (2026-11-14, `tokio 1.54.1`; `cargo audit` limpio)     |
+| DT-12 | CLI SSH import/add (stub)                  | **Cerrada** (2026-11-14, IPC `ListSshKeys`/`ImportSshKey`/`NewSshKey`) |
+| DT-13 | Claves SSH legacy                          | **Cerrada** (D-M5-3 + D49; soporte dual tipo 5 y SecureNote)       |
 | DT-14 | CLI notas/tarjetas/identidades             | Fuera de alcance                                            |
 | DT-15 | Pwned Passwords                            | Fuera de alcance                                            |
 | DT-16 | SSH legacy SecureNote                      | Mitigada; se mantiene                                       |
-| DT-19 | CLI no consulta `Status` antes de `Unlock` | Diferido; documentar en README                              |
+| DT-19 | CLI no consulta `Status` antes de `Unlock` | **Cerrada** (2026-11-14, consulta `Status` / `pin_cached`)         |
 | DT-20 | `PinCache` con sleep real                  | **Cerrada** en 1.1.4 (`FakeClock`)                          |
 | DT-21 | XDG Portal                                 | Fuera de alcance                                            |
 | DT-22 | systemd-logind manual                      | Fuera de alcance                                            |
@@ -793,19 +858,19 @@ El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 23 
 | DT-26 | Listado paginado                           | Fuera de alcance                                            |
 | DT-33 | `From<String>` con `contains()`            | Fase 3.1.4                                                  |
 | DT-34 | `json!` en `dispatch_request`              | Fase 3.1.4                                                  |
-| DT-35 | `try_current` en `with_vault_agent`        | Parcial; tarea de inyección del handle                      |
+| DT-35 | `try_current` en `with_vault_agent`        | **Cerrada** (2026-11-14, `VaultStore::try_load_sync_data`)         |
 | DT-36 | `Clone` + `expect` (asimétrica)            | Post-M7                                                     |
 | DT-37 | `Clone` + `expect` (simétrica)             | Post-M7                                                     |
-| DT-38 | `cipher.key` duplicado ×5                  | Fase 2.2.2                                                  |
+| DT-38 | `cipher.key` duplicado ×5                  | **Cerrada** en Fase 2 (`resolve_cipher_key` en `decrypt.rs`) |
 | DT-39 | Tests de `sw-cli` dependen de `$HOME`      | Post-M7                                                     |
-| DT-40 | `rustix 1.1.5` RUSTSEC-2026-0486           | Fase 4: upgrade ≥1.1.6                                      |
-| DT-41 | `async-executor` yanked                    | Fase 4: `cargo update`                                      |
+| DT-40 | `rustix 1.1.5` RUSTSEC-2026-0486           | **Cerrada** (2026-11-14, `rustix 1.1.6`)                           |
+| DT-41 | `async-executor` yanked                    | **Cerrada** (2026-11-14, `async-executor 1.14.1`)                  |
 | DT-42 | 11 dependencias sin uso                    | **Cerrada** (2026-11-14)                                    |
 
 - [ ] **9.1 — Actualizar `docs/deuda-tecnica.md`** con la disposición y el issue de cada ítem.
-  - **Estado (2026-11-14):** las 23 fichas abiertas tienen disposición en la tabla
-    "Auditoría 2026-11-13". Faltan los issues de GitHub para los diferidos
-    (DT-2, DT-14, DT-15, DT-19, DT-21, DT-22, DT-24, DT-25, DT-26, DT-36, DT-37, DT-39).
+  - **Estado (2026-11-14):** las 15 fichas abiertas y las 21 cerradas están actualizadas en la
+    tabla "Auditoría 2026-11-13". Faltan los issues de GitHub para los diferidos
+    (DT-2, DT-14, DT-15, DT-21, DT-22, DT-24, DT-25, DT-26, DT-36, DT-37, DT-39).
 - [ ] **9.2 — Revisar el título/subtítulo** para que no prometa “cero deuda” funcional; el alcance es deuda arquitectónica.
 - [ ] **9.3 — Verificación:** ningún DT abierto queda sin disposición.
 
