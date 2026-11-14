@@ -70,14 +70,14 @@ Reglas:
 
 ### 2.2. Lo que el plan v3.0 daba por cerrado y no lo está
 
-| Claim v3.0 | Estado real | Evidencia |
-|---|---|---|
-| “Eliminado el singleton `shared_vault_agent()`” | ❌ Sigue existiendo y se usa | `crates/sw-ssh-agent/src/lib.rs:981-996`, `crates/sw-cli/src/commands/agent.rs:23` |
-| “`VaultAgentServer` inyectado por constructor” | ❌ El daemon crea otra instancia distinta | `crates/sw-agent/src/lib.rs:317-320` frente a `crates/sw-ssh-agent/src/lib.rs:989` |
-| “Eliminada la dependencia `sw-cli` → `sw-agent`” | ❌ `sw-cli` sigue dependiendo | `crates/sw-cli/Cargo.toml`, `crates/sw-cli/src/main.rs:259`, `crates/sw-cli/src/commands/agent.rs:15` |
-| “Contrato IPC tipado” | ⚠️ Parcial: quedan `Value` en la frontera | `crates/sw-ipc/src/lib.rs:34,36,98` |
-| “`sw-client` es la fachada única” | ⚠️ Cierto para framing; la GUI sigue construyendo el socket | `crates/sw-gui/src-tauri/src/lib.rs:83-86` |
-| “Guía en `docs/04-buenas-practicas.md`” | ❌ Ese archivo no existe | La guía está en `../continuidad/04-buenas-practicas.md` |
+| Claim v3.0                                       | Estado real                                                 | Evidencia                                                                                             |
+| ------------------------------------------------ | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| “Eliminado el singleton `shared_vault_agent()`”  | ❌ Sigue existiendo y se usa                                | `crates/sw-ssh-agent/src/lib.rs:981-996`, `crates/sw-cli/src/commands/agent.rs:23`                    |
+| “`VaultAgentServer` inyectado por constructor”   | ❌ El daemon crea otra instancia distinta                   | `crates/sw-agent/src/lib.rs:317-320` frente a `crates/sw-ssh-agent/src/lib.rs:989`                    |
+| “Eliminada la dependencia `sw-cli` → `sw-agent`” | ❌ `sw-cli` sigue dependiendo                               | `crates/sw-cli/Cargo.toml`, `crates/sw-cli/src/main.rs:259`, `crates/sw-cli/src/commands/agent.rs:15` |
+| “Contrato IPC tipado”                            | ⚠️ Parcial: quedan `Value` en la frontera                   | `crates/sw-ipc/src/lib.rs:34,36,98`                                                                   |
+| “`sw-client` es la fachada única”                | ⚠️ Cierto para framing; la GUI sigue construyendo el socket | `crates/sw-gui/src-tauri/src/lib.rs:83-86`                                                            |
+| “Guía en `docs/04-buenas-practicas.md`”          | ❌ Ese archivo no existe                                    | La guía está en `../continuidad/04-buenas-practicas.md`                                               |
 
 ### 2.3. El bug que el plan no ve: dos vaults en el mismo proceso
 
@@ -133,6 +133,7 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - DoD: los tests de TTL pasan 50 veces seguidas sin fallos.
 
 - [x] **1.1.5 — Sustituir los `sleep` de sincronización de IPC**
+  - **Estado real (2026-11-13):** completado (incluyendo `1.1.5b`). Sustituidos los 9 `tokio::time::sleep` de `crates/sw-cli/src/tests.rs` y el de `crates/sw-agent/src/tests.rs` por el helper `wait_until(desc, timeout, cond)`.
   - Objetivo: que los tests no esperen a que “arranque algo”.
   - Pasos:
     - Identificar los `sleep` que esperan a que el servidor/cliente esté listo (14 en `sw-agent`, 8 en `sw-cli`).
@@ -141,12 +142,13 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Verificación: `grep -rn "tokio::time::sleep" crates/sw-agent/src/tests.rs crates/sw-cli/src/tests.rs` solo muestra casos justificados y documentados.
   - DoD: la suite no depende de esperas fijas; no hay `sleep` como mecanismo de sincronización.
 
-- [ ] **1.1.6 — Verificación de fase**
+- [x] **1.1.6 — Verificación de fase**
   - `cargo test -p sw-agent`
   - `cargo test -p sw-cli`
   - `cargo clippy -p sw-agent -p sw-cli --all-targets -- -D warnings`
   - Ejecutar la suite 50 veces: `for i in $(seq 1 50); do cargo test -p sw-agent --quiet || break; done`
   - DoD: 50/50 en verde y sin pausas de tiempo real en los tests de TTL.
+  - **Evidencia (2026-11-13):** `50/50` ejecuciones de `cargo test -p sw-agent --quiet` en verde (77 passed, 0 failed en cada iteración); `cargo test -p sw-cli` en verde (122 unitarios + 10 integración, 0 failed); `cargo clippy -p sw-agent -p sw-cli --all-targets -- -D warnings` sin warnings; `rg -n "std::thread::sleep|tokio::time::sleep" crates/sw-agent/src crates/sw-cli/src` muestra únicamente los 2 sondeos internos de `wait_until` (`crates/sw-agent/src/tests.rs:14`, `crates/sw-cli/src/tests.rs:1186`) y el test unitario del reloj real `SystemClock` (`crates/sw-agent/src/ports/clock.rs:70`, `test_system_clock_advances`), sin ningún sleep de TTL.
 
 ### 1.2. Subdivisión de `AgentState`
 
@@ -251,16 +253,24 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - `sw-gui/src-tauri/src/lib.rs` deja de hardcodear `~/.silverwarden.sock`.
   - Verificación: `grep -rn "silverwarden.sock" crates/` solo aparece en `sw-config` y tests.
 
-- [ ] **1.5.3 — Corregir la verificación de la dependencia**
+- [x] **1.5.3 — Corregir la verificación de la dependencia**
   - No afirmar que mover la ruta elimina `sw-cli → sw-agent`: `sw-cli` sigue usando `sw_agent::run_agent`.
   - Si se quiere eliminar esa dependencia, separar el binario del daemon (ver 1.5.4).
   - Verificación: `cargo tree -p sw-cli | grep sw-agent` documenta la dependencia real.
+  - **Evidencia (2026-11-13):** `cargo tree -p sw-cli | rg sw-agent` →
+    `├── sw-agent v0.1.0 (/home/hermes/Proyectos/SilverWarden-RS/SilverWarden-Rs/crates/sw-agent)`.
+    Documentada como dependencia esperada en `scripts/check-deps.sh` y corregida la afirmación previa en ADR-0008 §1.
 
-- [ ] **1.5.4 — Decidir el arranque del daemon**
+- [x] **1.5.4 — Decidir el arranque del daemon**
   - Opción A: `sw-cli agent start` sigue siendo el entrypoint y `sw-cli` depende de `sw-agent` (aceptado y documentado).
   - Opción B: `sw-agent` se convierte en binario real (`src/main.rs` sirve el socket) y `sw-cli` lo executa.
   - Verificación: `cargo run -p sw-agent` no termina inmediatamente (si se elige B).
   - DoD: la decisión queda en ADR-0008.
+  - **Evidencia (2026-11-13):** Opción A aceptada en
+    `docs/adr/adr-0008-daemon-entrypoint-and-paths.md`. `sw-cli agent start`
+    compone `VaultAgentServer`, lanza `run_agent` + `SshAgentServer`, espera
+    `Ctrl+C` y limpia los sockets. `sw-agent/src/main.rs` queda como utilidad de
+    desarrollo, no como entrypoint.
 
 ---
 
@@ -270,47 +280,74 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 2.1. Criterio de medición
 
-- [ ] **2.1.1 — Corregir `scripts/check-file-size.sh`**
+- [x] **2.1.1 — Corregir `scripts/check-file-size.sh`**
   - Contar solo código fuera de `#[cfg(test)]`.
   - Excluir `tests.rs`, `tests/`, `target/` y `fuzz/`.
   - Fallar con código 1 si un archivo de producción supera 800 líneas.
   - Avisar (sin fallar) entre 500 y 800.
   - Verificación: el script falla con un archivo de prueba de 801 líneas y pasa con el repo actual.
+  - **Estado real (2026-11-14):** `scripts/check-file-size.sh` creado con `--self-test`.
+    El repo **no pasa todavía**: detecta 2 violaciones reales
+    (`sw-vault/src/lib.rs` 1.376 y `sw-bitwarden-api/src/lib.rs` 1.005), que son
+    exactamente 2.2.2 y 2.2.3. El self-test sí pasa (600 → WARN, 801 → exit 1,
+    tests excluidos).
+  - **Evidencia:** `./scripts/check-file-size.sh --self-test` → `SELF-TEST OK`;
+    `./scripts/check-file-size.sh` → `Archivos medidos: 57 · violaciones: 2 · avisos: 7`.
 
-- [ ] **2.1.2 — Mover tests inline a archivos separados**
+- [x] **2.1.2 — Mover tests inline a archivos separados**
   - Hay 18 archivos con `mod tests { ... }` inline (22 archivos con `#[cfg(test)]` auxiliares).
   - Moverlos a `tests.rs` o `tests/` como parte del split de cada archivo.
   - Verificación: `grep -rn "#\[cfg(test)\]" crates --include="*.rs"` solo aparece en `tests.rs`/`tests/` y en módulos pequeños justificados.
   - DoD: el gate de tamaño y el de cobertura son medibles sin heurísticas.
+  - **Estado real (2026-11-14):** movidos los 3 bloques grandes:
+    - `sw-vault/src/lib.rs` (1.390 líneas de test) → `sw-vault/src/tests.rs`;
+    - `sw-bitwarden-api/src/lib.rs` (1.644) → `sw-bitwarden-api/src/tests.rs`;
+    - `sw-bitwarden-api/src/websocket.rs` (681) → `sw-bitwarden-api/src/websocket_tests.rs`
+      (declarado con `#[path = "websocket_tests.rs"]` porque `websocket` es un módulo de archivo).
+  - **Evidencia:** `rg -n "mod tests \{"` en los 3 archivos → 0;
+    `cargo test -p sw-vault -p sw-bitwarden-api` → 30 + 64 passed, 0 failed;
+    `./scripts/check-file-size.sh` → `sw-vault` 1.375 y `sw-bitwarden-api` 1.004
+    (ahora se mide solo producción, sin el bloque de tests).
 
-- [ ] **2.1.3 — Corregir `scripts/coverage-production.py`**
+- [x] **2.1.3 — Corregir `scripts/coverage-production.py`**
   - Ejecutar `cargo llvm-cov` con `--ignore-filename-regex` para `tests?\.rs$` y `tests/`.
   - Excluir también `#[cfg(test)]` inline: moverlos a archivos separados. Si se usa nightly, `#[coverage(off)]` es una alternativa.
   - Comprobar cobertura de producción ≥90%.
   - Verificación: el script informa del porcentaje y falla por debajo de 90.
+  - **Estado real (2026-11-14):** `scripts/coverage-production.py` creado, con
+    `--threshold` y `--reuse`. Ignora `tests.rs`, `*_tests.rs`, `tests/` y `fuzz/`,
+    y descarta rutas de otro checkout (21 entradas de
+    `/home/hermes/Proyectos/SilverWarden-RS/crates/...`, que no existen).
+  - **Cobertura medida: 88.08 %**, por debajo del objetivo de 90 %. El gate
+    funciona y falla; la brecha se cierra en 4.2.2 subiendo tests, no bajando el
+    umbral.
+  - **Evidencia:** `python3 scripts/coverage-production.py --threshold 101` → exit 1;
+    `python3 scripts/coverage-production.py` → `cobertura producción: 88.08%` y exit 1.
 
-**Medición actual** (producción = fuera de `#[cfg(test)]`):
+**Medición actual** (producción = líneas antes de `mod tests`; auditada 2026-11-13):
 
-| Archivo | Total | Producción | Veredicto P6 |
-|---|---:|---:|---|
-| `sw-ssh-agent/src/lib.rs` | 3.908 | **1.512** | Viola |
-| `sw-vault/src/lib.rs` | 2.768 | **1.375** | Viola |
-| `sw-bitwarden-api/src/lib.rs` | 2.651 | **1.004** | Viola |
-| `sw-config/src/lib.rs` | 1.707 | 695 | Alarma |
-| `sw-bitwarden-api/src/websocket.rs` | 1.214 | 530 | Alarma |
-| `sw-systemauth/src/lib.rs` | 869 | 405 | Correcto |
-| `sw-agent/src/lib.rs` | 752 | 750 | Alarma |
-| `sw-cli/src/main.rs` | 573 | 538 | Alarma |
+| Archivo                             | Total | Producción | Veredicto P6          |
+| ----------------------------------- | ----: | ---------: | --------------------- |
+| `sw-vault/src/lib.rs`               | 1.377 |  **1.375** | Viola                 |
+| `sw-bitwarden-api/src/lib.rs`       | 1.006 |  **1.004** | Viola                 |
+| `sw-agent/src/lib.rs`               |   768 |        766 | Alarma                |
+| `sw-config/src/lib.rs`              | 1.713 |        701 | Alarma                |
+| `sw-vault-agent/src/agent.rs`       |   662 |        662 | Alarma                |
+| `sw-ssh-agent/src/lib.rs`           | 2.166 |        637 | Correcto (aviso >500) |
+| `sw-cli/src/main.rs`                |   556 |        554 | Alarma                |
+| `sw-bitwarden-api/src/websocket.rs` |   533 |        532 | Alarma                |
+| `sw-agent/src/handlers/session.rs`  |   522 |        522 | Alarma                |
+| `sw-systemauth/src/lib.rs`          |   869 |        406 | Correcto              |
+
+> Medición 2026-11-14 tras 2.1.2, con `./scripts/check-file-size.sh`.
+> `sw-vault` y `sw-bitwarden-api` ya no incluyen tests inline: viven en
+> `tests.rs`, por eso el total baja a ~1.377 / ~1.006.
 
 ### 2.2. Splits obligatorios (violan P6)
 
-- [ ] **2.2.1 — `sw-ssh-agent/src/lib.rs` (1.512 líneas de producción)**
-  - Extraer `server.rs` (socket y accept loop).
-  - Extraer `protocol.rs` (wire format, `russh_keys`, mensajes).
-  - Extraer `keyring.rs` (gestión de claves y firmas).
-  - Extraer `prompt.rs` (confirmaciones y prompts).
-  - Dejar `lib.rs` < 300 líneas.
-  - Verificación: `cargo test -p sw-ssh-agent`, `cargo clippy -p sw-ssh-agent -- -D warnings`, `wc -l` producción ≤800 por archivo.
+- [x] **2.2.1 — `sw-ssh-agent/src/lib.rs` (cerrada por 1.4)**
+  - **Estado real (2026-11-13):** 638 líneas de producción; `VaultAgentServer` vive en `sw-vault-agent`. No requiere split adicional.
+  - Verificación: `awk '/^(pub )?mod tests/{print NR-1; exit}' crates/sw-ssh-agent/src/lib.rs` → 638; `cargo test -p sw-ssh-agent`.
 
 - [ ] **2.2.2 — `sw-vault/src/lib.rs` (1.375 líneas de producción)**
   - Extraer `store.rs` (store y concurrencia).
@@ -327,11 +364,24 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Dejar `lib.rs` < 300 líneas.
   - Verificación: `cargo test -p sw-bitwarden-api`, `cargo clippy -p sw-bitwarden-api -- -D warnings`, `wc -l` producción ≤800.
 
-- [ ] **2.2.4 — Tests de caracterización antes de cada split**
+- [x] **2.2.4 — Tests de caracterización antes de cada split**
   - Antes de mover código, capturar el comportamiento actual: tests existentes, snapshots de respuestas o fixtures.
   - Refactorizar sin cambiar la salida.
   - Verificación: los tests de caracterización pasan antes y después.
   - DoD: ningún split cambia comportamiento observable.
+  - **Estado real (2026-11-14):** añadidos **19 tests** con prefijo `caracterizacion_`:
+    - `sw-vault/src/tests.rs` (11): enums numéricos, claves JSON de `URI`, `Field`,
+      `LoginCipher`, `SSHKeyCipher`, `Card`, `Identity`, `SecureNoteCipher`,
+      `Folder`, `Organization`, `Profile`, `Cipher`, `SyncData`,
+      `DecryptedCipher` y `VaultSshKey`; `null` → vec vacío; tipos numéricos; `Display` de errores.
+    - `sw-bitwarden-api/src/tests.rs` (8): `Display` de `ApiError`, JSON y
+      defaults de `PreloginResponse`, parseo de 2FA, mapeo de `TwoFactorProvider`,
+      constantes de cliente, `RequestBody` y `decrypt_enc_key("")`.
+  - **Evidencia (antes del split):**
+    - `cargo test -p sw-vault caracterizacion` → 11 passed, 0 failed.
+    - `cargo test -p sw-bitwarden-api caracterizacion` → 8 passed, 0 failed.
+    - `cargo test --workspace` → 508 passed, 0 failed.
+    - `cargo fmt --all -- --check` y `cargo clippy -p sw-vault -p sw-bitwarden-api --all-targets -- -D warnings` → limpios.
 
 ### 2.3. Limpieza opcional de zona de alarma
 
@@ -637,11 +687,13 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
   - Gateway, `ts-rs` y FSM.
   - Verificación: el archivo existe y sigue el formato de §11.1.
 
-- [ ] **5.1.7 — `docs/adr/adr-0007-vault-agent-ownership.md`**
+- [x] **5.1.7 — `docs/adr/adr-0007-vault-agent-ownership.md`**
+  - **Estado real (2026-11-13):** existe desde `ca6a0ea`, con las 5 secciones del formato.
   - Un solo `VaultAgentServer` por proceso y ubicación neutral del tipo.
   - Verificación: el archivo existe y sigue el formato de §11.1.
 
-- [ ] **5.1.8 — `docs/adr/adr-0008-daemon-entrypoint-and-paths.md`**
+- [x] **5.1.8 — `docs/adr/adr-0008-daemon-entrypoint-and-paths.md`**
+  - **Estado real (2026-11-14):** existe desde 1.5.4, con las 5 secciones del formato (Contexto, Decisión, Alternativas Descartadas, Consecuencias y Grafo, Fecha de Revisión) y la cita de `cargo tree -p sw-cli | rg sw-agent`.
   - Quién arranca el daemon y dónde vive `default_socket_path`.
   - Verificación: el archivo existe y sigue el formato de §11.1.
 
@@ -720,27 +772,40 @@ Toda tarea, antes de marcarse, cumple:
 
 ## 9. Deuda técnica: cierre o diferimiento
 
-El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 15 ítems abiertos (uno mitigado). Este plan cierra o difiere explícitamente cada uno:
+El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 23 fichas abiertas (2 mitigadas, 1 parcial) y 13 cerradas tras la auditoría 2026-11-13. Este plan cierra o difiere explícitamente cada una:
 
-| DT | Tema | Disposición |
-|---|---|---|
-| DT-2 | FIDO2 stub | Fuera de alcance (post-MVP) |
-| DT-5 | GUI Tauri | Se cubre en Fase 3 |
-| DT-7 | `tokio` RUSTSEC-2026-0386 | Se cubre en Fase 4 con `cargo audit` y excepción documentada |
-| DT-12 | CLI SSH import/add | Fuera de alcance (Fase 3.6 puede cubrirlo en GUI) |
-| DT-13 | Claves SSH legacy | Mitigada; se mantiene el soporte dual (tipo 5 + SecureNote) |
-| DT-14 | CLI notas/tarjetas/identidades | Fuera de alcance |
-| DT-15 | Pwned Passwords | Fuera de alcance |
-| DT-16 | SSH legacy SecureNote | Fuera de alcance |
-| DT-19 | CLI no consulta `Status` antes de `Unlock` | Diferido; documentar en README |
-| DT-20 | `PinCache` con sleep real | Se cubre en Fase 1.1 |
-| DT-21 | XDG Portal | Fuera de alcance |
-| DT-22 | systemd-logind manual | Fuera de alcance |
-| DT-24 | Tests D-Bus manuales | Fuera de alcance |
-| DT-25 | 2FA Email sin verificar | Fuera de alcance |
-| DT-26 | Listado paginado | Fuera de alcance |
+| DT    | Tema                                       | Disposición                                                 |
+| ----- | ------------------------------------------ | ----------------------------------------------------------- |
+| DT-2  | FIDO2 stub                                 | Fuera de alcance (post-MVP)                                 |
+| DT-5  | GUI Tauri                                  | Parcial; se cubre en Fase 3                                 |
+| DT-7  | `tokio` RUSTSEC-2026-0386                  | Fase 4: upgrade ≥1.53.3 + `cargo audit`                     |
+| DT-12 | CLI SSH import/add (stub)                  | Fase 3.6 o tarea de CLI                                     |
+| DT-13 | Claves SSH legacy                          | Mitigada; se mantiene el soporte dual (tipo 5 + SecureNote) |
+| DT-14 | CLI notas/tarjetas/identidades             | Fuera de alcance                                            |
+| DT-15 | Pwned Passwords                            | Fuera de alcance                                            |
+| DT-16 | SSH legacy SecureNote                      | Mitigada; se mantiene                                       |
+| DT-19 | CLI no consulta `Status` antes de `Unlock` | Diferido; documentar en README                              |
+| DT-20 | `PinCache` con sleep real                  | **Cerrada** en 1.1.4 (`FakeClock`)                          |
+| DT-21 | XDG Portal                                 | Fuera de alcance                                            |
+| DT-22 | systemd-logind manual                      | Fuera de alcance                                            |
+| DT-24 | Tests D-Bus manuales                       | Fuera de alcance                                            |
+| DT-25 | 2FA Email sin verificar                    | Fuera de alcance                                            |
+| DT-26 | Listado paginado                           | Fuera de alcance                                            |
+| DT-33 | `From<String>` con `contains()`            | Fase 3.1.4                                                  |
+| DT-34 | `json!` en `dispatch_request`              | Fase 3.1.4                                                  |
+| DT-35 | `try_current` en `with_vault_agent`        | Parcial; tarea de inyección del handle                      |
+| DT-36 | `Clone` + `expect` (asimétrica)            | Post-M7                                                     |
+| DT-37 | `Clone` + `expect` (simétrica)             | Post-M7                                                     |
+| DT-38 | `cipher.key` duplicado ×5                  | Fase 2.2.2                                                  |
+| DT-39 | Tests de `sw-cli` dependen de `$HOME`      | Post-M7                                                     |
+| DT-40 | `rustix 1.1.5` RUSTSEC-2026-0486           | Fase 4: upgrade ≥1.1.6                                      |
+| DT-41 | `async-executor` yanked                    | Fase 4: `cargo update`                                      |
+| DT-42 | 11 dependencias sin uso                    | **Cerrada** (2026-11-14)                                    |
 
 - [ ] **9.1 — Actualizar `docs/deuda-tecnica.md`** con la disposición y el issue de cada ítem.
+  - **Estado (2026-11-14):** las 23 fichas abiertas tienen disposición en la tabla
+    "Auditoría 2026-11-13". Faltan los issues de GitHub para los diferidos
+    (DT-2, DT-14, DT-15, DT-19, DT-21, DT-22, DT-24, DT-25, DT-26, DT-36, DT-37, DT-39).
 - [ ] **9.2 — Revisar el título/subtítulo** para que no prometa “cero deuda” funcional; el alcance es deuda arquitectónica.
 - [ ] **9.3 — Verificación:** ningún DT abierto queda sin disposición.
 
