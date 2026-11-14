@@ -2867,27 +2867,23 @@ impl std::io::Write for FailingWriter {
 }
 
 #[test]
-fn test_resolve_ssh_socket_path_non_home_parent() {
+fn test_ssh_agent_socket_path_next_to_non_home_parent() {
     let temp_dir = tempfile::tempdir().unwrap();
     let main_socket = temp_dir.path().join(".silverwarden.sock");
     let expected = temp_dir.path().join(".silverwarden-ssh-agent.sock");
     let resolved = sw_config::ssh_agent_socket_path_next_to(&main_socket);
     assert_eq!(resolved, expected);
-    if let Ok(default_ssh) = sw_config::default_ssh_agent_socket_path() {
-        assert_ne!(resolved, default_ssh);
-    }
+    let home_ssh =
+        sw_config::ssh_agent_socket_path_from_home(Some(Path::new("/fake/home"))).unwrap();
+    assert_ne!(resolved, home_ssh);
 }
 
 #[test]
-fn test_resolve_ssh_socket_path_home_parent() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => return,
-    };
+fn test_ssh_agent_socket_path_next_to_home_parent() {
+    let home = Path::new("/fake/home");
     let main_socket = home.join(".silverwarden.sock");
     let resolved = sw_config::ssh_agent_socket_path_next_to(&main_socket);
-    let expected = sw_config::default_ssh_agent_socket_path()
-        .unwrap_or_else(|_| PathBuf::from(".silverwarden-ssh-agent.sock"));
+    let expected = sw_config::ssh_agent_socket_path_from_home(Some(home)).unwrap();
     assert_eq!(resolved, expected);
 }
 
@@ -2966,7 +2962,7 @@ fn test_resolve_config_path_custom_provided() {
 }
 
 #[test]
-fn test_resolve_ssh_socket_path_no_parent() {
+fn test_ssh_agent_socket_path_next_to_no_parent() {
     let path = Path::new("socket_without_parent");
     let resolved = sw_config::ssh_agent_socket_path_next_to(path);
     assert_eq!(resolved, PathBuf::from(".silverwarden-ssh-agent.sock"));

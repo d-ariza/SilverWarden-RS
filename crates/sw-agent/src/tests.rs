@@ -271,9 +271,6 @@ async fn test_agent_orphan_socket_removal() {
 
 #[test]
 fn test_default_socket_path() {
-    let path = default_socket_path().expect("Default socket path succeeds");
-    assert!(path.to_string_lossy().contains(".silverwarden.sock"));
-
     let custom = socket_path_from_home(Some(Path::new("/custom/home"))).unwrap();
     assert_eq!(custom, PathBuf::from("/custom/home/.silverwarden.sock"));
 }
