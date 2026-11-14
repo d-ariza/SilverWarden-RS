@@ -36,3 +36,8 @@ coverage/
 # Tooling artifacts
 graphify-out/
 graphify-rs.toml
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+scripts/__pycache__/
