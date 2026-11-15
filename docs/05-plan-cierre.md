@@ -484,85 +484,82 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 3.1. Contrato IPC tipado
 
-- [ ] **3.1.1 — Definir DTOs en `sw-ipc`**
+- [x] **3.1.1 — Definir DTOs en `sw-ipc`**
   - `AgentStatus { locked, has_pin, logged_in, pin_cached, pin_cached_remaining_secs, version }`.
   - `LoginSummary { id, name, username }`.
   - `LoginDetail { id, name, username, password, totp }`.
-  - `SyncResult { total, logins, ssh_keys, notes, cards, identities }`.
-  - `SshKeySummary { id, name, key_type }`.
+  - `SyncResult { status, total, logins, ssh_keys, notes, cards, identities }`.
+  - `SshKeySummary { id, name, fingerprint, public_key, key_type }`.
   - `ConfigView { api_url, identity_url, notifications_url, danger_accept_invalid_certs }`.
-  - `PinChangeResult { updated }`.
+  - `PinChangeResult { updated, status }`.
   - Verificación: `cargo check -p sw-ipc`.
 
-- [ ] **3.1.2 — Tipar `Response` por operación**
-  - Eliminar `Response::Ok(serde_json::Value)`.
-  - Opción A: `Response::Status(AgentStatus)`, `Response::Logins(Vec<LoginSummary>)`, etc.
-  - Opción B: `Response<T>` genérico con `T` por operación.
-  - Verificación: `grep -n "serde_json::Value" crates/sw-ipc/src/lib.rs` vacío en la frontera.
+- [x] **3.1.2 — Tipar `Response` por operación**
+  - Sustituido `Response::Ok(serde_json::Value)` por `Response::Ok(ResponseData)` con enum `#[serde(untagged)]`.
+  - Verificación: `rg -n "serde_json::Value" crates/sw-ipc/src/lib.rs` vacío (`0`).
 
-- [ ] **3.1.3 — Tipar `Request`**
-  - Sustituir `SyncData(serde_json::Value)` y `ReloadVault(serde_json::Value)` por `SyncData(SyncPayload)` y `ReloadVault(SyncPayload)`.
+- [x] **3.1.3 — Tipar `Request`**
+  - Sustituido `SyncData(serde_json::Value)` y `ReloadVault(serde_json::Value)` por `SyncData(SyncPayload)` y `ReloadVault(SyncPayload)` (y añadido `GetConfig` / `SetConfig(ConfigView)`).
   - Verificación: `cargo test -p sw-ipc`.
 
-- [ ] **3.1.4 — Handlers devuelven DTOs**
+- [x] **3.1.4 — Handlers devuelven DTOs**
   - `handle_list_logins` devuelve `Vec<LoginSummary>`.
   - `handle_get_login` devuelve `LoginDetail`.
   - `handle_sync` devuelve `SyncResult`.
   - `handle_status` devuelve `AgentStatus`.
-  - Actualizar `sw-client::call_ok`/`send_ok` para devolver el DTO correspondiente; no `serde_json::Value`.
-  - Verificación: `grep -rn "serde_json::json!" crates/sw-agent/src/handlers` no se usa para construir respuestas de contrato.
+  - `handle_list_ssh_keys` devuelve `Vec<sw_ipc::dto::SshKeySummary>`, `handle_pin_set`/`handle_pin_update` devuelven `PinChangeResult`, `handle_get_config`/`handle_set_config` devuelven `ConfigView`.
+  - Actualizado `sw-client::call_ok`/`send_ok` a genéricos `<T: DeserializeOwned>` y cerrados **DT-33** y **DT-34**.
+  - Verificación: `rg -c "serde_json::json!" crates/sw-agent/src/handlers crates/sw-agent/src/lib.rs` → `0`.
 
-- [ ] **3.1.5 — Tests de contrato**
-  - Serialización/deserialización de cada DTO.
+- [x] **3.1.5 — Tests de contrato**
+  - Serialización/deserialización de cada DTO y `GetConfig`/`SetConfig` (`test_contrato_*` en `sw-ipc` y `sw-agent`).
   - Test de compatibilidad con el formato JSON actual.
   - Verificación: `cargo test -p sw-ipc -p sw-agent`.
 
 ### 3.2. Generación de TypeScript con `ts-rs`
 
-- [ ] **3.2.1 — Añadir `ts-rs` de forma opcional**
-  - `[dependencies] ts-rs = { version = "...", optional = true }`.
-  - Feature `ts` que active la dependencia.
-  - Evitar que `ts-rs` entre en el build de producción.
-  - Verificación: `cargo tree -p sw-ipc --no-default-features | grep ts-rs` vacío; con `--features ts` aparece.
+- [x] **3.2.1 — Añadir `ts-rs` de forma opcional**
+  - `[dependencies] ts-rs = { version = "10", optional = true }`.
+  - Feature `ts = ["dep:ts-rs"]`.
+  - Verificación: `cargo tree -p sw-ipc --no-default-features | rg ts-rs` vacío; con `--features ts` aparece `ts-rs v10.1.0`.
 
-- [ ] **3.2.2 — Derivar `TS` en los DTOs**
+- [x] **3.2.2 — Derivar `TS` en los DTOs**
   - `#[cfg_attr(feature = "ts", derive(TS))]`.
-  - `#[cfg_attr(feature = "ts", ts(export, export_to = "..."))]`.
+  - `#[cfg_attr(feature = "ts", ts(export, export_to = "../../sw-gui/src/lib/types/generated/"))]`.
   - Verificación: `cargo test -p sw-ipc --features ts`.
 
-- [ ] **3.2.3 — Test de exportación**
-  - Test que genere los `.ts` en `crates/sw-gui/src/lib/types/generated/`.
+- [x] **3.2.3 — Test de exportación**
+  - Test `export_dto_ts_types` genera los 7 `.ts` en `crates/sw-gui/src/lib/types/generated/`.
   - Verificación: los archivos se crean y no contienen `any`.
 
-- [ ] **3.2.4 — Gate de tipos generados**
-  - `git diff --exit-code crates/sw-gui/src/lib/types/generated/` tras el test.
-  - Verificación: si los tipos cambian y no se commitean, el gate falla.
+- [x] **3.2.4 — Gate de tipos generados**
+  - Añadido `scripts/check-generated-types.sh`: exporta con `--features ts`, verifica ausencia de `any` y falla con `diff -ru` si los tipos en `crates/sw-gui/src/lib/types/generated/` difieren o faltan (restaurando la copia previa).
+  - Verificación: `clean_exit=0` y falla (`exit 1`) al modificar manualmente un `.ts`.
 
 ### 3.3. Comandos Tauri tipados
 
-- [ ] **3.3.1 — Tipar `get_agent_status`**
-  - Devolver `Result<AgentStatus, String>`.
-  - Eliminar `payload["locked"].as_bool().unwrap_or(true)` y los fallbacks.
-  - Verificación: `grep -n "as_bool().unwrap_or" crates/sw-gui/src-tauri/src/lib.rs` vacío.
+- [x] **3.3.1 — Tipar `get_agent_status`**
+  - Devuelve `Result<AgentStatus, String>`.
+  - Eliminados `payload["locked"].as_bool().unwrap_or(true)` y los fallbacks JSON.
+  - Verificación: `rg -n "as_bool\(\)\.unwrap_or" crates/sw-gui/src-tauri/src/lib.rs` vacío (`0`).
 
-- [ ] **3.3.2 — Tipar el resto de comandos**
+- [x] **3.3.2 — Tipar el resto de comandos**
   - `list_logins -> Result<Vec<LoginSummary>, String>`.
   - `sync_vault -> Result<SyncResult, String>`.
   - `get_login -> Result<LoginDetail, String>`.
-  - Verificación: `cargo check --manifest-path crates/sw-gui/src-tauri/Cargo.toml`.
+  - Verificación: `cargo check --manifest-path crates/sw-gui/src-tauri/Cargo.toml` y `rg -c "serde_json::Value" crates/sw-gui/src-tauri/src/lib.rs` → `0`.
 
-- [ ] **3.3.3 — Añadir comandos que faltan**
-  - `list_ssh_keys`.
-  - `pin_set`.
-  - `pin_update`.
-  - `get_config`.
-  - `set_config`.
-  - `save_settings` / `load_settings` si se mantienen.
-  - Verificación: `grep -n "#\[tauri::command\]" crates/sw-gui/src-tauri/src/lib.rs` lista todos.
+- [x] **3.3.3 — Añadir comandos que faltan**
+  - `list_ssh_keys -> Result<Vec<SshKeySummary>, String>`.
+  - `pin_set -> Result<PinChangeResult, String>`.
+  - `pin_update -> Result<PinChangeResult, String>`.
+  - `get_config -> Result<ConfigView, String>` y `set_config -> Result<ConfigView, String>` (con `Request::GetConfig`/`Request::SetConfig` y handlers en `sw-agent`).
+  - Mantenidos `save_settings` / `load_settings`.
+  - Verificación: `rg -n "#\[tauri::command\]" crates/sw-gui/src-tauri/src/lib.rs` lista los 15 comandos.
 
-- [ ] **3.3.4 — Usar la ruta centralizada**
+- [x] **3.3.4 — Usar la ruta centralizada**
   - `get_agent_client` usa `sw_config::default_socket_path()`.
-  - Verificación: `grep -n "silverwarden.sock" crates/sw-gui/src-tauri/src/lib.rs` vacío.
+  - Verificación: `rg -c "silverwarden\.sock" crates/sw-gui/src-tauri/src/lib.rs` vacío (`0`).
 
 ### 3.4. Gateway tipado
 
@@ -837,12 +834,12 @@ Toda tarea, antes de marcarse, cumple:
 
 ## 9. Deuda técnica: cierre o diferimiento
 
-El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 15 fichas abiertas (1 mitigada, 1 parcial y 13 abiertas) y 21 cerradas tras la auditoría 2026-11-13, el cierre de Fase 2 y el cierre de deuda rápida del 2026-11-14. Este plan cierra o difiere explícitamente cada una:
+El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 13 fichas abiertas (1 mitigada, 1 parcial y 11 abiertas) y 23 cerradas tras la auditoría 2026-11-13, el cierre de Fase 2, el cierre de deuda rápida del 2026-11-14 y Fase 3a (§3.1–§3.3). Este plan cierra o difiere explícitamente cada una:
 
 | DT    | Tema                                       | Disposición                                                        |
 | ----- | ------------------------------------------ | ------------------------------------------------------------------ |
 | DT-2  | FIDO2 stub                                 | Fuera de alcance (post-MVP)                                        |
-| DT-5  | GUI Tauri                                  | Parcial; se cubre en Fase 3                                        |
+| DT-5  | GUI Tauri                                  | Parcial (§3.1–§3.3 completas; faltan §3.4–§3.6)                    |
 | DT-7  | `tokio` RUSTSEC-2026-0386                  | **Cerrada** (2026-11-14, `tokio 1.54.1`; `cargo audit` limpio)     |
 | DT-12 | CLI SSH import/add (stub)                  | **Cerrada** (2026-11-14, IPC `ListSshKeys`/`ImportSshKey`/`NewSshKey`) |
 | DT-13 | Claves SSH legacy                          | **Cerrada** (D-M5-3 + D49; soporte dual tipo 5 y SecureNote)       |
@@ -856,8 +853,8 @@ El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 15 
 | DT-24 | Tests D-Bus manuales                       | Fuera de alcance                                            |
 | DT-25 | 2FA Email sin verificar                    | Fuera de alcance                                            |
 | DT-26 | Listado paginado                           | Fuera de alcance                                            |
-| DT-33 | `From<String>` con `contains()`            | Fase 3.1.4                                                  |
-| DT-34 | `json!` en `dispatch_request`              | Fase 3.1.4                                                  |
+| DT-33 | `From<String>` con `contains()`            | **Cerrada** (2026-11-14, Fase 3.1.4)                               |
+| DT-34 | `json!` en `dispatch_request`              | **Cerrada** (2026-11-14, Fase 3.1.4)                               |
 | DT-35 | `try_current` en `with_vault_agent`        | **Cerrada** (2026-11-14, `VaultStore::try_load_sync_data`)         |
 | DT-36 | `Clone` + `expect` (asimétrica)            | Post-M7                                                     |
 | DT-37 | `Clone` + `expect` (simétrica)             | Post-M7                                                     |
@@ -868,7 +865,7 @@ El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 15 
 | DT-42 | 11 dependencias sin uso                    | **Cerrada** (2026-11-14)                                    |
 
 - [ ] **9.1 — Actualizar `docs/deuda-tecnica.md`** con la disposición y el issue de cada ítem.
-  - **Estado (2026-11-14):** las 15 fichas abiertas y las 21 cerradas están actualizadas en la
+  - **Estado (2026-11-14):** las 13 fichas abiertas y las 23 cerradas están actualizadas en la
     tabla "Auditoría 2026-11-13". Faltan los issues de GitHub para los diferidos
     (DT-2, DT-14, DT-15, DT-21, DT-22, DT-24, DT-25, DT-26, DT-36, DT-37, DT-39).
 - [ ] **9.2 — Revisar el título/subtítulo** para que no prometa “cero deuda” funcional; el alcance es deuda arquitectónica.
