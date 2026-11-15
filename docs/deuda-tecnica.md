@@ -15,7 +15,7 @@ tiene la evidencia que la respalda.
 | DT | Estado verificado | Evidencia | Disposición |
 |---|---|---|---|
 | DT-2 | Abierta | `sw-bitwarden-api/src/twofactor.rs:164` devuelve `NotImplemented` | Fuera de alcance (post-MVP) |
-| DT-5 | **Parcial** | GUI con 4 rutas (`login`, `setup`, `vault`, inicio); comandos Tauri tipados (`get_agent_status`, `list_logins`, `get_login`, `sync_vault`, `list_ssh_keys`, `pin_set`, `pin_update`, `get_config`, `set_config`) y DTOs `ts-rs` listos (§3.1–§3.3) | Fase 3 (§3.4–§3.6 para gateway, FSM y vistas) |
+| DT-5 | **Cerrada** | Gateway IPC tipado (`src/lib/api/agent.ts`), FSM `VaultStatus`, rutas `/ssh` y `/settings`, tokens CSS/accesibilidad, CSP, Vitest y smoke E2E Playwright (§3.1–§3.7) | Cerrada el 2026-11-15 (Fase 3) |
 | DT-7 | **Cerrada** | `tokio 1.54.1`; `cargo audit` sin RUSTSEC-2026-0386 | Cerrada el 2026-11-14 (`cargo update`) |
 | DT-12 | **Cerrada** | `sw-cli/src/commands/ssh.rs` despacha `ListSshKeys`, `ImportSshKey` y `NewSshKey` por IPC | Cerrada el 2026-11-14 |
 | DT-13 | **Cerrada** | Soporte dual `SSHKey`/`SecureNote` + `BITWARDEN_CLIENT_VERSION = "2024.12.0"` (D-M5-3, D49) | Resuelta para Tipo 5 y legacy |
@@ -42,10 +42,11 @@ tiene la evidencia que la respalda.
 
 **Lectura de conjunto:**
 
-- **13 fichas** en "Items Abiertos": 1 mitigada (`DT-16`), 1 parcial (`DT-5`) y 11 abiertas (`DT-2`, `DT-14`, `DT-15`, `DT-21`, `DT-22`, `DT-24`, `DT-25`, `DT-26`, `DT-36`, `DT-37`, `DT-39`).
-- **23 fichas** en "Items Cerrados (Histórico)": 12 previas + 9 cerradas tras Fase 2 (`DT-7`, `DT-12`, `DT-13`, `DT-19`, `DT-35`, `DT-38`, `DT-40`, `DT-41`, `DT-42`) + 2 cerradas en Fase 3.1.4 (`DT-33`, `DT-34`).
+- **12 fichas** en "Items Abiertos": 1 mitigada (`DT-16`) y 11 abiertas (`DT-2`, `DT-14`, `DT-15`, `DT-21`, `DT-22`, `DT-24`, `DT-25`, `DT-26`, `DT-36`, `DT-37`, `DT-39`).
+- **24 fichas** en "Items Cerrados (Histórico)": 12 previas + 9 cerradas tras Fase 2 (`DT-7`, `DT-12`, `DT-13`, `DT-19`, `DT-35`, `DT-38`, `DT-40`, `DT-41`, `DT-42`) + 2 cerradas en Fase 3.1.4 (`DT-33`, `DT-34`) + 1 cerrada en Fase 3b (`DT-5`).
 - **DT-20 ya se cerró** con el puerto `Clock` de 1.1.4; su ficha vive ahora en el histórico.
 - **DT-33 y DT-34 cerradas (Fase 3.1.4)**: se eliminaron `From<String>`/`From<&str>` para `AgentError` y las llamadas `serde_json::json!` en `crates/sw-agent/src/handlers/` y `dispatch_request` usando DTOs tipados de `sw-ipc::dto`.
+- **DT-5 cerrada (Fase 3 §3.1–§3.7)**: se completó la GUI Tauri/Svelte 5 con DTOs `ts-rs`, gateway `src/lib/api/agent.ts` (18 métodos), FSM `VaultStatus` con tests en Vitest, vistas `/ssh` y `/settings`, 5 estados de UI por ruta, design tokens accesibles, CSP en `tauri.conf.json` y smoke E2E con Playwright.
 - **DT-35 y DT-38 cerradas**: `VaultStore::try_load_sync_data` eliminó el último `try_current()` en `AgentDaemon::with_vault_agent`, y `VaultStore::resolve_cipher_key` consolidó las 5 copias de `cipher.key`.
 - **DT-7, DT-40 y DT-41 cerradas**: `tokio 1.54.1`, `rustix 1.1.6` y `async-executor 1.14.1` actualizados; `cargo audit` reporta 0 vulnerabilidades y 0 avisos sobre 468 dependencias.
 - **DT-12 cerrada**: `sw-cli/src/commands/ssh.rs` despacha `Request::ListSshKeys`, `Request::ImportSshKey` y `Request::NewSshKey` por IPC al agente.
@@ -60,13 +61,6 @@ tiene la evidencia que la respalda.
 - **Motivo:** Requiere hardware y la crate `ctap-hid-fido2` no está madura. Se pospuso a post-MVP.
 - **Retoma:** Post-MVP (si hay demanda).
 - **Estado:** Abierta.
-
-### DT-5 — GUI Tauri (M7)
-- **Descripción:** La GUI Tauri existe parcialmente: `crates/sw-gui` tiene 4 rutas (`/`, `login`, `setup`, `vault`). En Fase 3a (§3.1–§3.3) se tipó el contrato IPC (`sw-ipc::dto`), se generaron los tipos TypeScript con `ts-rs` (`crates/sw-gui/src/lib/types/generated/`) y se tiparon/añadieron todos los comandos Tauri (`get_agent_status`, `list_logins`, `get_login`, `sync_vault`, `list_ssh_keys`, `pin_set`, `pin_update`, `get_config`, `set_config`). Quedan pendientes el gateway TypeScript, la FSM en Svelte y las vistas nuevas.
-- **Impacto:** Medio. La visión de "KeePassXC + Vaultwarden" ya es demostrable; falta paridad con el CLI.
-- **Motivo:** M7 se ejecutó a medias; el resto está planificado en la fase 3 del plan de cierre.
-- **Retoma:** Fase 3 del plan de cierre (`docs/05-plan-cierre.md` §3.4–§3.6).
-- **Estado:** Parcial (backend IPC + `ts-rs` + comandos Tauri completados en §3.1–§3.3; UI pendiente en §3.4–§3.6).
 
 ### DT-14 — Comandos CLI para Notas, Tarjetas e Identidades
 - **Descripción:** El agente tiene el modelo (`sw-vault`) y la API (`sw-bitwarden-api`), pero el CLI no tiene subcomandos para crear/leer/borrar estos tipos.
@@ -148,6 +142,12 @@ tiene la evidencia que la respalda.
 ---
 
 ## Items Cerrados (Histórico)
+
+### DT-5 — GUI Tauri (M7)
+- **Descripción:** La GUI Tauri tenía 4 rutas iniciales (`/`, `login`, `setup`, `vault`) con `invoke` disperso, booleanos paralelos y sin vistas de gestión SSH ni configuración/PIN.
+- **Resolución:** En Fase 3 (§3.1–§3.7, cerrada el 2026-11-15) se tipó el contrato IPC con `ts-rs`, se centralizaron los 18 comandos Tauri en `crates/sw-gui/src/lib/api/agent.ts`, se modeló la FSM de 8 estados (`VaultStatus`) con tabla `TRANSITIONS` y suite Vitest, se implementaron `routes/ssh/+page.svelte` y `routes/settings/+page.svelte` con los 5 estados de UI, se ajustaron tokens CSS (WCAG AA ≥4.5:1), CSP estricta en `tauri.conf.json` y smoke tests E2E con Playwright.
+- **Evidencia:** `pnpm --dir crates/sw-gui check`, `pnpm --dir crates/sw-gui test`, `pnpm --dir crates/sw-gui build`, `pnpm --dir crates/sw-gui test:e2e`, `cargo clippy --manifest-path crates/sw-gui/src-tauri/Cargo.toml --all-targets -- -D warnings`.
+- **Estado:** Cerrada (Fase 3 §3.1–§3.7, 2026-11-15).
 
 ### DT-33 — `impl From<String> for AgentError` con `contains()` (antipatrón P4)
 - **Descripción:** Las conversiones `From<String>` y `From<&str>` para `AgentError` en `crates/sw-agent/src/lib.rs` inspeccionaban subcadenas con `.contains()` para inferir `InvalidPin` o `Locked`.

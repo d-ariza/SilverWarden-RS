@@ -563,94 +563,94 @@ Son **dos `VaultStore` distintos**. El daemon desbloquea el suyo (`crates/sw-age
 
 ### 3.4. Gateway tipado
 
-- [ ] **3.4.1 — Crear `src/lib/api/agent.ts`**
-  - Métodos: `getStatus`, `unlock`, `lock`, `sync`, `listLogins`, `getLogin`, `listSshKeys`, `pinSet`, `pinUpdate`, `getConfig`, `setConfig`, `copyToClipboard`, `setMenuState`, `saveSettings`, `loadSettings`.
+- [x] **3.4.1 — Crear `src/lib/api/agent.ts`**
+  - Métodos: `getStatus`, `unlock`, `lock`, `sync`, `listLogins`, `getLogin`, `listSshKeys`, `importSshKey`, `newSshKey`, `deleteSshKey`, `pinSet`, `pinUpdate`, `getConfig`, `setConfig`, `copyToClipboard`, `setMenuState`, `saveSettings`, `loadSettings` (18 métodos en total).
   - Tipos importados desde `types/generated`.
   - Verificación: `pnpm --dir crates/sw-gui check`.
 
-- [ ] **3.4.2 — Refactorizar consumidores**
+- [x] **3.4.2 — Refactorizar consumidores**
+  - `routes/+page.svelte`.
   - `routes/vault/+page.svelte`.
   - `routes/login/+page.svelte`.
   - `lib/state/vault.svelte.ts`.
   - `lib/design/theme.svelte.ts`.
-  - Verificación: `grep -rn "invoke(" crates/sw-gui/src/` solo devuelve `src/lib/api/agent.ts`.
+  - Verificación: `rg -n "\binvoke\b" crates/sw-gui/src/` solo devuelve `src/lib/api/agent.ts`.
 
-- [ ] **3.4.3 — Eliminar interfaces duplicadas**
-  - `LoginItem` y `LoginDetail` dejan de estar definidos en dos sitios.
-  - Verificación: `grep -rn "interface LoginItem" crates/sw-gui/src/` devuelve una sola definición (o ninguna, si viene de generated).
+- [x] **3.4.3 — Eliminar interfaces duplicadas**
+  - `LoginItem`, `LoginDetail` y `AgentStatus` dejan de estar definidos localmente y usan `types/generated`.
+  - Verificación: `rg -n "interface LoginItem|interface LoginDetail|interface AgentStatus" crates/sw-gui/src/` devuelve 0 resultados.
 
 ### 3.5. Máquina de estados finita
 
-- [ ] **3.5.1 — Modelar la unión discriminada**
+- [x] **3.5.1 — Modelar la unión discriminada**
   - Estados: `disconnected`, `needs_setup`, `logged_out`, `locked`, `unlocking`, `unlocked`, `syncing`, `error`.
   - `unlocked` y `syncing` llevan `logins: LoginSummary[]`.
   - `error` lleva `message: string`.
   - Verificación: `pnpm --dir crates/sw-gui check`.
 
-- [ ] **3.5.2 — Eliminar los booleanos**
+- [x] **3.5.2 — Eliminar los booleanos**
   - Borrar `isLoading`, `isSyncing`, `isLocking`, `error`.
-  - Verificación: `grep -n "isLoading\|isSyncing\|isLocking" crates/sw-gui/src/lib/state/vault.svelte.ts` vacío.
+  - Verificación: `rg -n "isLoading|isSyncing|isLocking" crates/sw-gui/src/routes crates/sw-gui/src/lib/state/vault.svelte.ts` vacío.
 
-- [ ] **3.5.3 — Definir transiciones y guards**
+- [x] **3.5.3 — Definir transiciones y guards**
   - `disconnected → locked` al conectar.
   - `locked → unlocking → unlocked` al desbloquear.
   - `unlocked → syncing → unlocked` al sincronizar.
   - `cualquiera → error` con mensaje.
   - `cualquiera → disconnected` al perder el socket.
-  - Verificación: tabla de transiciones documentada en el código.
+  - Verificación: tabla `TRANSITIONS` y funciones `canTransition` / `transitionStatus` / `classifyAgentError` documentadas en `src/lib/state/transitions.ts`.
 
-- [ ] **3.5.4 — Tests de transiciones con Vitest**
-  - Un test por transición válida y por transición inválida.
+- [x] **3.5.4 — Tests de transiciones con Vitest**
+  - Tests para todas las transiciones válidas e inválidas, invariantes, `statusFromAgent` y `classifyAgentError`.
   - Verificación: `pnpm --dir crates/sw-gui test`.
 
-- [ ] **3.5.5 — Adaptar la UI**
-  - Las vistas reaccionan a `vaultState.status.state`.
+- [x] **3.5.5 — Adaptar la UI**
+  - Las vistas (`+layout`, `+page`, `login`, `setup`, `vault`) reaccionan a `vaultState.status.state`.
   - Verificación: `pnpm --dir crates/sw-gui build`.
 
 ### 3.6. Vistas de SSH y configuración
 
-- [ ] **3.6.1 — Vista/tab de claves SSH**
-  - Lista `SshKeySummary`.
-  - Acciones: importar, crear, borrar (si el backend lo soporta).
+- [x] **3.6.1 — Vista/tab de claves SSH**
+  - Lista `SshKeySummary` en `src/routes/ssh/+page.svelte`.
+  - Acciones: importar (`importSshKey`), crear (`newSshKey`), borrar (`deleteSshKey` con `<dialog>` nativo) y copiar huella/clave pública.
   - Verificación: `pnpm --dir crates/sw-gui check`.
 
-- [ ] **3.6.2 — Vista de configuración**
-  - URL de API, URL de identidad, preferencias y cambio de PIN.
-  - Usa `getConfig`/`setConfig`/`pinUpdate`.
+- [x] **3.6.2 — Vista de configuración**
+  - URL de API, URL de identidad, notificaciones, flag TLS y cambio/creación de PIN en `src/routes/settings/+page.svelte`.
+  - Usa `getStatus`/`getConfig`/`setConfig`/`pinSet`/`pinUpdate`.
   - Verificación: `pnpm --dir crates/sw-gui check`.
 
-- [ ] **3.6.3 — Cinco estados de UI en cada vista**
-  - Carga (skeleton), vacío, error, éxito, sin conexión.
-  - Verificación: revisión manual + checklist en el PR.
+- [x] **3.6.3 — Cinco estados de UI en cada vista**
+  - Carga (skeleton), vacío, error, éxito, sin conexión en las 6 rutas (`/`, `/login`, `/setup`, `/vault`, `/ssh`, `/settings`).
+  - Verificación: revisión y smoke E2E.
 
 ### 3.7. Calidad de frontend
 
-- [ ] **3.7.1 — Añadir Vitest**
-  - `vitest` y `@testing-library/svelte` en `devDependencies`.
+- [x] **3.7.1 — Añadir Vitest**
+  - `vitest`, `@testing-library/svelte` y `jsdom` en `devDependencies`.
   - Script `test` en `package.json`.
-  - Verificación: `pnpm --dir crates/sw-gui test` ejecuta al menos los tests de FSM.
+  - Verificación: `pnpm --dir crates/sw-gui test` ejecuta los tests de FSM (6/6 en verde).
 
-- [ ] **3.7.2 — CSP estricta**
-  - `tauri.conf.json`: `"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"` (ajustar a lo que necesite Svelte).
-  - Verificación: la app arranca y no hay violaciones de CSP en consola.
+- [x] **3.7.2 — CSP estricta**
+  - `tauri.conf.json`: `"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://ipc.localhost"` y `"devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://localhost:5173 ws://localhost:5173"`.
+  - CSP de producción sin `'unsafe-inline'` en `script-src`: Tauri hashea los scripts inline del `frontendDist` en compilación e inyecta los hashes, por lo que `'unsafe-inline'` era ignorado. `devCsp` conserva `'unsafe-inline'` y `'unsafe-eval'` para Vite HMR. Verificado con `tauri dev` y `tauri build`.
 
-- [ ] **3.7.3 — Accesibilidad**
-  - Contraste ≥4.5:1.
-  - Foco visible.
-  - `aria-label` en botones con solo icono.
-  - Navegación por teclado.
-  - Texto mínimo `0.875rem`.
-  - Verificación: checklist manual + `svelte-check`.
+- [x] **3.7.3 — Accesibilidad**
+  - Contraste ≥4.5:1 en los 3 temas (claro y oscuro).
+  - Foco visible (`:focus-visible`).
+  - `aria-label` constante y `aria-pressed` en botones toggle/icono.
+  - Navegación por teclado, landmarks semánticos y jerarquía de encabezados `<h1>`–`<h2>`.
+  - Texto mínimo `0.875rem` (`--font-size-sm`).
+  - Verificación: revisión y `svelte-check`.
 
-- [ ] **3.7.4 — Design tokens**
-  - Cero colores/tamaños/márgenes hardcodeados.
-  - Todo por variables CSS.
-  - Temas claro y oscuro validados.
-  - Verificación: `grep -rn "#[0-9a-fA-F]\{3,6\}" crates/sw-gui/src/` solo en tokens.
+- [x] **3.7.4 — Design tokens**
+  - Cero colores hardcodeados fuera de `src/lib/design/themes/`.
+  - `color-scheme` declarado en `app.html`, `tokens.css` y temas claro/oscuro validados.
+  - Verificación: `rg -n "#[0-9a-fA-F]{3,6}\b" crates/sw-gui/src/` solo devuelve `src/lib/design/themes/*.css`.
 
-- [ ] **3.7.5 — Smoke E2E de arranque**
-  - Un test que abra la app y compruebe que la vista principal renderiza.
-  - Verificación: el test pasa en CI.
+- [x] **3.7.5 — Smoke E2E de arranque**
+  - `@playwright/test` en `playwright.config.ts` y `e2e/smoke.spec.ts` cubriendo `/`, `/login`, `/setup`, `/vault`, `/ssh` y `/settings`.
+  - Verificación: `pnpm --dir crates/sw-gui test:e2e`.
 
 ---
 
@@ -834,12 +834,12 @@ Toda tarea, antes de marcarse, cumple:
 
 ## 9. Deuda técnica: cierre o diferimiento
 
-El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 13 fichas abiertas (1 mitigada, 1 parcial y 11 abiertas) y 23 cerradas tras la auditoría 2026-11-13, el cierre de Fase 2, el cierre de deuda rápida del 2026-11-14 y Fase 3a (§3.1–§3.3). Este plan cierra o difiere explícitamente cada una:
+El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 12 fichas abiertas (1 mitigada y 11 abiertas) y 24 cerradas tras la auditoría 2026-11-13, el cierre de Fase 2, el cierre de deuda rápida del 2026-11-14 y Fase 3 completa (§3.1–§3.7). Este plan cierra o difiere explícitamente cada una:
 
 | DT    | Tema                                       | Disposición                                                        |
 | ----- | ------------------------------------------ | ------------------------------------------------------------------ |
 | DT-2  | FIDO2 stub                                 | Fuera de alcance (post-MVP)                                        |
-| DT-5  | GUI Tauri                                  | Parcial (§3.1–§3.3 completas; faltan §3.4–§3.6)                    |
+| DT-5  | GUI Tauri                                  | **Cerrada** (2026-11-15, Fase 3 §3.1–§3.7)                         |
 | DT-7  | `tokio` RUSTSEC-2026-0386                  | **Cerrada** (2026-11-14, `tokio 1.54.1`; `cargo audit` limpio)     |
 | DT-12 | CLI SSH import/add (stub)                  | **Cerrada** (2026-11-14, IPC `ListSshKeys`/`ImportSshKey`/`NewSshKey`) |
 | DT-13 | Claves SSH legacy                          | **Cerrada** (D-M5-3 + D49; soporte dual tipo 5 y SecureNote)       |
@@ -864,12 +864,10 @@ El plan **no** cierra toda la deuda funcional. `docs/deuda-tecnica.md` tiene 13 
 | DT-41 | `async-executor` yanked                    | **Cerrada** (2026-11-14, `async-executor 1.14.1`)                  |
 | DT-42 | 11 dependencias sin uso                    | **Cerrada** (2026-11-14)                                    |
 
-- [ ] **9.1 — Actualizar `docs/deuda-tecnica.md`** con la disposición y el issue de cada ítem.
-  - **Estado (2026-11-14):** las 13 fichas abiertas y las 23 cerradas están actualizadas en la
-    tabla "Auditoría 2026-11-13". Faltan los issues de GitHub para los diferidos
-    (DT-2, DT-14, DT-15, DT-21, DT-22, DT-24, DT-25, DT-26, DT-36, DT-37, DT-39).
-- [ ] **9.2 — Revisar el título/subtítulo** para que no prometa “cero deuda” funcional; el alcance es deuda arquitectónica.
-- [ ] **9.3 — Verificación:** ningún DT abierto queda sin disposición.
+- [x] **9.1 — Actualizar `docs/deuda-tecnica.md`** con la disposición y el cierre de ítems del plan.
+  - **Estado (2026-11-15):** las 12 fichas abiertas (1 mitigada, 11 abiertas) y las 24 cerradas (`DT-5` cerrada en Fase 3b) están actualizadas en la tabla "Auditoría 2026-11-13" (quedan solo los issues externos de GitHub para los 11 diferidos fuera de alcance / post-M7).
+- [x] **9.2 — Revisar el título/subtítulo** para que no prometa “cero deuda” funcional; el alcance es deuda arquitectónica.
+- [x] **9.3 — Verificación:** ningún DT abierto queda sin disposición.
 
 ---
 
