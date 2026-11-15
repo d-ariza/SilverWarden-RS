@@ -175,6 +175,23 @@ async fn list_ssh_keys() -> Result<Vec<SshKeySummary>, String> {
 }
 
 #[tauri::command]
+async fn import_ssh_key(name: String, pem: String) -> Result<SshKeySummary, String> {
+    call_agent(sw_client::Request::ImportSshKey { name, pem }).await
+}
+
+#[tauri::command]
+async fn new_ssh_key(name: String, key_type: String) -> Result<SshKeySummary, String> {
+    call_agent(sw_client::Request::NewSshKey { name, key_type }).await
+}
+
+#[tauri::command]
+async fn delete_ssh_key(id: String) -> Result<String, String> {
+    let _ack: sw_ipc::dto::OperationAck =
+        call_agent(sw_client::Request::DeleteSshKey { id: id.clone() }).await?;
+    Ok(id)
+}
+
+#[tauri::command]
 async fn pin_set(pin: String) -> Result<PinChangeResult, String> {
     call_agent(sw_client::Request::PinSet { pin }).await
 }
@@ -225,6 +242,9 @@ pub fn run() {
             sync_vault,
             get_login,
             list_ssh_keys,
+            import_ssh_key,
+            new_ssh_key,
+            delete_ssh_key,
             pin_set,
             pin_update,
             get_config,

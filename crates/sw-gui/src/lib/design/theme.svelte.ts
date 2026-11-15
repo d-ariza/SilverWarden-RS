@@ -2,7 +2,7 @@ import './tokens.css';
 import './themes/fluent.css';
 import './themes/cupertino.css';
 import './themes/breeze.css';
-import { invoke } from '@tauri-apps/api/core';
+import { agent } from '$lib/api/agent';
 
 export type ThemeName = 'fluent' | 'cupertino' | 'breeze';
 export type ThemeMode = 'light' | 'dark';
@@ -25,7 +25,7 @@ class ThemeState {
   private async initFromBackend() {
     if (typeof window === 'undefined') return;
     try {
-      const raw = await invoke<string>('load_settings');
+      const raw = await agent.loadSettings();
       if (raw) {
         const settings = JSON.parse(raw);
         if (settings.theme) this.current = settings.theme;
@@ -42,7 +42,7 @@ class ThemeState {
   private async persist() {
     if (typeof window === 'undefined' || !this.isLoaded) return;
     try {
-      await invoke('save_settings', { theme: this.current, mode: this.mode });
+      await agent.saveSettings(this.current, this.mode);
     } catch (e) {
       console.warn('No se pudo guardar la configuración de tema:', e);
     }

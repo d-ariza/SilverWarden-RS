@@ -1,14 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { invoke } from "@tauri-apps/api/core";
+  import { agent } from "$lib/api/agent";
   import {
     KeyRound,
     Star,
     Terminal,
+    Settings,
     Search,
     Shield,
     AlertCircle,
+    WifiOff,
     Copy,
     Check,
     Eye,
@@ -17,35 +19,22 @@
   } from "lucide-svelte";
   import { vaultState } from "$lib/state/vault.svelte";
 
-  type Tab = "all" | "favorites" | "ssh";
-
-  interface LoginItem {
-    id: string;
-    name: string;
-    username?: string;
-  }
-
-  interface LoginDetail {
-    id: string;
-    name: string;
-    username?: string;
-    password?: string;
-    totp?: string;
-  }
+  type Tab = "all" | "favorites";
 
   let activeTab = $state<Tab>("all");
   let searchQuery = $state("");
   let copiedField = $state<string | null>(null);
   let showDetailPassword = $state(false);
+  let hasCheckedAgent = $state(false);
 
-  let logins = $state<LoginItem[]>([]);
-  let selectedLogin = $state<LoginDetail | null>(null);
-  let isLoading = $state(true);
-  let isSyncing = $state(false);
-  let errorMsg = $state<string | null>(null);
+  let syncing = $derived(vaultState.status.state === "syncing");
+  let isDisconnected = $derived(vaultState.status.state === "disconnected");
+  let errorMsg = $derived(
+    vaultState.status.state === "error" ? vaultState.status.message : null
+  );
 
   let filteredLogins = $derived(
-    logins.filter((item) => {
+    vaultState.logins.filter((item) => {
       const q = searchQuery.toLowerCase().trim();
       if (!q) return true;
       return (
@@ -55,64 +44,50 @@
     })
   );
 
-  async function loadLogins() {
-    isLoading = true;
-    errorMsg = null;
-    try {
-      const [res] = await Promise.all([
-        invoke<LoginItem[]>("list_logins"),
-        new Promise((r) => setTimeout(r, 200)), // Retraso visual mínimo de 200ms
-      ]);
-      logins = Array.isArray(res) ? res : [];
-      vaultState.logins = logins;
-
-      if (selectedLogin && !logins.some((l) => l.name === selectedLogin?.name)) {
-        selectedLogin = null;
-      }
-    } catch (err) {
-      const errStr = typeof err === "string" ? err : String(err);
-      if (errStr.toLowerCase().includes("lock") || errStr.toLowerCase().includes("bloquead")) {
+  async function initVault() {
+    hasCheckedAgent = false;
+    const status = await vaultState.refreshStatus();
+    if (status.state === "locked" || status.state === "logged_out") {
+      hasCheckedAgent = true;
+      await goto("/login");
+      return;
+    }
+    if (status.state === "needs_setup") {
+      hasCheckedAgent = true;
+      await goto("/setup");
+      return;
+    }
+    if (status.state === "unlocked") {
+      agent.setMenuState(true).catch(() => {});
+      await vaultState.loadLogins();
+      if (vaultState.status.state === "locked") {
+        hasCheckedAgent = true;
         await goto("/login");
         return;
       }
-      errorMsg = errStr;
-      logins = [];
-      vaultState.logins = [];
-    } finally {
-      isLoading = false;
     }
+    hasCheckedAgent = true;
   }
 
   async function handleSync() {
-    isSyncing = true;
-    vaultState.isSyncing = true;
-    errorMsg = null;
-    try {
-      await invoke("sync_vault");
-      await loadLogins();
-    } catch (err) {
-      errorMsg = typeof err === "string" ? err : String(err);
-    } finally {
-      isSyncing = false;
-      vaultState.isSyncing = false;
+    await vaultState.sync();
+    if (vaultState.status.state === "locked") {
+      await goto("/login");
     }
   }
 
   async function handleSelectItem(name: string) {
     showDetailPassword = false;
-    try {
-      const detail = await invoke<LoginDetail>("get_login", { name });
-      selectedLogin = detail;
-      vaultState.selectedLogin = detail;
-    } catch (err) {
-      console.warn("Error al cargar detalle del login:", err);
+    await vaultState.selectLogin(name);
+    if (vaultState.status.state === "locked") {
+      await goto("/login");
     }
   }
 
   async function handleCopy(text: string, fieldId: string) {
     if (!text) return;
     try {
-      await invoke("copy_to_clipboard", { text });
+      await agent.copyToClipboard(text);
       copiedField = fieldId;
       setTimeout(() => {
         if (copiedField === fieldId) copiedField = null;
@@ -122,25 +97,17 @@
     }
   }
 
-  onMount(async () => {
-    try {
-      const status = await invoke<{ locked?: boolean; has_pin?: boolean }>("get_agent_status");
-      if (status.locked) {
-        await goto("/login");
-        return;
-      }
-    } catch (e) {
-      console.warn("Error al verificar estado del agente:", e);
-    }
-    invoke("set_menu_state", { isLoggedIn: true }).catch(() => {});
-    loadLogins();
+  onMount(() => {
+    initVault();
   });
 </script>
+
+<h1 class="sr-only">Bóveda de credenciales</h1>
 
 <div class="vault-container">
   <!-- 1. Sidebar (Izquierda) -->
   <aside class="vault-sidebar">
-    <nav class="sidebar-nav">
+    <nav class="sidebar-nav" aria-label="Secciones de la bóveda">
       <button
         type="button"
         class="nav-item"
@@ -161,20 +128,20 @@
         <span>Favoritos</span>
       </button>
 
-      <button
-        type="button"
-        class="nav-item"
-        class:active={activeTab === "ssh"}
-        onclick={() => (activeTab = "ssh")}
-      >
+      <a href="/ssh" class="nav-item">
         <Terminal size={18} />
         <span>Claves SSH</span>
-      </button>
+      </a>
+
+      <a href="/settings" class="nav-item">
+        <Settings size={18} />
+        <span>Ajustes</span>
+      </a>
     </nav>
   </aside>
 
   <!-- 2. Lista de elementos (Centro) -->
-  <section class="vault-list-section">
+  <section class="vault-list-section" aria-label="Lista de accesos">
     <div class="search-bar">
       <div class="search-input-wrapper">
         <Search size={16} class="search-icon" />
@@ -189,20 +156,20 @@
         type="button"
         class="sync-btn"
         onclick={handleSync}
-        disabled={isSyncing}
+        disabled={syncing || isDisconnected}
         title="Sincronizar con el servidor Bitwarden"
         aria-label="Sincronizar bóveda"
       >
-        <span class="icon-wrap" class:spin={isSyncing}>
+        <span class="icon-wrap" class:spin={syncing}>
           <RefreshCw size={15} />
         </span>
-        <span>{isSyncing ? "Sincronizando..." : "Sincronizar"}</span>
+        <span>{syncing ? "Sincronizando..." : "Sincronizar"}</span>
       </button>
     </div>
 
     <div class="list-content">
-      {#if isLoading}
-        <!-- Skeletons mientras carga (mínimo 200ms) -->
+      {#if !hasCheckedAgent || (syncing && vaultState.logins.length === 0)}
+        <!-- Skeletons mientras carga (mínimo 250ms) -->
         <div class="skeletons-wrapper" aria-busy="true" aria-label="Cargando elementos">
           {#each [1, 2, 3] as _}
             <div class="skeleton-row">
@@ -214,15 +181,28 @@
             </div>
           {/each}
         </div>
+      {:else if isDisconnected}
+        <div class="empty-state error-state" role="alert">
+          <WifiOff size={32} class="empty-icon" color="var(--color-warning)" />
+          <p class="empty-title">Agente desconectado</p>
+          <p class="empty-subtitle">No se encontró <code>sw-agent</code>. Inicia el demonio y reintenta.</p>
+          <button type="button" class="nav-item active retry-btn" onclick={initVault}>
+            Reintentar conexión
+          </button>
+        </div>
       {:else if errorMsg}
-        <div class="empty-state error-state">
+        <div class="empty-state error-state" role="alert">
           <AlertCircle size={32} class="empty-icon" color="var(--color-danger)" />
           <p class="empty-title">{errorMsg}</p>
-          <button class="nav-item active retry-btn" onclick={loadLogins}>
+          <button
+            type="button"
+            class="nav-item active retry-btn"
+            onclick={() => vaultState.loadLogins()}
+          >
             Reintentar
           </button>
         </div>
-      {:else if logins.length === 0}
+      {:else if vaultState.logins.length === 0}
         <!-- Estado vacío: Sin logins -->
         <div class="empty-state">
           <KeyRound size={36} class="empty-icon" />
@@ -231,12 +211,12 @@
             type="button"
             class="sync-action-btn"
             onclick={handleSync}
-            disabled={isSyncing}
+            disabled={syncing}
           >
-            <span class="icon-wrap" class:spin={isSyncing}>
+            <span class="icon-wrap" class:spin={syncing}>
               <RefreshCw size={15} />
             </span>
-            <span>{isSyncing ? "Sincronizando..." : "Sincronizar con el Servidor"}</span>
+            <span>{syncing ? "Sincronizando..." : "Sincronizar con el Servidor"}</span>
           </button>
         </div>
       {:else if filteredLogins.length === 0}
@@ -252,7 +232,7 @@
             <button
               type="button"
               class="login-card-item"
-              class:selected={selectedLogin?.name === login.name}
+              class:selected={vaultState.selectedLogin?.name === login.name}
               onclick={() => handleSelectItem(login.name)}
             >
               <div class="login-card-icon">
@@ -272,29 +252,29 @@
   </section>
 
   <!-- 3. Panel de Detalles (Derecha) -->
-  <main class="vault-details-section">
-    {#if selectedLogin}
+  <section class="vault-details-section" aria-label="Detalles de credencial">
+    {#if vaultState.selectedLogin}
       <div class="detail-container">
         <div class="detail-header">
           <div class="detail-avatar">
             <KeyRound size={24} color="var(--color-primary)" />
           </div>
           <div class="detail-header-text">
-            <h3>{selectedLogin.name}</h3>
+            <h2>{vaultState.selectedLogin.name}</h2>
             <span class="detail-tag">Login</span>
           </div>
         </div>
 
         <div class="detail-fields-list">
-          {#if selectedLogin.username}
+          {#if vaultState.selectedLogin.username}
             <div class="detail-field">
               <span class="field-label">Nombre de usuario</span>
               <div class="field-box">
-                <span class="field-value">{selectedLogin.username}</span>
+                <span class="field-value">{vaultState.selectedLogin.username}</span>
                 <button
                   type="button"
                   class="field-btn"
-                  onclick={() => handleCopy(selectedLogin!.username!, "username")}
+                  onclick={() => handleCopy(vaultState.selectedLogin!.username, "username")}
                   title="Copiar nombre de usuario"
                   aria-label="Copiar nombre de usuario"
                 >
@@ -308,20 +288,21 @@
             </div>
           {/if}
 
-          {#if selectedLogin.password}
+          {#if vaultState.selectedLogin.password}
             <div class="detail-field">
               <span class="field-label">Contraseña</span>
               <div class="field-box">
                 <span class="field-value font-mono">
-                  {showDetailPassword ? selectedLogin.password : "••••••••••••••••"}
+                  {showDetailPassword ? vaultState.selectedLogin.password : "••••••••••••••••"}
                 </span>
                 <div class="field-actions">
                   <button
                     type="button"
                     class="field-btn"
                     onclick={() => (showDetailPassword = !showDetailPassword)}
+                    aria-pressed={showDetailPassword}
                     title={showDetailPassword ? "Ocultar contraseña" : "Ver contraseña"}
-                    aria-label={showDetailPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                    aria-label="Mostrar contraseña"
                   >
                     {#if showDetailPassword}
                       <EyeOff size={16} />
@@ -332,7 +313,7 @@
                   <button
                     type="button"
                     class="field-btn"
-                    onclick={() => handleCopy(selectedLogin!.password!, "password")}
+                    onclick={() => handleCopy(vaultState.selectedLogin!.password, "password")}
                     title="Copiar contraseña (se borra en 25s)"
                     aria-label="Copiar contraseña"
                   >
@@ -347,15 +328,15 @@
             </div>
           {/if}
 
-          {#if selectedLogin.totp}
+          {#if vaultState.selectedLogin.totp}
             <div class="detail-field">
               <span class="field-label">Código TOTP (2FA)</span>
               <div class="field-box">
-                <span class="field-value font-mono">{selectedLogin.totp}</span>
+                <span class="field-value font-mono">{vaultState.selectedLogin.totp}</span>
                 <button
                   type="button"
                   class="field-btn"
-                  onclick={() => handleCopy(selectedLogin!.totp!, "totp")}
+                  onclick={() => handleCopy(vaultState.selectedLogin!.totp, "totp")}
                   title="Copiar código TOTP"
                   aria-label="Copiar código TOTP"
                 >
@@ -373,14 +354,26 @@
     {:else}
       <div class="details-placeholder">
         <Shield size={40} class="placeholder-icon" />
-        <h3>Detalles del Acceso</h3>
+        <h2>Detalles del Acceso</h2>
         <p>Selecciona un login de la lista para ver su usuario, contraseña y opciones de seguridad.</p>
       </div>
     {/if}
-  </main>
+  </section>
 </div>
 
 <style>
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .vault-container {
     display: flex;
     flex: 1;
@@ -426,6 +419,7 @@
     font-weight: 500;
     cursor: pointer;
     text-align: left;
+    text-decoration: none;
     transition: background-color var(--transition-fast), color var(--transition-fast);
   }
 
@@ -609,7 +603,7 @@
   }
 
   .login-card-username {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--color-text-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -784,14 +778,14 @@
     box-shadow: var(--shadow-sm);
   }
 
-  .detail-header-text h3 {
+  .detail-header-text h2 {
     margin: 0;
     font-size: var(--font-size-lg);
     color: var(--color-text);
   }
 
   .detail-tag {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--color-text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -885,7 +879,7 @@
     margin-bottom: var(--space-2);
   }
 
-  .details-placeholder h3 {
+  .details-placeholder h2 {
     margin: 0;
     font-size: var(--font-size-lg);
     color: var(--color-text);
