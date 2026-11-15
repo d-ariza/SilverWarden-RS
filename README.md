@@ -53,4 +53,7 @@ silverWarden-Rs/
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
+pnpm --dir crates/sw-gui check
+pnpm --dir crates/sw-gui test
+pnpm --dir crates/sw-gui test:e2e
 ```

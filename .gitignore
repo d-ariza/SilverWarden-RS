@@ -26,6 +26,8 @@ crates/sw-gui/src-tauri/target/
 *.profdata
 lcov.info
 coverage/
+crates/sw-gui/test-results/
+crates/sw-gui/playwright-report/
 
 # Local sockets & credentials
 *.sock
