@@ -1,4 +1,7 @@
 use sw_client::{AgentClient, ClientError};
+use sw_ipc::dto::{
+    AgentStatus, ConfigView, LoginDetail, LoginSummary, PinChangeResult, SshKeySummary, SyncResult,
+};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem, Submenu};
@@ -90,6 +93,7 @@ fn map_client_error(e: ClientError) -> String {
         ClientError::SocketNotFound(_) => {
             "El agente no está corriendo (socket no existe).".to_string()
         }
+        ClientError::ConnectionFailed(_, err) => format!("Agente no disponible: {err}"),
         ClientError::InvalidPin => "El PIN es incorrecto, inténtalo de nuevo.".to_string(),
         ClientError::Locked => "Bóveda bloqueada. Desbloquea primero.".to_string(),
         ClientError::NotFound(msg)
@@ -101,62 +105,14 @@ fn map_client_error(e: ClientError) -> String {
     }
 }
 
+async fn call_agent<T: serde::de::DeserializeOwned>(req: sw_client::Request) -> Result<T, String> {
+    let client = get_agent_client()?;
+    client.call_ok(req).await.map_err(map_client_error)
+}
+
 #[tauri::command]
-async fn get_agent_status() -> Result<serde_json::Value, String> {
-    let client = match get_agent_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(serde_json::json!({
-                "locked": true,
-                "has_pin": false,
-                "logged_in": false,
-                "error": e,
-            }));
-        }
-    };
-
-    match client.call_ok(sw_client::Request::Status).await {
-        Ok(payload) => {
-            let locked = payload["locked"].as_bool().unwrap_or(true);
-            let has_pin = payload["has_pin"].as_bool().unwrap_or(false);
-            let logged_in = payload["logged_in"].as_bool().unwrap_or(false);
-
-            let estado = if locked { "Bloqueado" } else { "Desbloqueado" };
-            let pin = if has_pin { "Sí" } else { "No" };
-            let session = if logged_in { "Sí" } else { "No" };
-
-            Ok(serde_json::json!({
-                "locked": locked,
-                "has_pin": has_pin,
-                "logged_in": logged_in,
-                "text": format!("Estado: {} | PIN: {} | Sesión: {}", estado, pin, session)
-            }))
-        }
-        Err(ClientError::SocketNotFound(_)) => Ok(serde_json::json!({
-            "locked": true,
-            "has_pin": false,
-            "logged_in": false,
-            "error": "El agente no está corriendo (socket no existe)."
-        })),
-        Err(ClientError::ConnectionFailed(_, err)) => Ok(serde_json::json!({
-            "locked": true,
-            "has_pin": false,
-            "logged_in": false,
-            "error": format!("Agente no disponible: {}", err)
-        })),
-        Err(ClientError::AgentError { message, .. }) => Ok(serde_json::json!({
-            "locked": true,
-            "has_pin": false,
-            "logged_in": false,
-            "error": format!("Agente respondió con Error: {}", message)
-        })),
-        Err(e) => Ok(serde_json::json!({
-            "locked": true,
-            "has_pin": false,
-            "logged_in": false,
-            "error": e.to_string()
-        })),
-    }
+async fn get_agent_status() -> Result<AgentStatus, String> {
+    call_agent(sw_client::Request::Status).await
 }
 
 #[tauri::command]
@@ -199,30 +155,43 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn list_logins() -> Result<serde_json::Value, String> {
-    let client = get_agent_client()?;
-    client
-        .call_ok(sw_client::Request::ListLogins)
-        .await
-        .map_err(map_client_error)
+async fn list_logins() -> Result<Vec<LoginSummary>, String> {
+    call_agent(sw_client::Request::ListLogins).await
 }
 
 #[tauri::command]
-async fn sync_vault() -> Result<serde_json::Value, String> {
-    let client = get_agent_client()?;
-    client
-        .call_ok(sw_client::Request::Sync)
-        .await
-        .map_err(map_client_error)
+async fn sync_vault() -> Result<SyncResult, String> {
+    call_agent(sw_client::Request::Sync).await
 }
 
 #[tauri::command]
-async fn get_login(name: String) -> Result<serde_json::Value, String> {
-    let client = get_agent_client()?;
-    client
-        .call_ok(sw_client::Request::GetLogin { name })
-        .await
-        .map_err(map_client_error)
+async fn get_login(name: String) -> Result<LoginDetail, String> {
+    call_agent(sw_client::Request::GetLogin { name }).await
+}
+
+#[tauri::command]
+async fn list_ssh_keys() -> Result<Vec<SshKeySummary>, String> {
+    call_agent(sw_client::Request::ListSshKeys).await
+}
+
+#[tauri::command]
+async fn pin_set(pin: String) -> Result<PinChangeResult, String> {
+    call_agent(sw_client::Request::PinSet { pin }).await
+}
+
+#[tauri::command]
+async fn pin_update(old_pin: String, new_pin: String) -> Result<PinChangeResult, String> {
+    call_agent(sw_client::Request::PinUpdate { old_pin, new_pin }).await
+}
+
+#[tauri::command]
+async fn get_config() -> Result<ConfigView, String> {
+    call_agent(sw_client::Request::GetConfig).await
+}
+
+#[tauri::command]
+async fn set_config(config: ConfigView) -> Result<ConfigView, String> {
+    call_agent(sw_client::Request::SetConfig(config)).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -255,6 +224,11 @@ pub fn run() {
             list_logins,
             sync_vault,
             get_login,
+            list_ssh_keys,
+            pin_set,
+            pin_update,
+            get_config,
+            set_config,
             copy_to_clipboard,
             save_settings,
             load_settings,
