@@ -68,7 +68,7 @@ fn test_cli_status_no_agent() {
 fn test_cli_status_with_mock_agent() {
     let (_dir, socket_path, handle) = spawn_mock_server(|req| {
         assert_eq!(req, Request::Status);
-        Response::Ok(serde_json::json!({
+        Response::ok(serde_json::json!({
             "locked": false,
             "has_pin": true,
             "logged_in": true,
@@ -99,7 +99,7 @@ fn test_cli_unlock_with_mock_agent() {
                 pin: Some("1234".to_string())
             }
         );
-        Response::Ok(serde_json::json!({"status": "unlocked"}))
+        Response::ok(serde_json::json!({"status": "unlocked"}))
     });
 
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
@@ -151,7 +151,7 @@ fn test_cli_unlock_agent_error() {
 fn test_cli_lock_with_mock_agent() {
     let (_dir, socket_path, handle) = spawn_mock_server(|req| {
         assert_eq!(req, Request::Lock);
-        Response::Ok(serde_json::json!({}))
+        Response::ok(serde_json::json!({}))
     });
 
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
@@ -174,7 +174,7 @@ fn test_cli_pin_set_with_mock_agent() {
                 pin: "998877".to_string()
             }
         );
-        Response::Ok(serde_json::json!({}))
+        Response::ok(serde_json::json!({}))
     });
 
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
@@ -203,7 +203,7 @@ fn test_cli_pin_update_with_mock_agent() {
                 new_pin: "222222".to_string()
             }
         );
-        Response::Ok(serde_json::json!({}))
+        Response::ok(serde_json::json!({}))
     });
 
     let mut cmd = Command::cargo_bin("silverwarden").unwrap();
@@ -250,7 +250,7 @@ fn test_cli_local_commands() {
     // SSH List via IPC
     let (_dir_list, sock_list, handle_list) = spawn_mock_server(|req| {
         assert_eq!(req, Request::ListSshKeys);
-        Response::Ok(serde_json::json!([{
+        Response::ok(serde_json::json!([{
             "id": "11111111-1111-1111-1111-111111111111",
             "name": "cli-ssh",
             "fingerprint": "SHA256:test",
@@ -273,7 +273,7 @@ fn test_cli_local_commands() {
                 key_type: "Ed25519".to_string(),
             }
         );
-        Response::Ok(serde_json::json!({
+        Response::ok(serde_json::json!({
             "name": "id_ed25519",
             "fingerprint": "SHA256:added"
         }))

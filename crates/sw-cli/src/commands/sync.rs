@@ -105,10 +105,12 @@ where
         .count();
 
     if socket_path.exists() {
-        if let Ok(payload) = serde_json::to_value(&sync_data) {
-            let _ = AgentClient::new(&socket_path)
-                .call(Request::SyncData(payload))
-                .await;
+        if let Ok(payload_val) = serde_json::to_value(&sync_data) {
+            if let Ok(payload) = serde_json::from_value::<sw_ipc::SyncPayload>(payload_val) {
+                let _ = AgentClient::new(&socket_path)
+                    .call(Request::SyncData(payload))
+                    .await;
+            }
         }
     }
 

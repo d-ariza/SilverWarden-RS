@@ -405,7 +405,7 @@ async fn test_send_command_success() {
         if let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             assert_eq!(req, Request::Status);
-            let ok_resp = Response::Ok(serde_json::json!({
+            let ok_resp = Response::ok(serde_json::json!({
                 "locked": false,
                 "has_pin": true,
                 "logged_in": true,
@@ -422,7 +422,7 @@ async fn test_send_command_success() {
     assert!(res.is_ok());
     let resp = res.unwrap();
     assert!(resp.is_ok());
-    let payload = resp.unwrap_ok().unwrap();
+    let payload = resp.unwrap_ok().unwrap().to_value();
     assert_eq!(payload["locked"], false);
 }
 
@@ -444,7 +444,7 @@ async fn test_handle_command_status_and_status_locked() {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let _req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
-            let ok_resp = Response::Ok(serde_json::json!({
+            let ok_resp = Response::ok(serde_json::json!({
                 "locked": true,
                 "has_pin": false,
                 "logged_in": false,
@@ -479,7 +479,7 @@ async fn test_handle_command_unlock_with_pin_and_interactive() {
         while let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             let resp = match req {
-                Request::Status => Response::Ok(serde_json::json!({
+                Request::Status => Response::ok(serde_json::json!({
                     "locked": true,
                     "has_pin": true,
                     "logged_in": true,
@@ -491,7 +491,7 @@ async fn test_handle_command_unlock_with_pin_and_interactive() {
                     } else {
                         assert!(pin.is_some());
                     }
-                    Response::Ok(serde_json::json!({ "status": "unlocked" }))
+                    Response::ok(serde_json::json!({ "status": "unlocked" }))
                 }
                 other => panic!("Unexpected request: {:?}", other),
             };
@@ -538,7 +538,7 @@ async fn test_handle_command_lock() {
         if let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             assert_eq!(req, Request::Lock);
-            let resp = Response::Ok(serde_json::json!({ "status": "locked" }));
+            let resp = Response::ok(serde_json::json!({ "status": "locked" }));
             sw_ipc::write_message(&mut stream, &resp).await.unwrap();
         }
     });
@@ -559,11 +559,11 @@ async fn test_handle_command_pin_set_and_update() {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             match req {
                 Request::PinSet { .. } => {
-                    let resp = Response::Ok(serde_json::json!({ "status": "pin_set" }));
+                    let resp = Response::ok(serde_json::json!({ "status": "pin_set" }));
                     sw_ipc::write_message(&mut stream, &resp).await.unwrap();
                 }
                 Request::PinUpdate { .. } => {
-                    let resp = Response::Ok(serde_json::json!({ "status": "pin_updated" }));
+                    let resp = Response::ok(serde_json::json!({ "status": "pin_updated" }));
                     sw_ipc::write_message(&mut stream, &resp).await.unwrap();
                 }
                 _ => panic!("Unexpected request {:?}", req),
@@ -639,7 +639,7 @@ async fn test_handle_command_local_subcommands() {
         while let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             let resp = match req {
-                Request::ListSshKeys => Response::Ok(serde_json::json!([{
+                Request::ListSshKeys => Response::ok(serde_json::json!([{
                     "id": "11111111-1111-1111-1111-111111111111",
                     "name": "work-key",
                     "fingerprint": "SHA256:abc",
@@ -648,7 +648,7 @@ async fn test_handle_command_local_subcommands() {
                 Request::NewSshKey { name, key_type } => {
                     assert_eq!(name, "id_ed25519");
                     assert_eq!(key_type, "Ed25519");
-                    Response::Ok(serde_json::json!({
+                    Response::ok(serde_json::json!({
                         "name": name,
                         "fingerprint": "SHA256:new",
                         "public_key": "ssh-ed25519 BBBB"
@@ -840,7 +840,7 @@ async fn test_cli_sync_success() {
         if let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             assert!(matches!(req, Request::SyncData(_)));
-            let resp = Response::Ok(serde_json::json!({
+            let resp = Response::ok(serde_json::json!({
                 "status": "synced",
                 "logins": 5
             }));
@@ -1087,7 +1087,7 @@ async fn test_cli_logins_list() {
         if let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             assert_eq!(req, Request::ListLogins);
-            let resp = Response::Ok(serde_json::json!([
+            let resp = Response::ok(serde_json::json!([
                 { "id": "111", "name": "GitHub", "username": "octocat" },
                 { "id": "222", "name": "Google", "username": "admin@gmail.com" }
             ]));
@@ -1133,7 +1133,7 @@ async fn test_cli_logins_create() {
                 }
                 other => panic!("Unexpected request {:?}", other),
             }
-            let resp = Response::Ok(serde_json::json!({
+            let resp = Response::ok(serde_json::json!({
                 "status": "created",
                 "id": "uuid-1234",
                 "name": "AWS Console"
@@ -1170,7 +1170,7 @@ async fn test_cli_logins_get_and_delete() {
             match req {
                 Request::GetLogin { name } => {
                     assert_eq!(name, "GitHub");
-                    let resp = Response::Ok(serde_json::json!({
+                    let resp = Response::ok(serde_json::json!({
                         "name": "GitHub",
                         "username": "octocat",
                         "password": "supersecretpass",
@@ -1180,7 +1180,7 @@ async fn test_cli_logins_get_and_delete() {
                 }
                 Request::DeleteLogin { name } => {
                     assert_eq!(name, "GitHub");
-                    let resp = Response::Ok(serde_json::json!({
+                    let resp = Response::ok(serde_json::json!({
                         "status": "deleted",
                         "name": "GitHub"
                     }));
@@ -3269,11 +3269,11 @@ async fn test_ssh_subcommands() {
         while let Ok((mut stream, _)) = listener.accept().await {
             let req: Request = sw_ipc::read_message(&mut stream).await.unwrap();
             let resp = match req {
-                Request::ListSshKeys => Response::Ok(serde_json::json!([])),
+                Request::ListSshKeys => Response::ok(serde_json::json!([])),
                 Request::ImportSshKey { name, pem } => {
                     assert_eq!(name, "imported_key");
                     assert!(pem.contains("OPENSSH PRIVATE KEY"));
-                    Response::Ok(serde_json::json!({
+                    Response::ok(serde_json::json!({
                         "name": name,
                         "fingerprint": "SHA256:imp",
                     }))
@@ -3281,7 +3281,7 @@ async fn test_ssh_subcommands() {
                 Request::NewSshKey { name, key_type } => {
                     assert_eq!(name, "id_ed25519");
                     assert_eq!(key_type, "Ed25519");
-                    Response::Ok(serde_json::json!({
+                    Response::ok(serde_json::json!({
                         "name": name,
                         "fingerprint": "SHA256:gen",
                     }))
@@ -4349,7 +4349,7 @@ async fn test_cli_logins_list_filter_matches_and_no_matches() {
         while let Ok((mut stream, _)) = listener.accept().await {
             if let Ok(msg) = sw_ipc::read_message::<_, Request>(&mut stream).await {
                 if msg == Request::ListLogins {
-                    let resp = Response::Ok(serde_json::json!([
+                    let resp = Response::ok(serde_json::json!([
                         { "name": "GitHub", "username": "octocat" },
                         { "name": "Google", "username": "alice@gmail.com" }
                     ]));
@@ -4419,7 +4419,7 @@ async fn test_cli_unlock_with_corrupt_config_ignores_and_proceeds() {
                         pin: Some("1234".to_string())
                     }
                 );
-                let resp = Response::Ok(serde_json::json!({ "unlocked": true }));
+                let resp = Response::ok(serde_json::json!({ "unlocked": true }));
                 let _ = sw_ipc::write_message(&mut stream, &resp).await;
             }
         }
@@ -4454,13 +4454,13 @@ async fn test_cli_pin_commands_interactive_prompts() {
                 match msg {
                     Request::PinSet { pin } => {
                         assert_eq!(pin, "5555");
-                        let resp = Response::Ok(serde_json::json!({ "success": true }));
+                        let resp = Response::ok(serde_json::json!({ "success": true }));
                         let _ = sw_ipc::write_message(&mut stream, &resp).await;
                     }
                     Request::PinUpdate { old_pin, new_pin } => {
                         assert_eq!(old_pin, "5555");
                         assert_eq!(new_pin, "6666");
-                        let resp = Response::Ok(serde_json::json!({ "success": true }));
+                        let resp = Response::ok(serde_json::json!({ "success": true }));
                         let _ = sw_ipc::write_message(&mut stream, &resp).await;
                     }
                     other => panic!("Unexpected request {:?}", other),
@@ -4970,7 +4970,7 @@ async fn test_cli_logins_create_status_ok_payload() {
         if let Ok((mut stream, _)) = listener.accept().await {
             if let Ok(msg) = sw_ipc::read_message::<_, Request>(&mut stream).await {
                 assert!(matches!(msg, Request::CreateLogin { .. }));
-                let resp = Response::Ok(serde_json::json!({
+                let resp = Response::ok(serde_json::json!({
                     "status": "ok",
                     "cipher_id": "test_id"
                 }));

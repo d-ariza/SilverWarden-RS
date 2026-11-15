@@ -8,10 +8,9 @@ pub async fn handle(
     let socket_path = resolve_socket_path(cli.socket.clone())?;
     match action {
         None | Some(LoginsCommands::List) => {
-            let val = AgentClient::new(&socket_path)
+            let items: Vec<sw_ipc::dto::LoginSummary> = AgentClient::new(&socket_path)
                 .call_ok(Request::ListLogins)
                 .await?;
-            let items = val.as_array().cloned().unwrap_or_default();
             let filter_str = filter.as_deref().unwrap_or("").to_lowercase();
             let filtered: Vec<_> = items
                 .into_iter()
@@ -19,10 +18,8 @@ pub async fn handle(
                     if filter_str.is_empty() {
                         return true;
                     }
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let username = item.get("username").and_then(|v| v.as_str()).unwrap_or("");
-                    name.to_lowercase().contains(&filter_str)
-                        || username.to_lowercase().contains(&filter_str)
+                    item.name.to_lowercase().contains(&filter_str)
+                        || item.username.to_lowercase().contains(&filter_str)
                 })
                 .collect();
 
@@ -36,9 +33,7 @@ pub async fn handle(
                 ""
             ));
             for item in filtered {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let username = item.get("username").and_then(|v| v.as_str()).unwrap_or("");
-                out.push_str(&format!("{:<30} | {}\n", name, username));
+                out.push_str(&format!("{:<30} | {}\n", item.name, item.username));
             }
             Ok(out.trim_end().to_string())
         }
@@ -48,12 +43,13 @@ pub async fn handle(
                     "El nombre no puede estar vacío.".to_string(),
                 ));
             }
-            let val = AgentClient::new(&socket_path)
+            let detail: sw_ipc::dto::LoginDetail = AgentClient::new(&socket_path)
                 .call_ok(Request::GetLogin { name: name.clone() })
                 .await?;
-            let password = val.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let totp = val.get("totp").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(format!("Contraseña: {password}\nTOTP: {totp}"))
+            Ok(format!(
+                "Contraseña: {}\nTOTP: {}",
+                detail.password, detail.totp
+            ))
         }
         Some(LoginsCommands::Create {
             name,
@@ -65,7 +61,7 @@ pub async fn handle(
                     "El nombre no puede estar vacío.".to_string(),
                 ));
             }
-            let val = AgentClient::new(&socket_path)
+            let val: serde_json::Value = AgentClient::new(&socket_path)
                 .call_ok(Request::CreateLogin {
                     name: name.clone(),
                     username: username.clone(),

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use sw_ipc::{read_message, write_message, Request, Response};
+use sw_ipc::{read_message, write_message, Request, Response, ResponseData, SyncPayload};
 use sw_systemauth::CallingContext;
 use sw_vault_agent::VaultAgentServer;
 use thiserror::Error;
@@ -67,18 +67,6 @@ impl AgentError {
     }
 }
 
-impl From<String> for AgentError {
-    fn from(s: String) -> Self {
-        if s.contains("PIN incorrecto") {
-            AgentError::InvalidPin
-        } else if s.contains("Bóveda bloqueada") || s.contains("Vault is locked") {
-            AgentError::Locked
-        } else {
-            AgentError::Other(s)
-        }
-    }
-}
-
 #[allow(clippy::cmp_owned)]
 impl PartialEq for AgentError {
     fn eq(&self, other: &Self) -> bool {
@@ -117,10 +105,11 @@ impl PartialEq<String> for AgentError {
     }
 }
 
-impl From<&str> for AgentError {
-    fn from(s: &str) -> Self {
-        s.to_string().into()
-    }
+fn serialize_dto<T: serde::Serialize>(
+    res: Result<T, AgentError>,
+) -> Result<serde_json::Value, AgentError> {
+    let dto = res?;
+    serde_json::to_value(dto).map_err(|e| AgentError::ServerError(e.to_string()))
 }
 
 /// Type alias for dynamic asynchronous action handlers.
@@ -171,7 +160,7 @@ impl ActionsRegistry {
         let a = agent.clone();
         self.register_async("ListSSHKeys", move |_state, _ctx, _payload| {
             let a = a.clone();
-            Box::pin(async move { handle_list_ssh_keys(&a).await })
+            Box::pin(async move { serialize_dto(handle_list_ssh_keys(&a).await) })
         });
 
         let a = agent.clone();
@@ -217,7 +206,7 @@ pub fn default_registry() -> ActionsRegistry {
     let mut registry = ActionsRegistry::new();
 
     registry.register_async("Status", |state, ctx, _payload| {
-        Box::pin(async move { handle_status(state, ctx).await })
+        Box::pin(async move { serialize_dto(handle_status(state, ctx).await) })
     });
     registry.register_async("Unlock", |state, ctx, payload| {
         let p = payload.clone();
@@ -227,17 +216,17 @@ pub fn default_registry() -> ActionsRegistry {
         Box::pin(async move { handle_lock(state, ctx).await })
     });
     registry.register("PinSet", |state, _ctx, payload| {
-        handle_pin_set(state, payload)
+        serialize_dto(handle_pin_set(state, payload))
     });
     registry.register("PinUpdate", |state, _ctx, payload| {
-        handle_pin_update(state, payload)
+        serialize_dto(handle_pin_update(state, payload))
     });
     registry.register("AgentShutdown", |state, _ctx, _payload| {
         handle_agent_shutdown(state)
     });
     registry.register_async("ListSSHKeys", |state, _ctx, _payload| {
         let agent = state.services.vault_agent.clone();
-        Box::pin(async move { handle_list_ssh_keys(&agent).await })
+        Box::pin(async move { serialize_dto(handle_list_ssh_keys(&agent).await) })
     });
     registry.register_async("ImportSSHKey", |state, _ctx, payload| {
         let agent = state.services.vault_agent.clone();
@@ -256,22 +245,39 @@ pub fn default_registry() -> ActionsRegistry {
     });
     registry.register_async("Sync", |state, _ctx, payload| {
         let p = payload.clone();
-        Box::pin(async move { handle_sync(state, &p).await })
+        Box::pin(async move {
+            let sync_payload: SyncPayload = if p.is_null() {
+                SyncPayload::default()
+            } else {
+                serde_json::from_value(p).unwrap_or_default()
+            };
+            serialize_dto(handle_sync(state, &sync_payload).await)
+        })
     });
     registry.register_async("SyncData", |state, _ctx, payload| {
         let p = payload.clone();
-        Box::pin(async move { handle_sync_data(state, &p).await })
+        Box::pin(async move {
+            let sync_payload: SyncPayload = serde_json::from_value(p).map_err(|e| {
+                AgentError::Validation(format!("Error deserializando SyncData: {e}"))
+            })?;
+            serialize_dto(handle_sync_data(state, &sync_payload).await)
+        })
     });
     registry.register_async("ReloadVault", |state, _ctx, payload| {
         let p = payload.clone();
-        Box::pin(async move { handle_sync_data(state, &p).await })
+        Box::pin(async move {
+            let sync_payload: SyncPayload = serde_json::from_value(p).map_err(|e| {
+                AgentError::Validation(format!("Error deserializando SyncData: {e}"))
+            })?;
+            serialize_dto(handle_sync_data(state, &sync_payload).await)
+        })
     });
     registry.register_async("ListLogins", |state, _ctx, _payload| {
-        Box::pin(handle_list_logins(state))
+        Box::pin(async move { serialize_dto(handle_list_logins(state).await) })
     });
     registry.register_async("GetLogin", |state, _ctx, payload| {
         let p = payload.clone();
-        Box::pin(async move { handle_get_login(state, &p).await })
+        Box::pin(async move { serialize_dto(handle_get_login(state, &p).await) })
     });
     registry.register_async("CreateLogin", |state, _ctx, payload| {
         let p = payload.clone();
@@ -288,6 +294,14 @@ pub fn default_registry() -> ActionsRegistry {
     registry.register_async("Login", |state, _ctx, payload| {
         let p = payload.clone();
         Box::pin(async move { handle_set_session(state, &p).await })
+    });
+    registry.register("GetConfig", |state, _ctx, _payload| {
+        serialize_dto(Ok(handle_get_config(state)))
+    });
+    registry.register("SetConfig", |state, _ctx, payload| {
+        let view: sw_ipc::ConfigView = serde_json::from_value(payload.clone())
+            .map_err(|e| AgentError::Validation(format!("ConfigView inválido: {e}")))?;
+        serialize_dto(handle_set_config(state, &view))
     });
 
     registry
@@ -345,56 +359,55 @@ impl AgentDaemon {
         ctx: &CallingContext,
         req: Request,
     ) -> Response {
-        let res = match req {
-            Request::Status => handle_status(state, ctx).await,
-            Request::Unlock { pin } => {
-                let payload = serde_json::json!({ "pin": pin });
-                handle_unlock(state, ctx, &payload).await
-            }
-            Request::Lock => handle_lock(state, ctx).await,
-            Request::Sync => handle_sync(state, &serde_json::json!({})).await,
+        let res: Result<ResponseData, AgentError> = match req {
+            Request::Status => handle_status(state, ctx).await.map(ResponseData::from),
+            Request::Unlock { pin } => handle_unlock_pin(state, ctx, pin.as_deref(), None, None)
+                .await
+                .map(ResponseData::from),
+            Request::Lock => handle_lock_typed(state, ctx).await.map(ResponseData::from),
+            Request::Sync => handle_sync(state, &SyncPayload::default())
+                .await
+                .map(ResponseData::from),
             Request::SyncData(payload) | Request::ReloadVault(payload) => {
-                handle_sync_data(state, &payload).await
+                handle_sync_data(state, &payload)
+                    .await
+                    .map(ResponseData::from)
             }
-            Request::ListLogins => handle_list_logins(state).await,
-            Request::GetLogin { name } => {
-                handle_get_login(state, &serde_json::json!({ "name": name })).await
-            }
+            Request::ListLogins => handle_list_logins(state).await.map(ResponseData::from),
+            Request::GetLogin { name } => handle_get_login_by_name(state, &name)
+                .await
+                .map(ResponseData::from),
             Request::CreateLogin {
                 name,
                 username,
                 password,
-            } => {
-                let payload = serde_json::json!({
-                    "name": name,
-                    "username": username,
-                    "password": password
-                });
-                handle_create_login(state, &payload).await
-            }
-            Request::DeleteLogin { name } => {
-                handle_delete_login(state, &serde_json::json!({ "name": name })).await
-            }
+            } => handle_create_login_params(state, &name, &username, &password)
+                .await
+                .map(ResponseData::from),
+            Request::DeleteLogin { name } => handle_delete_login_by_name(state, &name)
+                .await
+                .map(ResponseData::from),
             Request::ListSshKeys => {
                 let agent = state.services.vault_agent.clone();
-                handle_list_ssh_keys(&agent).await
+                handle_list_ssh_keys(&agent).await.map(ResponseData::from)
             }
             Request::ImportSshKey { name, pem } => {
                 let agent = state.services.vault_agent.clone();
-                handle_import_ssh_key(&agent, &serde_json::json!({ "name": name, "pem": pem }))
+                handle_import_ssh_key_params(&agent, &name, &pem)
                     .await
+                    .map(ResponseData::from)
             }
             Request::NewSshKey { name, key_type } => {
                 let agent = state.services.vault_agent.clone();
-                handle_new_ssh_key(
-                    &agent,
-                    &serde_json::json!({ "name": name, "key_type": key_type }),
-                )
-                .await
+                handle_new_ssh_key_params(&agent, &name, &key_type)
+                    .await
+                    .map(ResponseData::from)
             }
             Request::DeleteSshKey { id } => {
                 let agent = state.services.vault_agent.clone();
-                handle_delete_ssh_key(&agent, &serde_json::json!({ "id": id })).await
+                handle_delete_ssh_key_by_id(&agent, &id)
+                    .await
+                    .map(ResponseData::from)
             }
             Request::SetSession {
                 token,
@@ -406,24 +419,27 @@ impl AgentDaemon {
                 notifications_url,
                 danger_accept_invalid_certs,
             } => {
-                let payload = serde_json::json!({
-                    "token": token,
-                    "encrypted_token": encrypted_token,
-                    "encrypted_user_symmetric_key": encrypted_user_symmetric_key,
-                    "user_symmetric_key": user_symmetric_key,
-                    "identity_url": identity_url,
-                    "api_url": api_url,
-                    "notifications_url": notifications_url,
-                    "danger_accept_invalid_certs": danger_accept_invalid_certs,
-                });
-                handle_set_session(state, &payload).await
+                let params = SessionUpdate {
+                    token: token.as_ref(),
+                    encrypted_token: encrypted_token.as_deref(),
+                    encrypted_user_symmetric_key: encrypted_user_symmetric_key.as_deref(),
+                    user_symmetric_key: user_symmetric_key.as_deref(),
+                    identity_url: identity_url.as_deref(),
+                    api_url: api_url.as_deref(),
+                    notifications_url: notifications_url.as_deref(),
+                    danger_accept_invalid_certs,
+                };
+                handle_set_session_params(state, params)
+                    .await
+                    .map(ResponseData::from)
             }
-            Request::PinSet { pin } => handle_pin_set(state, &serde_json::json!({ "pin": pin })),
-            Request::PinUpdate { old_pin, new_pin } => handle_pin_update(
-                state,
-                &serde_json::json!({ "old_pin": old_pin, "new_pin": new_pin }),
-            ),
-            Request::AgentShutdown => handle_agent_shutdown(state),
+            Request::PinSet { pin } => handle_pin_set_value(state, &pin).map(ResponseData::from),
+            Request::PinUpdate { old_pin, new_pin } => {
+                handle_pin_update_values(state, &old_pin, &new_pin).map(ResponseData::from)
+            }
+            Request::GetConfig => Ok(ResponseData::from(handle_get_config(state))),
+            Request::SetConfig(view) => handle_set_config(state, &view).map(ResponseData::from),
+            Request::AgentShutdown => handle_agent_shutdown_typed(state).map(ResponseData::from),
         };
 
         match res {

@@ -61,9 +61,10 @@ async fn test_agent_socket_actions_flow() {
     write_message(&mut stream, &status_req).await.unwrap();
     let status_resp: Response = read_message(&mut stream).await.unwrap();
     assert!(status_resp.is_ok());
-    let status_payload = status_resp.unwrap_ok().unwrap();
-    assert_eq!(status_payload["locked"], true);
-    assert_eq!(status_payload["has_pin"], true);
+    let status_payload: sw_ipc::AgentStatus =
+        status_resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    assert!(status_payload.locked);
+    assert!(status_payload.has_pin);
 
     // 2. Unlock with wrong PIN -> should fail
     let wrong_unlock_req = Request::Unlock {
@@ -80,21 +81,25 @@ async fn test_agent_socket_actions_flow() {
     write_message(&mut stream, &unlock_req).await.unwrap();
     let unlock_resp: Response = read_message(&mut stream).await.unwrap();
     assert!(unlock_resp.is_ok());
-    let unlock_payload = unlock_resp.unwrap_ok().unwrap();
+    let unlock_payload = unlock_resp.unwrap_ok().unwrap().to_value();
     assert_eq!(unlock_payload["status"], "unlocked");
 
     // Status after unlock -> locked must be false
     write_message(&mut stream, &status_req).await.unwrap();
     let status_after_unlock: Response = read_message(&mut stream).await.unwrap();
-    let status_after_payload = status_after_unlock.unwrap_ok().unwrap();
-    assert_eq!(status_after_payload["locked"], false);
+    let status_after_payload: sw_ipc::AgentStatus = status_after_unlock
+        .unwrap_ok()
+        .unwrap()
+        .deserialize_into()
+        .unwrap();
+    assert!(!status_after_payload.locked);
 
     // 4. Send Lock request
     let lock_req = Request::Lock;
     write_message(&mut stream, &lock_req).await.unwrap();
     let lock_resp: Response = read_message(&mut stream).await.unwrap();
     assert!(lock_resp.is_ok());
-    let lock_payload = lock_resp.unwrap_ok().unwrap();
+    let lock_payload = lock_resp.unwrap_ok().unwrap().to_value();
     assert_eq!(lock_payload["status"], "locked");
 
     // 5. Send AgentShutdown request to stop the daemon
@@ -102,7 +107,7 @@ async fn test_agent_socket_actions_flow() {
     write_message(&mut stream, &shutdown_req).await.unwrap();
     let shutdown_resp: Response = read_message(&mut stream).await.unwrap();
     assert!(shutdown_resp.is_ok());
-    let shutdown_payload = shutdown_resp.unwrap_ok().unwrap();
+    let shutdown_payload = shutdown_resp.unwrap_ok().unwrap().to_value();
     assert_eq!(shutdown_payload["status"], "shutting_down");
 
     let agent_res = agent_task.await.expect("Agent task completed");
@@ -567,14 +572,15 @@ async fn test_ssh_actions_daemon_ipc_messages() {
     };
     let resp = daemon.handle_message(&ctx, req).await;
     assert!(resp.is_ok());
-    let val = resp.unwrap_ok().unwrap();
-    assert_eq!(val["name"], "daemon-key");
+    let val: sw_ipc::SshKeySummary = resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    assert_eq!(val.name, "daemon-key");
 
     // List keys via handle_message
     let list_resp = daemon.handle_message(&ctx, Request::ListSshKeys).await;
     assert!(list_resp.is_ok());
-    let list_val = list_resp.unwrap_ok().unwrap();
-    assert_eq!(list_val.as_array().unwrap().len(), 1);
+    let list_val: Vec<sw_ipc::SshKeySummary> =
+        list_resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    assert_eq!(list_val.len(), 1);
 
     // Import key via handle_message
     let keypair = russh::keys::ssh_key::private::KeypairData::Ed25519(
@@ -591,8 +597,8 @@ async fn test_ssh_actions_daemon_ipc_messages() {
     };
     let imp_resp = daemon.handle_message(&ctx, imp_req).await;
     assert!(imp_resp.is_ok());
-    let imp_val = imp_resp.unwrap_ok().unwrap();
-    let imp_id = imp_val["id"].as_str().unwrap();
+    let imp_val: sw_ipc::SshKeySummary = imp_resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    let imp_id = imp_val.id.as_deref().unwrap();
 
     // Delete key via handle_message
     let del_req = Request::DeleteSshKey {
@@ -1777,7 +1783,7 @@ fn mock_api_client(base_url: &str) -> Arc<sw_bitwarden_api::AuthenticatedClient>
 async fn test_handle_sync_locked_returns_error() {
     let (mut state, _tmp) = temp_state();
     state.session.is_locked = true;
-    let res = handle_sync(&mut state, &serde_json::json!({})).await;
+    let res = handle_sync(&mut state, &sw_ipc::SyncPayload::default()).await;
     assert!(res.is_err());
     assert!(res.unwrap_err().contains("Bóveda bloqueada"));
 }
@@ -1788,7 +1794,7 @@ async fn test_handle_sync_without_session_returns_error() {
     state.session.is_locked = false;
     state.services.config.encrypted_token = String::new();
     state.services.api_client = None;
-    let res = handle_sync(&mut state, &serde_json::json!({})).await;
+    let res = handle_sync(&mut state, &sw_ipc::SyncPayload::default()).await;
     assert!(res.is_err());
     assert_eq!(
         res.unwrap_err(),
@@ -1839,13 +1845,14 @@ async fn test_handle_sync_payload_updates_config_and_summary() {
         })
         .await;
 
-    let payload = serde_json::json!({
-        "encrypted_token": "enc_tok_payload",
-        "encrypted_user_symmetric_key": "enc_sym_payload",
-        "identity_url": "https://identity.test",
-        "api_url": "https://api.test",
-        "danger_accept_invalid_certs": true,
-    });
+    let payload = sw_ipc::SyncPayload {
+        encrypted_token: Some("enc_tok_payload".to_string()),
+        encrypted_user_symmetric_key: Some("enc_sym_payload".to_string()),
+        identity_url: Some("https://identity.test".to_string()),
+        api_url: Some("https://api.test".to_string()),
+        danger_accept_invalid_certs: Some(true),
+        ..Default::default()
+    };
 
     let res = handle_sync(&mut state, &payload)
         .await
@@ -1859,10 +1866,11 @@ async fn test_handle_sync_payload_updates_config_and_summary() {
     assert_eq!(state.services.config.api_url, "https://api.test");
     assert!(state.services.config.danger_accept_invalid_certs);
 
-    assert_eq!(res["status"], "synced");
-    assert_eq!(res["total"], 4);
-    assert_eq!(res["logins"], 2);
-    assert_eq!(res["ssh_keys"], 1);
+    assert_eq!(res.status, "synced");
+    assert_eq!(res.total, 4);
+    assert_eq!(res.logins, 2);
+    assert_eq!(res.ssh_keys, 1);
+    assert_eq!(res.notes, 1);
 }
 
 #[tokio::test]
@@ -1882,7 +1890,7 @@ async fn test_handle_sync_disk_config_fallback() {
     };
     save_config_file(&disk_cfg, &tmp.path().join("goldwarden.json")).unwrap();
 
-    let res = handle_sync(&mut state, &serde_json::json!({}))
+    let res = handle_sync(&mut state, &sw_ipc::SyncPayload::default())
         .await
         .expect("sync fallback should succeed");
     assert_eq!(state.services.config.encrypted_token, "disk_enc_token");
@@ -1895,7 +1903,7 @@ async fn test_handle_sync_disk_config_fallback() {
         "https://disk-ident.test"
     );
     assert_eq!(state.services.config.api_url, "https://disk-api.test");
-    assert_eq!(res["status"], "synced");
+    assert_eq!(res.status, "synced");
 }
 
 #[tokio::test]
@@ -1941,13 +1949,13 @@ async fn test_handle_sync_api_success_persists_vault() {
     state.session.is_locked = false;
     state.services.api_client = Some(mock_api_client(&server.uri()));
 
-    let res = handle_sync(&mut state, &serde_json::json!({}))
+    let res = handle_sync(&mut state, &sw_ipc::SyncPayload::default())
         .await
         .expect("sync should succeed");
-    assert_eq!(res["status"], "synced");
-    assert_eq!(res["total"], 2);
-    assert_eq!(res["logins"], 1);
-    assert_eq!(res["ssh_keys"], 1);
+    assert_eq!(res.status, "synced");
+    assert_eq!(res.total, 2);
+    assert_eq!(res.logins, 1);
+    assert_eq!(res.ssh_keys, 1);
 
     // Verify vault.json was persisted on disk in tmp
     let vault_file = tmp.path().join("vault.json");
@@ -1973,7 +1981,7 @@ async fn test_handle_sync_api_rate_limit() {
     state.session.is_locked = false;
     state.services.api_client = Some(mock_api_client(&server.uri()));
 
-    let err = handle_sync(&mut state, &serde_json::json!({}))
+    let err = handle_sync(&mut state, &sw_ipc::SyncPayload::default())
         .await
         .unwrap_err();
     assert!(err.contains("El servidor ha bloqueado temporalmente tu IP"));
@@ -1995,7 +2003,7 @@ async fn test_handle_sync_api_server_error() {
     state.session.is_locked = false;
     state.services.api_client = Some(mock_api_client(&server.uri()));
 
-    let err = handle_sync(&mut state, &serde_json::json!({}))
+    let err = handle_sync(&mut state, &sw_ipc::SyncPayload::default())
         .await
         .unwrap_err();
     assert!(err.contains("Error al sincronizar con el servidor"));
@@ -2028,23 +2036,25 @@ async fn test_handle_sync_token_payload_builds_api_client() {
     state.session.is_locked = false;
     assert!(state.services.api_client.is_none());
 
-    let payload = serde_json::json!({
-        "identity_url": format!("{}/identity", server.uri()),
-        "api_url": format!("{}/api", server.uri()),
-        "danger_accept_invalid_certs": true,
-        "token": {
-            "access_token": "valid_token_xyz",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "refresh_token": "valid_refresh_xyz",
-            "key": "valid_key_xyz"
-        }
-    });
+    let payload = sw_ipc::SyncPayload {
+        identity_url: Some(format!("{}/identity", server.uri())),
+        api_url: Some(format!("{}/api", server.uri())),
+        danger_accept_invalid_certs: Some(true),
+        token: Some(sw_config::LoginToken {
+            access_token: "valid_token_xyz".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: "valid_refresh_xyz".to_string(),
+            key: "valid_key_xyz".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
 
     let res = handle_sync(&mut state, &payload)
         .await
         .expect("sync with token payload should succeed");
-    assert_eq!(res["status"], "synced");
+    assert_eq!(res.status, "synced");
     assert!(state.services.api_client.is_some());
 }
 
@@ -2094,13 +2104,12 @@ async fn test_handle_list_logins_filters_and_locked() {
     deleted_login.deleted_date = Some("2026-01-01T00:00:00Z".to_string());
     vault.insert(deleted_login).await;
 
-    let res = handle_list_logins(&state)
+    let list = handle_list_logins(&state)
         .await
         .expect("list logins succeeds");
-    let list = res.as_array().expect("array result");
     assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["name"], "ActiveLogin");
-    assert_eq!(list[0]["username"], "alice");
+    assert_eq!(list[0].name, "ActiveLogin");
+    assert_eq!(list[0].username, "alice");
 }
 
 #[tokio::test]
@@ -2128,21 +2137,21 @@ async fn test_handle_get_login_found_not_found_locked() {
     let res_exact = handle_get_login(&state, &serde_json::json!({ "name": "GitHub" }))
         .await
         .unwrap();
-    assert_eq!(res_exact["name"], "GitHub");
-    assert_eq!(res_exact["username"], "octocat");
-    assert_eq!(res_exact["password"], "super_secret");
+    assert_eq!(res_exact.name, "GitHub");
+    assert_eq!(res_exact.username, "octocat");
+    assert_eq!(res_exact.password, "super_secret");
 
     // Found case-insensitive
     let res_case = handle_get_login(&state, &serde_json::json!({ "name": "github" }))
         .await
         .unwrap();
-    assert_eq!(res_case["name"], "GitHub");
+    assert_eq!(res_case.name, "GitHub");
 
     // Found from primitive string payload
     let res_str = handle_get_login(&state, &serde_json::json!("GITHUB"))
         .await
         .unwrap();
-    assert_eq!(res_str["name"], "GitHub");
+    assert_eq!(res_str.name, "GitHub");
 
     // Not found
     let err_not_found = handle_get_login(&state, &serde_json::json!({ "name": "GitLab" }))
@@ -2466,7 +2475,11 @@ async fn test_handle_set_session_invalid_key_does_not_panic() {
 #[tokio::test]
 async fn test_handle_sync_data_invalid_payload() {
     let (mut state, _tmp) = temp_state();
-    let err = handle_sync_data(&mut state, &serde_json::json!("not-a-syncdata-object"))
+    let bad_payload = sw_ipc::SyncPayload {
+        ciphers: Some(serde_json::json!("not-a-syncdata-object")),
+        ..Default::default()
+    };
+    let err = handle_sync_data(&mut state, &bad_payload)
         .await
         .unwrap_err();
     assert!(err.contains("Error deserializando SyncData"));
@@ -2498,14 +2511,15 @@ async fn test_handle_sync_data_success() {
         ..Default::default()
     };
 
-    let payload = serde_json::to_value(&valid_sync).unwrap();
+    let payload: sw_ipc::SyncPayload =
+        serde_json::from_value(serde_json::to_value(&valid_sync).unwrap()).unwrap();
     let res = handle_sync_data(&mut state, &payload)
         .await
         .expect("sync data should succeed");
-    assert_eq!(res["status"], "synced");
-    assert_eq!(res["total"], 2);
-    assert_eq!(res["logins"], 1);
-    assert_eq!(res["ssh_keys"], 1);
+    assert_eq!(res.status, "synced");
+    assert_eq!(res.total, 2);
+    assert_eq!(res.logins, 1);
+    assert_eq!(res.ssh_keys, 1);
 
     // Vault file on disk
     let vault_file = tmp.path().join("vault.json");
@@ -4031,9 +4045,63 @@ async fn test_run_agent_loads_config_from_disk() {
     let _ = server_handle.await;
 
     match resp {
-        Response::Ok(val) => {
-            assert_eq!(val["has_pin"], true);
+        Response::Ok(data) => {
+            let status: sw_ipc::AgentStatus = data.deserialize_into().unwrap();
+            assert!(status.has_pin);
         }
         other => panic!("Unexpected response: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_contrato_agent_daemon_get_and_set_config_dtos() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ConfigFile {
+        api_url: "https://api.initial.example".to_string(),
+        identity_url: "https://id.initial.example".to_string(),
+        notifications_url: "https://notif.initial.example".to_string(),
+        danger_accept_invalid_certs: false,
+        ..Default::default()
+    };
+    config
+        .save_to_file(&temp_dir.path().join("goldwarden.json"))
+        .unwrap();
+
+    let vault_agent = Arc::new(VaultAgentServer::default());
+    let state =
+        AgentState::load_or_default_from_with(Some(temp_dir.path().to_path_buf()), vault_agent);
+    let daemon = AgentDaemon::with_state(state);
+
+    let ctx = CallingContext {
+        username: "tester".into(),
+        process_name: "test".into(),
+        parent_process_name: "test_runner".into(),
+        grandparent_process_name: "cargo".into(),
+        process_pid: 10,
+        parent_process_pid: 5,
+        grandparent_process_pid: 1,
+        error: false,
+        authenticated: true,
+    };
+
+    let get_resp = daemon.handle_message(&ctx, Request::GetConfig).await;
+    let initial: sw_ipc::ConfigView = get_resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    assert_eq!(initial.api_url, "https://api.initial.example");
+    assert!(!initial.danger_accept_invalid_certs);
+
+    let updated_cfg = sw_ipc::ConfigView {
+        api_url: "https://api.updated.example".to_string(),
+        identity_url: "https://id.updated.example".to_string(),
+        notifications_url: "https://notif.updated.example".to_string(),
+        danger_accept_invalid_certs: true,
+    };
+    let set_resp = daemon
+        .handle_message(&ctx, Request::SetConfig(updated_cfg.clone()))
+        .await;
+    let returned: sw_ipc::ConfigView = set_resp.unwrap_ok().unwrap().deserialize_into().unwrap();
+    assert_eq!(returned, updated_cfg);
+
+    let persisted = ConfigFile::load_from_file(&temp_dir.path().join("goldwarden.json")).unwrap();
+    assert_eq!(persisted.api_url, "https://api.updated.example");
+    assert!(persisted.danger_accept_invalid_certs);
 }

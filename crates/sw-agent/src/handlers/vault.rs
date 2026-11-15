@@ -1,8 +1,9 @@
 use crate::handlers::sync::populate_keyring;
 use crate::state::AgentState;
 use crate::AgentError;
+use sw_ipc::dto::{LoginDetail, LoginSummary, OperationAck};
 
-pub async fn handle_list_logins(state: &AgentState) -> Result<serde_json::Value, AgentError> {
+pub async fn handle_list_logins(state: &AgentState) -> Result<Vec<LoginSummary>, AgentError> {
     if state.session.is_locked {
         return Err(AgentError::Locked);
     }
@@ -65,28 +66,26 @@ pub async fn handle_list_logins(state: &AgentState) -> Result<serde_json::Value,
                 })
                 .unwrap_or_default();
 
-            list.push(serde_json::json!({
-                "id": c.id,
-                "name": name,
-                "username": username,
-            }));
+            list.push(LoginSummary {
+                id: c.id.map(|u| u.to_string()),
+                name,
+                username,
+            });
         }
     }
-    Ok(serde_json::json!(list))
+    Ok(list)
 }
 
-pub async fn handle_get_login(
+pub async fn handle_get_login_by_name(
     state: &AgentState,
-    payload: &serde_json::Value,
-) -> Result<serde_json::Value, AgentError> {
+    target_name: &str,
+) -> Result<LoginDetail, AgentError> {
     if state.session.is_locked {
         return Err(AgentError::Locked);
     }
-    let target_name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .or_else(|| payload.as_str())
-        .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
+    if target_name.is_empty() {
+        return Err(AgentError::Validation("Campo 'name' requerido".to_string()));
+    }
 
     let agent = state.services.vault_agent.clone();
     let sym_key = agent.get_symmetric_key().await.ok_or(AgentError::Locked)?;
@@ -115,13 +114,13 @@ pub async fn handle_get_login(
                 if dec.name.eq_ignore_ascii_case(target_name)
                     || c.id.map(|u| u.to_string()).as_deref() == Some(target_name)
                 {
-                    return Ok(serde_json::json!({
-                        "id": dec.id,
-                        "name": dec.name,
-                        "username": dec.username.unwrap_or_default(),
-                        "password": dec.password.unwrap_or_default(),
-                        "totp": dec.totp.unwrap_or_default(),
-                    }));
+                    return Ok(LoginDetail {
+                        id: Some(dec.id.to_string()),
+                        name: dec.name,
+                        username: dec.username.unwrap_or_default(),
+                        password: dec.password.unwrap_or_default(),
+                        totp: dec.totp.unwrap_or_default(),
+                    });
                 }
             }
         }
@@ -131,29 +130,30 @@ pub async fn handle_get_login(
     )))
 }
 
-pub async fn handle_create_login(
-    state: &mut AgentState,
+pub async fn handle_get_login(
+    state: &AgentState,
     payload: &serde_json::Value,
-) -> Result<serde_json::Value, AgentError> {
+) -> Result<LoginDetail, AgentError> {
     if state.session.is_locked {
         return Err(AgentError::Locked);
     }
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| AgentError::Validation("El payload debe ser un objeto JSON".to_string()))?;
-
-    let name = obj
+    let target_name = payload
         .get("name")
         .and_then(|v| v.as_str())
+        .or_else(|| payload.as_str())
         .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
-    let username = obj
-        .get("username")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::Validation("Campo 'username' requerido".to_string()))?;
-    let password = obj
-        .get("password")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::Validation("Campo 'password' requerido".to_string()))?;
+    handle_get_login_by_name(state, target_name).await
+}
+
+pub async fn handle_create_login_params(
+    state: &mut AgentState,
+    name: &str,
+    username: &str,
+    password: &str,
+) -> Result<OperationAck, AgentError> {
+    if state.session.is_locked {
+        return Err(AgentError::Locked);
+    }
 
     if name.trim().is_empty() {
         return Err(AgentError::Validation(
@@ -254,25 +254,44 @@ pub async fn handle_create_login(
 
     agent.vault().insert(created_cipher).await;
 
-    Ok(serde_json::json!({
-        "status": "created",
-        "id": server_id.to_string(),
-        "name": name,
-    }))
+    Ok(OperationAck::login_created(server_id.to_string(), name))
 }
 
-pub async fn handle_delete_login(
+pub async fn handle_create_login(
     state: &mut AgentState,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, AgentError> {
     if state.session.is_locked {
         return Err(AgentError::Locked);
     }
-    let target_name = payload
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| AgentError::Validation("El payload debe ser un objeto JSON".to_string()))?;
+
+    let name = obj
         .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| payload.as_str())
         .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
+    let username = obj
+        .get("username")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AgentError::Validation("Campo 'username' requerido".to_string()))?;
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AgentError::Validation("Campo 'password' requerido".to_string()))?;
+
+    let ack = handle_create_login_params(state, name, username, password).await?;
+    serde_json::to_value(ack).map_err(|e| AgentError::ServerError(e.to_string()))
+}
+
+pub async fn handle_delete_login_by_name(
+    state: &mut AgentState,
+    target_name: &str,
+) -> Result<OperationAck, AgentError> {
+    if state.session.is_locked {
+        return Err(AgentError::Locked);
+    }
 
     let agent = state.services.vault_agent.clone();
     let sym_key = agent.get_symmetric_key().await.ok_or(AgentError::Locked)?;
@@ -321,8 +340,22 @@ pub async fn handle_delete_login(
         agent.vault().delete(&id).await;
     }
 
-    Ok(serde_json::json!({
-        "status": "deleted",
-        "name": found_name,
-    }))
+    Ok(OperationAck::login_deleted(found_name))
+}
+
+pub async fn handle_delete_login(
+    state: &mut AgentState,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, AgentError> {
+    if state.session.is_locked {
+        return Err(AgentError::Locked);
+    }
+    let target_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.as_str())
+        .ok_or_else(|| AgentError::Validation("Campo 'name' requerido".to_string()))?;
+
+    let ack = handle_delete_login_by_name(state, target_name).await?;
+    serde_json::to_value(ack).map_err(|e| AgentError::ServerError(e.to_string()))
 }

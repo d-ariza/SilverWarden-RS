@@ -1,6 +1,46 @@
 use crate::state::AgentState;
 use crate::AgentError;
 use std::sync::Arc;
+use sw_ipc::dto::{SyncPayload, SyncResult};
+
+async fn summarize_ciphers(vault: &sw_vault::VaultStore) -> SyncResult {
+    let all_ciphers = vault.all().await;
+    let non_deleted: Vec<_> = all_ciphers
+        .into_iter()
+        .filter(|c| c.deleted_date.is_none())
+        .collect();
+    let total = non_deleted.len();
+    let logins = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Login)
+        .count();
+    let ssh_keys = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
+        .count();
+    let notes = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Note)
+        .count();
+    let cards = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Card)
+        .count();
+    let identities = non_deleted
+        .iter()
+        .filter(|c| c.r#type == sw_vault::CipherType::Identity)
+        .count();
+
+    SyncResult {
+        status: "synced".to_string(),
+        total,
+        logins,
+        ssh_keys,
+        notes,
+        cards,
+        identities,
+    }
+}
 
 pub async fn populate_keyring(
     keyring: &tokio::sync::RwLock<sw_crypto::Keyring>,
@@ -30,52 +70,42 @@ pub async fn populate_keyring(
 
 pub async fn handle_sync(
     state: &mut AgentState,
-    payload: &serde_json::Value,
-) -> Result<serde_json::Value, AgentError> {
+    payload: &SyncPayload,
+) -> Result<SyncResult, AgentError> {
     if state.session.is_locked {
         return Err(AgentError::Locked);
     }
 
     // 1. Sync config fields from payload if provided
-    if let Some(map) = payload.as_object() {
-        if let Some(enc_tok) = map.get("encrypted_token").and_then(|v| v.as_str()) {
-            if !enc_tok.is_empty() {
-                state.services.config.encrypted_token = enc_tok.to_string();
-            }
+    if let Some(ref enc_tok) = payload.encrypted_token {
+        if !enc_tok.is_empty() {
+            state.services.config.encrypted_token = enc_tok.clone();
         }
-        if let Some(enc_sym) = map
-            .get("encrypted_user_symmetric_key")
-            .and_then(|v| v.as_str())
-        {
-            if !enc_sym.is_empty() {
-                state.services.config.encrypted_user_symmetric_key = enc_sym.to_string();
-            }
+    }
+    if let Some(ref enc_sym) = payload.encrypted_user_symmetric_key {
+        if !enc_sym.is_empty() {
+            state.services.config.encrypted_user_symmetric_key = enc_sym.clone();
         }
-        if let Some(id_url) = map.get("identity_url").and_then(|v| v.as_str()) {
-            state.services.config.identity_url = id_url.to_string();
-        }
-        if let Some(api_url) = map.get("api_url").and_then(|v| v.as_str()) {
-            state.services.config.api_url = api_url.to_string();
-        }
-        if let Some(insecure) = map
-            .get("danger_accept_invalid_certs")
-            .and_then(|v| v.as_bool())
-        {
-            state.services.config.danger_accept_invalid_certs = insecure;
-        }
-        if let Some(token_val) = map.get("token") {
-            if let Ok(token) = serde_json::from_value::<sw_config::LoginToken>(token_val.clone()) {
-                let client = Arc::new(
-                    sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
-                        state.services.config.identity_url.clone(),
-                        state.services.config.api_url.clone(),
-                        token,
-                        state.services.config.danger_accept_invalid_certs,
-                    ),
-                );
-                state.services.api_client = Some(client);
-            }
-        }
+    }
+    if let Some(ref id_url) = payload.identity_url {
+        state.services.config.identity_url = id_url.clone();
+    }
+    if let Some(ref api_url) = payload.api_url {
+        state.services.config.api_url = api_url.clone();
+    }
+    if let Some(insecure) = payload.danger_accept_invalid_certs {
+        state.services.config.danger_accept_invalid_certs = insecure;
+    }
+    if let Some(ref token) = payload.token {
+        let client = Arc::new(
+            sw_bitwarden_api::AuthenticatedClient::from_token_with_options(
+                state.services.config.identity_url.clone(),
+                state.services.config.api_url.clone(),
+                token.clone(),
+                state.services.config.danger_accept_invalid_certs,
+            ),
+        );
+        state.services.api_client = Some(client);
     }
 
     // 2. If still not logged in according to state.services.config and api_client is missing, check disk config
@@ -167,34 +197,16 @@ pub async fn handle_sync(
         populate_keyring(&state.security.keyring, agent.vault(), &sym_key).await;
     }
 
-    let all_ciphers = agent.vault().all().await;
-    let non_deleted: Vec<_> = all_ciphers
-        .into_iter()
-        .filter(|c| c.deleted_date.is_none())
-        .collect();
-    let total = non_deleted.len();
-    let logins = non_deleted
-        .iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::Login)
-        .count();
-    let ssh_keys = non_deleted
-        .iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
-        .count();
-
-    Ok(serde_json::json!({
-        "status": "synced",
-        "logins": logins,
-        "total": total,
-        "ssh_keys": ssh_keys,
-    }))
+    Ok(summarize_ciphers(agent.vault()).await)
 }
 
 pub async fn handle_sync_data(
     state: &mut AgentState,
-    payload: &serde_json::Value,
-) -> Result<serde_json::Value, AgentError> {
-    let sync_data: sw_vault::SyncData = serde_json::from_value(payload.clone())
+    payload: &SyncPayload,
+) -> Result<SyncResult, AgentError> {
+    let payload_val = serde_json::to_value(payload)
+        .map_err(|e| AgentError::Validation(format!("Error deserializando SyncData: {e}")))?;
+    let sync_data: sw_vault::SyncData = serde_json::from_value(payload_val)
         .map_err(|e| AgentError::Validation(format!("Error deserializando SyncData: {e}")))?;
 
     if let Some(vp) = state.vault_path() {
@@ -210,25 +222,5 @@ pub async fn handle_sync_data(
         populate_keyring(&state.security.keyring, agent.vault(), &sym_key).await;
     }
 
-    let all_ciphers = agent.vault().all().await;
-    let non_deleted: Vec<_> = all_ciphers
-        .into_iter()
-        .filter(|c| c.deleted_date.is_none())
-        .collect();
-    let total = non_deleted.len();
-    let logins = non_deleted
-        .iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::Login)
-        .count();
-    let ssh_keys = non_deleted
-        .iter()
-        .filter(|c| c.r#type == sw_vault::CipherType::SshKey)
-        .count();
-
-    Ok(serde_json::json!({
-        "status": "synced",
-        "logins": logins,
-        "total": total,
-        "ssh_keys": ssh_keys,
-    }))
+    Ok(summarize_ciphers(agent.vault()).await)
 }

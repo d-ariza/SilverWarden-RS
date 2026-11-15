@@ -14,27 +14,24 @@ pub async fn handle(cli: &Cli, ssh_command: &SshCommands) -> Result<String, CliE
 
     match ssh_command {
         SshCommands::List => {
-            let val = client.call_ok(Request::ListSshKeys).await?;
-            let keys = val.as_array().cloned().unwrap_or_default();
+            let keys: Vec<sw_ipc::dto::SshKeySummary> =
+                client.call_ok(Request::ListSshKeys).await?;
             if keys.is_empty() {
                 return Ok("No hay claves SSH registradas.".to_string());
             }
 
             let mut out = String::from("Listando claves SSH registradas:\n");
             for key in keys {
-                let name = key
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(sin nombre)");
-                let fingerprint = key
-                    .get("fingerprint")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = key.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-                if fingerprint.is_empty() {
+                let name = if key.name.is_empty() {
+                    "(sin nombre)"
+                } else {
+                    key.name.as_str()
+                };
+                let id = key.id.as_deref().unwrap_or("-");
+                if key.fingerprint.is_empty() {
                     out.push_str(&format!("  - {name} ({id})\n"));
                 } else {
-                    out.push_str(&format!("  - {name} [{fingerprint}] ({id})\n"));
+                    out.push_str(&format!("  - {name} [{}] ({id})\n", key.fingerprint));
                 }
             }
             Ok(out.trim_end().to_string())
@@ -69,17 +66,18 @@ pub async fn handle(cli: &Cli, ssh_command: &SshCommands) -> Result<String, CliE
                 }
             };
 
-            let val = client.call_ok(request).await?;
-            let name = val.get("name").and_then(|v| v.as_str()).unwrap_or(trimmed);
-            let fingerprint = val
-                .get("fingerprint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if fingerprint.is_empty() {
+            let key: sw_ipc::dto::SshKeySummary = client.call_ok(request).await?;
+            let name = if key.name.is_empty() {
+                trimmed
+            } else {
+                key.name.as_str()
+            };
+            if key.fingerprint.is_empty() {
                 Ok(format!("Registrando clave SSH {name}: completado."))
             } else {
                 Ok(format!(
-                    "Registrando clave SSH {name}: completado [{fingerprint}]."
+                    "Registrando clave SSH {name}: completado [{}].",
+                    key.fingerprint
                 ))
             }
         }

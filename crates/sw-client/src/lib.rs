@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+pub use sw_ipc::dto;
 use sw_ipc::{read_message, write_message};
-pub use sw_ipc::{Request, Response};
+pub use sw_ipc::{Request, Response, SyncPayload};
 use thiserror::Error;
 use tokio::net::UnixStream;
 
@@ -66,6 +67,12 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+impl From<sw_ipc::IpcError> for ClientError {
+    fn from(e: sw_ipc::IpcError) -> Self {
+        ClientError::ReceiveFailed(e.to_string())
+    }
+}
+
 /// Facade client for communicating with the SilverWarden agent daemon over Unix Domain Socket.
 #[derive(Clone, Debug)]
 pub struct AgentClient {
@@ -102,10 +109,13 @@ impl AgentClient {
         conn.send(request).await
     }
 
-    /// Sends a command and returns the inner `serde_json::Value` payload, or returns an error.
-    pub async fn call_ok(&self, request: Request) -> Result<serde_json::Value, ClientError> {
+    /// Sends a command and deserializes the `ResponseData` payload into `T`, or returns an error.
+    pub async fn call_ok<T: serde::de::DeserializeOwned>(
+        &self,
+        request: Request,
+    ) -> Result<T, ClientError> {
         match self.call(request).await? {
-            Response::Ok(val) => Ok(val),
+            Response::Ok(data) => data.deserialize_into().map_err(ClientError::from),
             Response::Error { code, message } => Err(ClientError::from_agent_error(code, message)),
         }
     }
@@ -128,7 +138,7 @@ impl AgentClient {
         self.call(Request::Sync).await
     }
 
-    pub async fn sync_data(&self, data: serde_json::Value) -> Result<Response, ClientError> {
+    pub async fn sync_data(&self, data: SyncPayload) -> Result<Response, ClientError> {
         self.call(Request::SyncData(data)).await
     }
 
@@ -206,10 +216,13 @@ impl AgentConnection {
         }
     }
 
-    /// Sends a request and unwraps the success payload directly.
-    pub async fn send_ok(&mut self, request: Request) -> Result<serde_json::Value, ClientError> {
+    /// Sends a request and deserializes the success payload directly into `T`.
+    pub async fn send_ok<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: Request,
+    ) -> Result<T, ClientError> {
         match self.send(request).await? {
-            Response::Ok(val) => Ok(val),
+            Response::Ok(data) => data.deserialize_into().map_err(ClientError::from),
             Response::Error { code, message } => Err(ClientError::from_agent_error(code, message)),
         }
     }
@@ -258,7 +271,10 @@ mod tests {
                 let req: Request = read_message(&mut stream).await.unwrap();
                 match req {
                     Request::Status => {
-                        let resp = Response::Ok(serde_json::json!({ "locked": false }));
+                        let resp = Response::ok(dto::AgentStatus {
+                            locked: false,
+                            ..Default::default()
+                        });
                         write_message(&mut stream, &resp).await.unwrap();
                     }
                     Request::Lock => {
@@ -276,8 +292,8 @@ mod tests {
         let client = AgentClient::new(&socket_path);
 
         // Success call
-        let val = client.call_ok(Request::Status).await.unwrap();
-        assert_eq!(val["locked"], false);
+        let status: dto::AgentStatus = client.call_ok(Request::Status).await.unwrap();
+        assert!(!status.locked);
 
         // Error call
         let err = client.call(Request::Lock).await.unwrap_err();
@@ -303,10 +319,10 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let req: Request = read_message(&mut stream).await.unwrap();
                 let resp = match req {
-                    Request::Status => Response::Ok(serde_json::json!({ "status": "ok" })),
-                    Request::ListLogins => Response::Ok(serde_json::json!([])),
-                    Request::GetLogin { name } => Response::Ok(serde_json::json!({ "name": name })),
-                    _ => Response::Ok(serde_json::json!({})),
+                    Request::Status => Response::ok(serde_json::json!({ "status": "ok" })),
+                    Request::ListLogins => Response::ok(Vec::<dto::LoginSummary>::new()),
+                    Request::GetLogin { name } => Response::ok(serde_json::json!({ "name": name })),
+                    _ => Response::ok(serde_json::json!({})),
                 };
                 write_message(&mut stream, &resp).await.unwrap();
             }
@@ -316,6 +332,7 @@ mod tests {
         assert!(client.status().await.is_ok());
         assert!(client.list_logins().await.is_ok());
         let get_res = client.get_login("github").await.unwrap();
-        assert_eq!(get_res.unwrap_ok().unwrap()["name"], "github");
+        let val: serde_json::Value = get_res.unwrap_ok().unwrap().deserialize_into().unwrap();
+        assert_eq!(val["name"], "github");
     }
 }

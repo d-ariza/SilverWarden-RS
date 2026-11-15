@@ -13,18 +13,14 @@ where
     let pin_val = match pin {
         Some(p) => Some(p.clone()),
         None => {
-            let status = client.call_ok(Request::Status).await?;
-            let pin_cached = status
-                .get("pin_cached")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if pin_cached {
+            let status: sw_ipc::dto::AgentStatus = client.call_ok(Request::Status).await?;
+            if status.pin_cached {
                 None
             } else {
                 Some(prompt_fn("Introduce el PIN de desbloqueo: ")?)
             }
         }
     };
-    client.call_ok(Request::Unlock { pin: pin_val }).await?;
+    let _: serde_json::Value = client.call_ok(Request::Unlock { pin: pin_val }).await?;
     Ok("Bóveda desbloqueada con éxito.".to_string())
 }
