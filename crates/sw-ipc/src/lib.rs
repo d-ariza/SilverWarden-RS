@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod dto;
+
+pub use dto::{
+    AgentStatus, ConfigView, LoginDetail, LoginSummary, OpaqueValue, OperationAck, PinChangeResult,
+    ResponseData, SshKeySummary, SyncPayload, SyncResult,
+};
+
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_IPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
@@ -33,9 +40,9 @@ pub enum Request {
     },
     Lock,
     Sync,
-    SyncData(serde_json::Value),
+    SyncData(SyncPayload),
     #[serde(alias = "ReloadVault")]
-    ReloadVault(serde_json::Value),
+    ReloadVault(SyncPayload),
     ListLogins,
     GetLogin {
         name: String,
@@ -67,7 +74,7 @@ pub enum Request {
     #[serde(alias = "Login")]
     SetSession {
         #[serde(default)]
-        token: Option<serde_json::Value>,
+        token: Option<OpaqueValue>,
         #[serde(default)]
         encrypted_token: Option<String>,
         #[serde(default)]
@@ -90,6 +97,10 @@ pub enum Request {
         old_pin: String,
         new_pin: String,
     },
+    #[serde(alias = "get_config", alias = "getconfig")]
+    GetConfig,
+    #[serde(alias = "set_config", alias = "setconfig")]
+    SetConfig(ConfigView),
     AgentShutdown,
 }
 
@@ -97,13 +108,13 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data")]
 pub enum Response {
-    Ok(serde_json::Value),
+    Ok(ResponseData),
     Error { code: String, message: String },
 }
 
 impl Response {
-    pub fn ok(data: serde_json::Value) -> Self {
-        Response::Ok(data)
+    pub fn ok(data: impl Into<ResponseData>) -> Self {
+        Response::Ok(data.into())
     }
 
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -121,7 +132,7 @@ impl Response {
         matches!(self, Response::Error { .. })
     }
 
-    pub fn unwrap_ok(self) -> Result<serde_json::Value, (String, String)> {
+    pub fn unwrap_ok(self) -> Result<ResponseData, (String, String)> {
         match self {
             Response::Ok(val) => Ok(val),
             Response::Error { code, message } => Err((code, message)),
@@ -163,149 +174,4 @@ pub async fn write_message<W: tokio::io::AsyncWriteExt + Unpin, T: serde::Serial
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn test_golden_json_contract_unlock() {
-        let req = Request::Unlock {
-            pin: Some("1234".to_string()),
-        };
-        let serialized = serde_json::to_string(&req).expect("Serialization failed");
-        assert_eq!(
-            serialized,
-            r#"{"action":"Unlock","payload":{"pin":"1234"}}"#
-        );
-
-        let deserialized: Request =
-            serde_json::from_str(&serialized).expect("Deserialization failed");
-        assert_eq!(deserialized, req);
-    }
-
-    #[tokio::test]
-    async fn test_golden_json_contract_status_and_lock() {
-        let req = Request::Status;
-        let serialized = serde_json::to_string(&req).expect("Serialization failed");
-        assert_eq!(serialized, r#"{"action":"Status"}"#);
-
-        let deserialized: Request =
-            serde_json::from_str(&serialized).expect("Deserialization failed");
-        assert_eq!(deserialized, req);
-
-        let lock_req = Request::Lock;
-        let lock_ser = serde_json::to_string(&lock_req).expect("Serialization failed");
-        assert_eq!(lock_ser, r#"{"action":"Lock"}"#);
-    }
-
-    #[tokio::test]
-    async fn test_golden_json_contract_response() {
-        let ok_resp = Response::Ok(serde_json::json!({ "status": "unlocked" }));
-        let ok_json = serde_json::to_string(&ok_resp).expect("Serialization failed");
-        assert_eq!(ok_json, r#"{"status":"Ok","data":{"status":"unlocked"}}"#);
-
-        let deserialized_ok: Response =
-            serde_json::from_str(&ok_json).expect("Deserialization failed");
-        assert_eq!(deserialized_ok, ok_resp);
-
-        let err_resp = Response::Error {
-            code: "AUTH_FAILED".into(),
-            message: "PIN incorrecto".into(),
-        };
-        let err_json = serde_json::to_string(&err_resp).expect("Serialization failed");
-        assert_eq!(
-            err_json,
-            r#"{"status":"Error","data":{"code":"AUTH_FAILED","message":"PIN incorrecto"}}"#
-        );
-
-        let deserialized_err: Response =
-            serde_json::from_str(&err_json).expect("Deserialization failed");
-        assert_eq!(deserialized_err, err_resp);
-    }
-
-    #[tokio::test]
-    async fn test_roundtrip_duplex_request_response() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
-
-        let client_req = Request::Status;
-
-        // Client writes Request to server
-        write_message(&mut client, &client_req)
-            .await
-            .expect("Client write should succeed");
-
-        // Server reads Request from client
-        let received_by_server: Request = read_message(&mut server)
-            .await
-            .expect("Server read should succeed");
-        assert_eq!(received_by_server, client_req);
-
-        // Server responds with Response
-        let server_response = Response::Ok(serde_json::json!({
-            "locked": true,
-            "version": "0.1.0"
-        }));
-        write_message(&mut server, &server_response)
-            .await
-            .expect("Server write should succeed");
-
-        // Client reads Response
-        let received_by_client: Response = read_message(&mut client)
-            .await
-            .expect("Client read response should succeed");
-        assert_eq!(received_by_client, server_response);
-    }
-
-    #[tokio::test]
-    async fn test_write_message_too_large_fails() {
-        let (mut client, _server) = tokio::io::duplex(8192);
-
-        let large_string = "a".repeat(MAX_IPC_MESSAGE_SIZE + 10);
-        let large_msg = Request::GetLogin { name: large_string };
-
-        let result = write_message(&mut client, &large_msg).await;
-        assert!(matches!(result, Err(IpcError::MessageTooLarge)));
-    }
-
-    #[tokio::test]
-    async fn test_read_message_too_large_fails() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
-
-        let invalid_len = ((MAX_IPC_MESSAGE_SIZE + 100) as u32).to_be_bytes();
-        client.write_all(&invalid_len).await.unwrap();
-
-        let result: Result<Request, _> = read_message(&mut server).await;
-        assert!(matches!(result, Err(IpcError::MessageTooLarge)));
-    }
-
-    #[tokio::test]
-    async fn test_read_malformed_json_fails() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
-
-        let bad_json = b"{not_valid_json:";
-        let len_bytes = (bad_json.len() as u32).to_be_bytes();
-        client.write_all(&len_bytes).await.unwrap();
-        client.write_all(bad_json).await.unwrap();
-
-        let result: Result<Request, _> = read_message(&mut server).await;
-        assert!(matches!(result, Err(IpcError::Json(_))));
-    }
-
-    #[test]
-    fn test_ipc_error_display() {
-        let io_err = IpcError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "conn reset",
-        ));
-        assert!(io_err.to_string().contains("conn reset"));
-
-        let large_err = IpcError::MessageTooLarge;
-        assert!(large_err.to_string().contains("4194304"));
-
-        let eof_err = IpcError::UnexpectedEof;
-        assert!(eof_err.to_string().contains("Unexpected end of stream"));
-
-        let proto_err = IpcError::Protocol("version mismatch".to_string());
-        assert!(proto_err.to_string().contains("version mismatch"));
-    }
-}
+mod tests;
