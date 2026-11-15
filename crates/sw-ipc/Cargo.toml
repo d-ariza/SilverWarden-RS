@@ -5,10 +5,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+ts = ["dep:ts-rs"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+sw-config = { path = "../sw-config" }
+ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
