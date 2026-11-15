@@ -1,6 +1,13 @@
 <script lang="ts">
   import { CheckCircle2, Loader2, Circle } from "lucide-svelte";
 
+  interface Props {
+    open?: boolean;
+    title?: string;
+    phases?: string[];
+    progress?: number;
+  }
+
   let {
     open = false,
     title = "Desbloqueando Bóveda",
@@ -10,12 +17,7 @@
       "Descifrando bóveda y sesiones...",
     ],
     progress = 0,
-  } = $props<{
-    open: boolean;
-    title?: string;
-    phases?: string[];
-    progress?: number;
-  }>();
+  }: Props = $props();
 
   // Determinar la fase visual actual basada en el avance numérico continuo
   let currentPhase = $derived(
@@ -30,7 +32,7 @@
 {#if open}
   <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-card">
-      <h3 id="modal-title">{title}</h3>
+      <h2 id="modal-title">{title}</h2>
 
       <div class="phases-checklist">
         {#each phases as phase, index}
@@ -89,7 +91,7 @@
     text-align: left;
   }
 
-  .modal-card h3 {
+  .modal-card h2 {
     margin: 0;
     font-size: var(--font-size-lg);
     color: var(--color-text);

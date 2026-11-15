@@ -1,19 +1,21 @@
 <script lang="ts">
-  let { 
-    label, 
-    type = 'text', 
-    placeholder = '', 
-    value = $bindable(''), 
-    disabled = false,
-    error = ''
-  } = $props<{
+  interface Props {
     label: string;
     type?: 'text' | 'password' | 'email';
     placeholder?: string;
     value?: string;
     disabled?: boolean;
     error?: string;
-  }>();
+  }
+
+  let {
+    label,
+    type = 'text',
+    placeholder = '',
+    value = $bindable(''),
+    disabled = false,
+    error = '',
+  }: Props = $props();
 </script>
 
 <div class="input-group">
@@ -57,10 +59,10 @@
     transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
   }
 
-  input:focus {
-    outline: none;
+  input:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
     border-color: var(--color-primary);
-    box-shadow: 0 0 0 2px var(--color-skeleton);
   }
 
   input:disabled {

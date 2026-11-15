@@ -1,15 +1,21 @@
 <script lang="ts">
-  let { 
-    variant = 'primary', 
-    type = 'button', 
-    disabled = false, 
-    onclick 
-  } = $props<{
+  import type { Snippet } from 'svelte';
+
+  interface Props {
     variant?: 'primary' | 'secondary' | 'danger';
-    type?: 'button' | 'submit';
+    type?: 'button' | 'submit' | 'reset';
     disabled?: boolean;
     onclick?: (e: MouseEvent) => void;
-  }>();
+    children?: Snippet;
+  }
+
+  let {
+    variant = 'primary',
+    type = 'button',
+    disabled = false,
+    onclick,
+    children,
+  }: Props = $props();
 
   let baseClass = $derived(`btn btn-${variant}`);
 </script>
@@ -60,7 +66,7 @@
   /* Danger: Acciones destructivas (borrar, bloquear) */
   .btn-danger {
     background-color: var(--color-danger);
-    color: #ffffff; /* Texto blanco para contraste sobre rojo */
+    color: var(--color-danger-text); /* Alto contraste sobre color de peligro */
   }
   .btn-danger:hover:not(:disabled) {
     opacity: 0.9;

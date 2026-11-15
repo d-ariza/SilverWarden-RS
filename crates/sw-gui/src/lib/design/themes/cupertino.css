@@ -1,40 +1,46 @@
 /* Tema Cupertino (macOS) */
 [data-theme="cupertino"] {
+  color-scheme: light;
   --color-bg: #f5f5f7;
   --color-bg-alt: #ffffff;
   --color-text: #1d1d1f;
-  --color-text-muted: #86868b;
+  --color-text-muted: #56565b;
   --color-border: #d2d2d7;
-  
-  --color-primary: #007aff;
-  --color-primary-hover: #0066d6;
+
+  --color-primary: #0062cc;
+  --color-primary-hover: #004fa3;
   --color-primary-text: #ffffff;
-  --color-danger: #ff3b30;
-  --color-success: #34c759;
-  
+  --color-danger: #c92a2a;
+  --color-danger-text: #ffffff;
+  --color-success: #1b7f37;
+  --color-warning: #8a5300;
+
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 16px;
-  
-  --shadow-sm: 0 1px 3px rgba(0,0,0,0.04);
-  --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
-  
-  --font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', sans-serif;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06);
+
+  --font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
   --color-skeleton: #e8e8ed;
 }
 
 [data-theme="cupertino"][data-mode="dark"] {
+  color-scheme: dark;
   --color-bg: #1c1c1e;
   --color-bg-alt: #2c2c2e;
   --color-text: #f5f5f7;
-  --color-text-muted: #98989d;
-  --color-border: #3a3a3c;
-  
-  --color-primary: #0a84ff;
-  --color-primary-hover: #409cff;
-  --color-primary-text: #ffffff;
-  --color-danger: #ff453a;
+  --color-text-muted: #a1a1a6;
+  --color-border: #48484a;
+
+  --color-primary: #409cff;
+  --color-primary-hover: #64b0ff;
+  --color-primary-text: #141618;
+  --color-danger: #ff6961;
+  --color-danger-text: #141618;
   --color-success: #30d158;
-  
+  --color-warning: #ffd60a;
+
   --color-skeleton: #3a3a3c;
 }

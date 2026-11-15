@@ -1,17 +1,73 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { Shield, Server, Mail, Lock, Eye, EyeOff, Info } from "lucide-svelte";
+  import {
+    Shield,
+    Server,
+    Mail,
+    Lock,
+    Eye,
+    EyeOff,
+    Info,
+    WifiOff,
+    AlertCircle,
+    RefreshCw,
+  } from "lucide-svelte";
+  import { agent } from "$lib/api/agent";
+  import { vaultState } from "$lib/state/vault.svelte";
 
   let serverUrl = $state("https://vault.bitwarden.com");
   let email = $state("");
   let masterPassword = $state("");
   let showPassword = $state(false);
   let infoMessage = $state("");
+  let isChecking = $state(false);
 
-  function handleSubmit() {
+  async function refreshConnection() {
+    isChecking = true;
+    try {
+      const status = await vaultState.refreshStatus();
+      if (status.state === "unlocked" || status.state === "syncing") {
+        await goto("/vault");
+        return;
+      }
+      if (status.state !== "disconnected" && status.state !== "error") {
+        try {
+          const cfg = await agent.getConfig();
+          if (cfg.api_url) {
+            serverUrl = cfg.api_url;
+          }
+        } catch {
+          // Si no hay config previa cargable, mantener valor por defecto.
+        }
+      }
+    } finally {
+      isChecking = false;
+    }
+  }
+
+  async function handleSubmit() {
     infoMessage =
       "El inicio de sesión gráfico completo llegará con la v2. Por ahora, inicia sesión ejecutando 'silverwarden login' en tu terminal y luego regresa aquí.";
+    if (vaultState.status.state !== "disconnected") {
+      try {
+        const current = await agent.getConfig();
+        await agent.setConfig({
+          ...current,
+          api_url: serverUrl.trim() || current.api_url,
+        });
+      } catch (e) {
+        console.warn(
+          "No se pudo guardar la URL del servidor en la configuración:",
+          e,
+        );
+      }
+    }
   }
+
+  onMount(() => {
+    refreshConnection();
+  });
 </script>
 
 <div class="setup-container">
@@ -19,10 +75,52 @@
     <div class="card-header">
       <div class="title-row">
         <Shield size={28} color="var(--color-primary)" />
-        <h2>Bienvenido a SilverWarden</h2>
+        <h1>Bienvenido a SilverWarden</h1>
       </div>
       <p class="subtitle">Conecta tu cuenta de Bitwarden o Vaultwarden</p>
     </div>
+
+    {#if isChecking}
+      <div class="info-banner" role="status" aria-live="polite">
+        <RefreshCw size={18} class="spin" />
+        <div class="info-text">
+          <p>Comprobando estado del agente...</p>
+        </div>
+      </div>
+    {:else if vaultState.status.state === "disconnected"}
+      <div class="status-banner warning" role="alert">
+        <WifiOff size={18} color="var(--color-warning)" />
+        <div class="status-text">
+          <strong>Agente desconectado</strong>
+          <p>
+            No se encontró <code>sw-agent</code>. Inicia el demonio antes de
+            completar el acceso.
+          </p>
+        </div>
+        <button
+          type="button"
+          class="retry-inline-btn"
+          onclick={refreshConnection}
+        >
+          Reintentar
+        </button>
+      </div>
+    {:else if vaultState.status.state === "error"}
+      <div class="status-banner danger" role="alert">
+        <AlertCircle size={18} color="var(--color-danger)" />
+        <div class="status-text">
+          <strong>Error del agente</strong>
+          <p>{vaultState.status.message}</p>
+        </div>
+        <button
+          type="button"
+          class="retry-inline-btn"
+          onclick={refreshConnection}
+        >
+          Reintentar
+        </button>
+      </div>
+    {/if}
 
     {#if infoMessage}
       <div class="info-banner" role="alert">
@@ -33,7 +131,13 @@
       </div>
     {/if}
 
-    <form class="setup-form" onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
+    <form
+      class="setup-form"
+      onsubmit={(e) => {
+        e.preventDefault();
+        handleSubmit();
+      }}
+    >
       <div class="input-group">
         <label for="server-url">Servidor Bitwarden / Vaultwarden</label>
         <div class="input-wrapper">
@@ -79,7 +183,8 @@
             type="button"
             class="toggle-btn"
             onclick={() => (showPassword = !showPassword)}
-            aria-label={showPassword ? "Ocultar contraseña" : "Ver contraseña"}
+            aria-pressed={showPassword}
+            aria-label="Mostrar contraseña"
             title={showPassword ? "Ocultar contraseña" : "Ver contraseña"}
           >
             {#if showPassword}
@@ -92,18 +197,12 @@
       </div>
 
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">
-          Iniciar Sesión
-        </button>
+        <button type="submit" class="btn btn-primary"> Iniciar Sesión </button>
       </div>
     </form>
 
     <div class="footer-links">
-      <button
-        type="button"
-        class="link-button"
-        onclick={() => goto("/login")}
-      >
+      <button type="button" class="link-button" onclick={() => goto("/login")}>
         Ya tengo SilverWarden configurado (Ir a Desbloqueo)
       </button>
     </div>
@@ -143,10 +242,55 @@
     gap: var(--space-2);
   }
 
-  .title-row h2 {
+  .title-row h1 {
     margin: 0;
     font-size: var(--font-size-xl);
     color: var(--color-text);
+  }
+
+  .status-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background-color: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-sm);
+  }
+
+  .status-banner.warning {
+    border-color: var(--color-warning);
+  }
+
+  .status-banner.danger {
+    border-color: var(--color-danger);
+  }
+
+  .status-text {
+    flex: 1;
+  }
+
+  .status-text p {
+    margin: var(--space-1) 0 0 0;
+    color: var(--color-text-muted);
+    line-height: 1.4;
+  }
+
+  .retry-inline-btn {
+    padding: var(--space-1) var(--space-2);
+    min-height: 32px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--color-border);
+    background-color: var(--color-bg-alt);
+    color: var(--color-text);
+    font-family: inherit;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .retry-inline-btn:hover {
+    background-color: var(--color-skeleton);
   }
 
   .subtitle {
@@ -320,4 +464,3 @@
     border-radius: var(--radius-sm);
   }
 </style>
-

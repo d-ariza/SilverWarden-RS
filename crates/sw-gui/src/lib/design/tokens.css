@@ -1,4 +1,6 @@
 :root {
+  color-scheme: light dark;
+
   /* Espaciados (base 4px) */
   --space-1: 4px;
   --space-2: 8px;
@@ -13,7 +15,7 @@
   --radius-lg: 12px;
   --radius-full: 9999px;
 
-  /* Tipografía base */
+  /* Tipografía base (mínimo legible 0.875rem) */
   --font-size-sm: 0.875rem;
   --font-size-base: 1rem;
   --font-size-lg: 1.125rem;
@@ -21,4 +23,9 @@
 
   /* Transiciones */
   --transition-fast: 150ms ease;
+}
+
+:where(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
