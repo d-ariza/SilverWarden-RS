@@ -114,6 +114,20 @@ def clean_workspace(repo_root: str, verbose: bool = False) -> None:
             sys.stderr.write(result.stderr)
         fail(f"`cargo llvm-cov clean --workspace` falló con código {result.returncode}", 3)
 
+    deps_dir = os.path.join(repo_root, "target", "llvm-cov-target", "debug", "deps")
+    removed = 0
+    if os.path.isdir(deps_dir):
+        with os.scandir(deps_dir) as entries:
+            for entry in entries:
+                if "." not in entry.name and entry.is_file(follow_symlinks=False):
+                    os.unlink(entry.path)
+                    removed += 1
+    if verbose and removed:
+        print(
+            f"Eliminados {removed} binario(s) huérfano(s) de {deps_dir}.",
+            file=sys.stderr,
+        )
+
 
 def run_coverage(repo_root: str, reuse: bool = False, verbose: bool = False) -> dict:
     if reuse:
